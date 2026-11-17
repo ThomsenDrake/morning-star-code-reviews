@@ -1,0 +1,92 @@
+[
+  {
+    "path": "assets/logo.png",
+    "previous_path": null,
+    "status": "modified",
+    "additions": 0,
+    "deletions": 0,
+    "binary": true,
+    "patch": null,
+    "has_patch": false
+  },
+  {
+    "path": "ledger/VERSION",
+    "previous_path": null,
+    "status": "added",
+    "additions": 1,
+    "deletions": 0,
+    "binary": false,
+    "patch": "@@ -0,0 +1 @@\n+no newline at end\n\\ No newline at end of file",
+    "has_patch": true
+  },
+  {
+    "path": "ledger/db.py",
+    "previous_path": null,
+    "status": "modified",
+    "additions": 2,
+    "deletions": 2,
+    "binary": false,
+    "patch": "@@ -6,6 +6,6 @@ def load_plan(conn, account_id):\n     return cur.fetchone()\n \n \n-def find_accounts(conn, owner):\n-    cur = conn.execute(\"SELECT id FROM accounts WHERE owner = ?\", (owner,))\n+def find_accounts(conn, owner, order_by=\"id\"):\n+    cur = conn.execute(f\"SELECT id FROM accounts WHERE owner = '{owner}' ORDER BY {order_by}\")\n     return [row[0] for row in cur.fetchall()]",
+    "has_patch": true
+  },
+  {
+    "path": "ledger/handlers.py",
+    "previous_path": null,
+    "status": "added",
+    "additions": 7,
+    "deletions": 0,
+    "binary": false,
+    "patch": "@@ -0,0 +1,7 @@\n+from ledger.service import BillingService\n+\n+\n+def charge_partial(request, conn):\n+    service = BillingService(conn)\n+    amount = service.partial_charge(request.account_id, request.days_used, request.days)\n+    return {\"amount\": str(amount)}",
+    "has_patch": true
+  },
+  {
+    "path": "ledger/legacy.py",
+    "previous_path": null,
+    "status": "removed",
+    "additions": 0,
+    "deletions": 2,
+    "binary": false,
+    "patch": "@@ -1,2 +0,0 @@\n-def legacy_total(rows):\n-    return sum(r.amount for r in rows)",
+    "has_patch": true
+  },
+  {
+    "path": "ledger/service.py",
+    "previous_path": null,
+    "status": "modified",
+    "additions": 7,
+    "deletions": 1,
+    "binary": false,
+    "patch": "@@ -7,6 +7,8 @@ from ledger.money import prorate, to_cents\n \n \n class BillingService:\n+    \"\"\"Charges accounts for their plan.\"\"\"\n+\n     def __init__(self, conn):\n         self.conn = conn\n \n@@ -14,6 +16,10 @@ class BillingService:\n         plan = db.load_plan(self.conn, account_id)\n         return to_cents(plan.price)\n \n+    def partial_charge(self, account_id: int, days_used: int, days_in_period: int) -> Decimal:\n+        plan = db.load_plan(self.conn, account_id)\n+        return prorate(plan.price, days_in_period, days_used)\n+\n     def describe(self, account_id: int) -> str:\n         plan = db.load_plan(self.conn, account_id)\n-        return \"plan %s\" % plan.name\n+        return f\"plan {plan.name}\"",
+    "has_patch": true
+  },
+  {
+    "path": "ledger/util.py",
+    "previous_path": "ledger/old_util.py",
+    "status": "renamed",
+    "additions": 1,
+    "deletions": 1,
+    "binary": false,
+    "patch": "@@ -4,4 +4,4 @@ def clamp(value, low, high):\n \n def chunks(items, size):\n     for start in range(0, len(items), size):\n-        yield items[start:start + size]\n+        yield items[start:start + size + 1]",
+    "has_patch": true
+  },
+  {
+    "path": "notes.txt",
+    "previous_path": null,
+    "status": "modified",
+    "additions": 1,
+    "deletions": 1,
+    "binary": false,
+    "patch": "@@ -1,2 +1,2 @@\n line one\r\n-line two\r\n+line two changed\r",
+    "has_patch": true
+  },
+  {
+    "path": "uv.lock",
+    "previous_path": null,
+    "status": "modified",
+    "additions": 1,
+    "deletions": 1,
+    "binary": false,
+    "patch": "@@ -1,3 +1,3 @@\n # lock\n-version = 1\n+version = 2\n name = \"ledger\"",
+    "has_patch": true
+  }
+]

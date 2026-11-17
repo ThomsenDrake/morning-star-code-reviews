@@ -1,0 +1,76 @@
+=== assets/logo.png (modified)
+(binary file; no text diff)
+
+=== ledger/VERSION (added)
+@@ new line 1 @@
+    1 + no newline at end
+
+=== ledger/db.py (modified)
+@@ new line 6 @@ def load_plan(conn, account_id):
+    6       return cur.fetchone()
+    7
+    8
+      - def find_accounts(conn, owner):
+      -     cur = conn.execute("SELECT id FROM accounts WHERE owner = ?", (owner,))
+    9 + def find_accounts(conn, owner, order_by="id"):
+   10 +     cur = conn.execute(f"SELECT id FROM accounts WHERE owner = '{owner}' ORDER BY {order_by}")
+   11       return [row[0] for row in cur.fetchall()]
+
+=== ledger/handlers.py (added)
+@@ new line 1 @@
+    1 + from ledger.service import BillingService
+    2 +
+    3 +
+    4 + def charge_partial(request, conn):
+    5 +     service = BillingService(conn)
+    6 +     amount = service.partial_charge(request.account_id, request.days_used, request.days)
+    7 +     return {"amount": str(amount)}
+
+=== ledger/legacy.py (removed)
+@@ removed lines @@
+      - def legacy_total(rows):
+      -     return sum(r.amount for r in rows)
+
+=== ledger/service.py (modified)
+@@ new line 7 @@ from ledger.money import prorate, to_cents
+    7
+    8
+    9   class BillingService:
+   10 +     """Charges accounts for their plan."""
+   11 +
+   12       def __init__(self, conn):
+   13           self.conn = conn
+   14
+@@ new line 16 @@ class BillingService:
+   16           plan = db.load_plan(self.conn, account_id)
+   17           return to_cents(plan.price)
+   18
+   19 +     def partial_charge(self, account_id: int, days_used: int, days_in_period: int) -> Decimal:
+   20 +         plan = db.load_plan(self.conn, account_id)
+   21 +         return prorate(plan.price, days_in_period, days_used)
+   22 +
+   23       def describe(self, account_id: int) -> str:
+   24           plan = db.load_plan(self.conn, account_id)
+      -         return "plan %s" % plan.name
+   25 +         return f"plan {plan.name}"
+
+=== ledger/util.py (renamed from ledger/old_util.py)
+@@ new line 4 @@ def clamp(value, low, high):
+    4
+    5   def chunks(items, size):
+    6       for start in range(0, len(items), size):
+      -         yield items[start:start + size]
+    7 +         yield items[start:start + size + 1]
+
+=== notes.txt (modified)
+@@ new line 1 @@
+    1   line one
+      - line two
+    2 + line two changed
+
+=== uv.lock (modified)
+@@ new line 1 @@
+    1   # lock
+      - version = 1
+    2 + version = 2
+    3   name = "ledger"

@@ -1,0 +1,234 @@
+name: Morning Star Code Review
+description: >-
+  Review a pull request with Mistral-hosted models as a Mistral Workflow; post as your
+  GitHub App or produce a report.
+author: Drake Thomsen
+branding:
+  icon: eye
+  color: orange
+
+inputs:
+  mistral-api-key:
+    description: Mistral API key of a workspace with Workflows access.
+    required: true
+  client-id:
+    description: GitHub App client ID. Without the App credentials the review is a report.
+    required: false
+    default: ""
+  app-private-key:
+    description: GitHub App private key (PEM). Used only by the token step.
+    required: false
+    default: ""
+  post:
+    description: "auto | never (never = report only)."
+    required: false
+    default: auto
+  preset:
+    description: >-
+      best | balanced | single | fast | mistral. Empty = the repository file's preset,
+      else the built-in default (best: three explorers, merged, then verified).
+    required: false
+    default: ""
+  explorers:
+    description: Comma-separated explorer models for an ensemble (overrides the preset).
+    required: false
+    default: ""
+  explorer-model:
+    description: A single explorer model (no ensemble).
+    required: false
+    default: ""
+  formatter-model:
+    description: Formatter model (only used when the explorer's notes cannot be parsed).
+    required: false
+    default: ""
+  explorer-effort:
+    description: "default | low | medium | high | max (validated per model)."
+    required: false
+    default: ""
+  verify:
+    description: "true | false: run the verifier on merged candidates. Empty = preset."
+    required: false
+    default: ""
+  verifier-model:
+    description: Verifier model. Empty = preset.
+    required: false
+    default: ""
+  verifier-effort:
+    description: "default | low | medium | high | max. Empty = preset."
+    required: false
+    default: ""
+  max-cost-usd:
+    description: Per-run cost limit in USD. Empty = 10.00 (or a lower repository value).
+    required: false
+    default: ""
+  max-tool-calls:
+    description: Tool calls per explorer. Empty = 60.
+    required: false
+    default: ""
+  explorer-minutes:
+    description: Minutes per explorer. Empty = 15.
+    required: false
+    default: ""
+  verifier-max-tool-calls:
+    description: Tool calls for the verifier. Empty = 30.
+    required: false
+    default: ""
+  verifier-minutes:
+    description: Minutes for the verifier. Empty = 8.
+    required: false
+    default: ""
+  allowed-models:
+    description: Comma-separated models the run may use.
+    required: false
+    default: "zai-glm-5-3,mistral-large-4,zai-glm-5-3-flash,deepseek-v4-1-flash-1017"
+  review-drafts:
+    description: "true | false: review draft pull requests."
+    required: false
+    default: "false"
+  labels:
+    description: >-
+      true | false: keep one verdict label on the PR (msreview: clean / findings /
+      incomplete). Needs Issues: write on the App.
+    required: false
+    default: "true"
+  suggestions:
+    description: "true | false: add validated suggestion blocks to inline comments."
+    required: false
+    default: "true"
+  fail-on:
+    description: "never | findings | high | critical: fail the step at this threshold."
+    required: false
+    default: never
+  deadline-minutes:
+    description: Driver deadline; keep it below the job's timeout-minutes.
+    required: false
+    default: "40"
+  telemetry:
+    description: "true | false: enable Workflows / Agents SDK telemetry."
+    required: false
+    default: "false"
+  pr-url:
+    description: Pull request URL. Empty = the triggering pull request.
+    required: false
+    default: ""
+  expected-head-sha:
+    description: >-
+      Review only this head commit (skip if the PR moved). Empty = the event's head SHA.
+    required: false
+    default: ""
+  remove-label:
+    description: >-
+      A label to remove from the PR after the run (the fork template passes
+      "msreview: safe-to-review", so every new push needs a fresh approval).
+    required: false
+    default: ""
+
+outputs:
+  status:
+    description: "posted | report | skipped | superseded | failed"
+    value: ${{ steps.review.outputs.status }}
+  verdict:
+    description: "clean | findings | incomplete"
+    value: ${{ steps.review.outputs.verdict }}
+  findings:
+    description: Number of open findings.
+    value: ${{ steps.review.outputs.findings }}
+  execution-id:
+    description: The Mistral Workflows execution id.
+    value: ${{ steps.review.outputs.execution-id }}
+  report-path:
+    description: Path of report.md on the runner.
+    value: ${{ steps.review.outputs.report-path }}
+
+runs:
+  using: composite
+  steps:
+    - id: token
+      if: ${{ inputs.client-id != '' && inputs.app-private-key != '' && inputs.post != 'never' }}
+      continue-on-error: true
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      with:
+        client-id: ${{ inputs.client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ github.repository_owner }}
+        repositories: ${{ github.event.repository.name }}
+        permission-contents: read
+        permission-pull-requests: write
+        permission-issues: ${{ inputs.labels == 'true' && 'write' || '' }}
+
+    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        python-version: "3.12"
+        enable-cache: auto
+        cache-dependency-glob: ${{ github.action_path }}/uv.lock
+
+    - name: Install morning-star-code-reviews (two environments, one lock)
+      shell: bash
+      env:
+        UV_NO_CONFIG: "1"
+      run: |
+        set -euo pipefail
+        unset UV_INDEX_URL UV_DEFAULT_INDEX UV_EXTRA_INDEX_URL UV_INDEX_STRATEGY PIP_INDEX_URL
+        UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/msreview/venv-worker" \
+          uv sync --project "$GITHUB_ACTION_PATH" --frozen --no-dev --no-editable
+        UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/msreview/venv-agent" \
+          uv sync --project "$GITHUB_ACTION_PATH" --frozen --no-dev --no-editable --extra agent
+
+    - id: review
+      shell: bash
+      env:
+        MISTRAL_API_KEY: ${{ inputs.mistral-api-key }}
+        MSREVIEW_GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+        MSREVIEW_APP_SLUG: ${{ steps.token.outputs.app-slug }}
+        MSREVIEW_TOKEN_STEP: ${{ steps.token.outcome || 'skipped' }}
+        MSREVIEW_READ_TOKEN: ${{ github.token }}
+        MSREVIEW_AGENT_PYTHON: ${{ runner.temp }}/msreview/venv-agent/bin/python
+        MSREVIEW_REPORT_DIR: ${{ runner.temp }}/msreview/report
+        MSREVIEW_RUN_ROOT: ${{ runner.temp }}/msreview/runs
+        MSREVIEW_PR_URL: ${{ inputs.pr-url || github.event.pull_request.html_url }}
+        # The event's head SHA only binds the run when the run reviews the event's PR.
+        MSREVIEW_HEAD_SHA: >-
+          ${{ inputs.expected-head-sha || ((inputs.pr-url == '' ||
+          inputs.pr-url == github.event.pull_request.html_url) &&
+          github.event.pull_request.head.sha) || '' }}
+        MSREVIEW_RUN_LABEL: gha:${{ github.repository }}/${{ github.run_id }}/${{ github.run_attempt }}
+        MSREVIEW_POST: ${{ inputs.post }}
+        MSREVIEW_PRESET: ${{ inputs.preset }}
+        MSREVIEW_EXPLORERS: ${{ inputs.explorers }}
+        MSREVIEW_EXPLORER_MODEL: ${{ inputs.explorer-model }}
+        MSREVIEW_FORMATTER_MODEL: ${{ inputs.formatter-model }}
+        MSREVIEW_EXPLORER_EFFORT: ${{ inputs.explorer-effort }}
+        MSREVIEW_VERIFY: ${{ inputs.verify }}
+        MSREVIEW_VERIFIER_MODEL: ${{ inputs.verifier-model }}
+        MSREVIEW_VERIFIER_EFFORT: ${{ inputs.verifier-effort }}
+        MSREVIEW_MAX_COST_USD: ${{ inputs.max-cost-usd }}
+        MSREVIEW_MAX_TOOL_CALLS: ${{ inputs.max-tool-calls }}
+        MSREVIEW_EXPLORER_MINUTES: ${{ inputs.explorer-minutes }}
+        MSREVIEW_VERIFIER_MAX_TOOL_CALLS: ${{ inputs.verifier-max-tool-calls }}
+        MSREVIEW_VERIFIER_MINUTES: ${{ inputs.verifier-minutes }}
+        MSREVIEW_ALLOWED_MODELS: ${{ inputs.allowed-models }}
+        MSREVIEW_REVIEW_DRAFTS: ${{ inputs.review-drafts }}
+        MSREVIEW_LABELS: ${{ inputs.labels }}
+        MSREVIEW_SUGGESTIONS: ${{ inputs.suggestions }}
+        MSREVIEW_FAIL_ON: ${{ inputs.fail-on }}
+        MSREVIEW_DEADLINE_MINUTES: ${{ inputs.deadline-minutes }}
+        MSREVIEW_TELEMETRY: ${{ inputs.telemetry }}
+        MSREVIEW_REMOVE_LABEL: ${{ inputs.remove-label }}
+      run: |
+        "$RUNNER_TEMP/msreview/venv-worker/bin/msreview" ci &
+        pid=$!
+        # Actions signals only this shell; pass SIGTERM on so the driver can terminate
+        # its execution and stop its worker.
+        trap 'kill -TERM "$pid" 2>/dev/null || true' INT TERM
+        set +e
+        wait "$pid"; rc=$?
+        while kill -0 "$pid" 2>/dev/null; do wait "$pid"; rc=$?; done
+        exit $rc
+
+    - if: ${{ always() }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: msreview-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/msreview/report
+        if-no-files-found: ignore
+        retention-days: 14

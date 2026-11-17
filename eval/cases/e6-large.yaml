@@ -1,0 +1,59 @@
+# E6: about 80 changed files: a lock file, files with a generated-code marker,
+# a vendored package, 25 similar report modules, tests, docs and translation
+# catalogs, plus one hand-written module with a planted bug. The report
+# modules alone exceed the default inline diff budget. The bug module has fewer
+# changed lines than a report module (so it ranks below them) but a larger diff
+# (so it cannot fill the gap the reports leave in the budget); it is therefore
+# only seen if the explorer opens it on demand. tests/unit/eval checks this with
+# the real diff pre-pass.
+case: e6
+name: Large PR
+pr: null
+eval: {default: true, runs: 1}
+pull_request:
+  branch: msreview-eval/e6-large
+  title: Statement reports, vendored formatter and regenerated routing tables
+  body: |
+    - 25 statement report modules under `ledger/reports/` (generated from the
+      report template, then reviewed by hand), with tests and docs.
+    - A custom date-window report (`ledger/reports/window.py`).
+    - Vendors `tinyfmt` 0.4.1 under `vendor/`.
+    - Regenerates the routing prefix tables and refreshes `uv.lock`.
+    - Translation catalogs for the report labels.
+build:
+  - message: Add statement reports
+    generators: [large_pr]
+    patches: [e6-window-report.patch]
+tolerance: 3
+bugs:
+  - id: W1
+    description: >-
+      Window.contains joins the two bounds with `or` instead of `and`, so every
+      transaction is inside every window.
+    path: ledger/reports/window.py
+    lines: [49, 50]
+    expect_text: return self.start <= day or day <= self.end
+    # Substrings of the title, explanation or fix: avoid plain words such as "and"
+    # that occur in almost any sentence.
+    keywords:
+      - "`or`"
+      - "`and`"
+      - "'or'"
+      - "'and'"
+      - always true
+      - always return
+      - every transaction
+      - all transactions
+      - outside the window
+      - outside of the window
+      - logical
+      - disjunction
+      - conjunction
+cosmetic: []
+cosmetic_paths: []
+expect:
+  verdicts: [findings]
+  verdicts_if_missed: [incomplete]
+  max_cosmetic_hits: 0
+  max_cost_usd: 10.0  # the default per-run cap
+  on_demand: [ledger/reports/window.py]

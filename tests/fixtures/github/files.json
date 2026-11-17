@@ -1,0 +1,29 @@
+[
+ {
+  "sha": "1111111111111111111111111111111111111111",
+  "filename": "src/pagination.py",
+  "status": "modified",
+  "additions": 6,
+  "deletions": 2,
+  "changes": 8,
+  "patch": "@@ -10,6 +10,10 @@ def page(items, n):\n     size = 20\n-    start = n * size\n-    end = start + size\n+    start = (n - 1) * size\n+    end = start + size + 1\n+    if end > len(items):\n+        end = len(items)\n+    return items[start:end]\n     # done\n     return None\n"
+ },
+ {
+  "sha": "2222222222222222222222222222222222222222",
+  "filename": "src/money.py",
+  "previous_filename": "src/amounts.py",
+  "status": "renamed",
+  "additions": 8,
+  "deletions": 1,
+  "changes": 9,
+  "patch": "@@ -1,3 +1,10 @@\n-def rnd(x):\n+def round_cents(value, places=2):\n+    \"\"\"Round to cents.\"\"\"\n+    return round(value, places)\n+\n+\n+def prorate(total, days, period):\n+    return total * days / period\n+\n \n # end\n"
+ },
+ {
+  "sha": "3333333333333333333333333333333333333333",
+  "filename": "assets/logo.png",
+  "status": "added",
+  "additions": 0,
+  "deletions": 0,
+  "changes": 0
+ }
+]

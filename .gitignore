@@ -1,0 +1,19 @@
+.internal/
+
+# Local environments
+.venv/
+.venv-agent/
+
+# Python caches and build output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+dist/
+build/
+*.egg-info/
+
+# Review reports written by `msreview review --report`
+msreview-reports/

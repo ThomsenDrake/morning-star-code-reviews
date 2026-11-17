@@ -1,0 +1,65 @@
+# E2: the E1 change plus a second commit that fixes B3 (authorization) and
+# B4 (SQL injection). Live end-to-end flow: push commit 1, review and post,
+# push commit 2 (`make_test_prs.py --stage e2=2`), review again: the scope is
+# incremental, the B3/B4 threads are resolved, B1/B2 are carried.
+case: e2
+name: Incremental fix
+pr: null
+eval: {default: false, runs: null}
+pull_request:
+  branch: msreview-eval/e2-incremental
+  initial_stage: 1  # push commit 2 later with: make_test_prs.py --stage e2=2
+  title: Plan changes and transaction search (with fixes)
+  body: |
+    Same feature as the plan-change PR. The second commit addresses review
+    feedback: the search query now binds the term as a parameter and the plan
+    endpoint checks permissions the right way round.
+build:
+  - message: Add plan changes and transaction search
+    patches: [e1-planted.patch]
+  - message: Bind the search term and fix the plan permission check
+    patches: [e2-fix.patch]
+tolerance: 3
+bugs:
+  - id: B1
+    description: Cross-file argument order in the prorate call (carried from E1).
+    path: ledger/service.py
+    lines: [125, 125]
+    expect_text: money.prorate(new_plan.monthly_cents, period_days, remaining_days)
+    keywords: [argument, order, swap, prorate, used_days, period_days, remaining_days, revers, transpos]
+    alt_locations:
+      - {path: ledger/money.py, lines: [53, 64]}
+  - id: B2
+    description: Off-by-one in paginate() (carried from E1).
+    path: ledger/pagination.py
+    lines: [84, 85]
+    expect_text: start = request.page * request.per_page
+    keywords: [off-by-one, off by one, skip, first page, page - 1, 1-based, one-based, zero-based, 0-based, offset]
+fixed:
+  - id: B3
+    description: Authorization check, fixed by the second commit.
+    path: ledger/handlers.py
+    lines: [92, 93]
+    expect_text: if not auth.can_modify_account(request.user, account)
+    keywords: [invert, authoriz, authoris, permission, forbidden, negat, missing not]
+  - id: B4
+    description: SQL injection, fixed by the second commit.
+    path: ledger/db.py
+    lines: [146, 151]
+    expect_text: (account_id, pattern)
+    keywords: [sql, inject, f-string, interpolat]
+cosmetic:
+  - id: C1
+    path: ledger/handlers.py
+    lines: [31, 34]
+    expect_text: Read a numeric id from the path parameters
+  - id: C2
+    path: ledger/service.py
+    lines: [48, 51]
+    expect_text: Overdrafts are not offered
+cosmetic_paths: []
+expect:
+  verdicts: [findings]
+  min_detected_per_run: 2
+  max_cosmetic_hits: 0
+  scope: incremental
