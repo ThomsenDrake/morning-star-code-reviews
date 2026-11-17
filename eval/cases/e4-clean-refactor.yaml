@@ -1,0 +1,27 @@
+# E4: a behaviour-preserving refactor (renames and docstrings). The ledger's
+# own test suite passes before and after; the expected verdict is clean.
+case: e4
+name: Clean refactor
+pr: null
+eval: {default: true, runs: null}
+pull_request:
+  branch: msreview-eval/e4-clean-refactor
+  title: Rename row helpers and document the storage layer
+  body: |
+    Pure refactor, no behaviour change:
+
+    - `_row_to_account` / `_row_to_transaction` become `_account_from_row` /
+      `_transaction_from_row`; the handler render helpers become `*_body`.
+    - `_check_open` becomes `_require_open`.
+    - Docstrings for the storage methods and the read handlers.
+build:
+  - message: Rename helpers and add docstrings
+    patches: [e4-refactor.patch]
+tolerance: 3
+bugs: []
+cosmetic: []
+cosmetic_paths: [ledger/db.py, ledger/handlers.py, ledger/service.py]
+expect:
+  verdicts: [clean]
+  max_fp_medium: 0
+  max_cosmetic_hits: 0

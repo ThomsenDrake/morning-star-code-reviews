@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_NO_CONFIG: "1"
+  UV_FROZEN: "1"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+      - run: uv sync --extra agent
+      - run: uv run --no-sync ruff check src tests scripts
+      - run: uv run --no-sync ruff format --check src tests scripts
+      - run: uv run --no-sync mypy
+      - name: agent-requirements.txt matches uv.lock
+        run: |
+          scripts/export_agent_requirements.sh
+          git diff --exit-code -- src/morning_star_review/_data/agent-requirements.txt
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        venv: [worker, agent]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+      - name: Install (${{ matrix.venv }} environment)
+        env:
+          VENV: ${{ matrix.venv }}
+        run: |
+          if [ "$VENV" = agent ]; then uv sync --extra agent; else uv sync; fi
+      - run: uv run --no-sync pytest -q
+
+  action-dry-run:
+    # Installs both environments exactly as action.yml does and runs each entry point.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+      - name: Install both environments from uv.lock
+        run: |
+          set -euo pipefail
+          UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/msreview/venv-worker" \
+            uv sync --project "$GITHUB_WORKSPACE" --no-dev --no-editable
+          UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/msreview/venv-agent" \
+            uv sync --project "$GITHUB_WORKSPACE" --no-dev --no-editable --extra agent
+      - name: Run msreview --version in each environment
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/msreview/venv-worker/bin/msreview" --version
+          "$RUNNER_TEMP/msreview/venv-agent/bin/msreview" --version
+          "$RUNNER_TEMP/msreview/venv-agent/bin/python" -c "import morning_star_review.agent"
+          if "$RUNNER_TEMP/msreview/venv-worker/bin/python" -c "import mistralai.agents" 2>/dev/null; then
+            echo "the worker environment must not contain the Agents SDK" >&2
+            exit 1
+          fi
+
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" .github/workflows/*.yml examples/workflows/*.yml

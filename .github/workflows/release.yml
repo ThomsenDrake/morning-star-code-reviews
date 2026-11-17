@@ -1,0 +1,51 @@
+# Build the wheel and sdist for a version tag and attach them to a GitHub Release.
+# There is no PyPI upload: users install with
+#   uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@<tag>
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the release and upload its assets
+    env:
+      UV_NO_CONFIG: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+      - name: Check that the tag matches the package version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/morning_star_review/_version.py)
+          if [ "v$version" != "$TAG" ]; then
+            echo "tag $TAG does not match version $version" >&2
+            exit 1
+          fi
+      - name: Build
+        run: |
+          set -euo pipefail
+          uv build --out-dir dist
+          (cd dist && sha256sum -- * > SHA256SUMS)
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          notes="Install: uv tool install git+https://github.com/$REPO@$TAG, then run msreview setup."
+          gh release create "$TAG" dist/* --repo "$REPO" --verify-tag --title "$TAG" --notes "$notes"

@@ -1,0 +1,31 @@
+diff --git a/ledger/db.py b/ledger/db.py
+index bf1f2fb..386e5e4 100644
+--- a/ledger/db.py
++++ b/ledger/db.py
+@@ -143,9 +143,11 @@ class Database:
+ 
+     def search_transactions(self, account_id: int, term: str) -> list[Transaction]:
+         """Transactions of one account whose memo contains ``term``, oldest first."""
++        pattern = "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+         rows = self._conn.execute(
+-            f"SELECT * FROM transactions WHERE account_id = ? AND memo LIKE '%{term}%' ORDER BY id",
+-            (account_id,),
++            "SELECT * FROM transactions WHERE account_id = ? AND memo LIKE ? ESCAPE '\\'"
++            " ORDER BY id",
++            (account_id, pattern),
+         ).fetchall()
+         return [_row_to_transaction(row) for row in rows]
+ 
+diff --git a/ledger/handlers.py b/ledger/handlers.py
+index dd78744..8b11617 100644
+--- a/ledger/handlers.py
++++ b/ledger/handlers.py
+@@ -89,7 +89,7 @@ def search_transactions(service: LedgerService, request: Request) -> Response:
+ 
+ def change_plan(service: LedgerService, request: Request) -> Response:
+     account = service.get_account(_account_id(request))
+-    if auth.can_modify_account(request.user, account):
++    if not auth.can_modify_account(request.user, account):
+         raise Forbidden("you may not change this account")
+     try:
+         day = int(request.body.get("day_of_period", "0"))

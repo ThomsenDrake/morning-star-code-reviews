@@ -1,0 +1,22 @@
+Morning Star Code Reviews
+Copyright 2026 Drake Thomsen
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+It contains only original code written for this project.
+
+Third-party components in the optional "agent" extra
+----------------------------------------------------
+
+The base installation (the worker environment) depends only on packages
+published under permissive open-source licenses.
+
+The optional "agent" extra (pip/uv extra name: agent) installs
+mistralai-agents (Apache-2.0) from PyPI, which in turn installs:
+
+  - mistralai-vibe-harness, whose PyPI metadata declares "License: Proprietary"
+    and which ships a compiled core;
+  - mistralai-vibe-sdk, which publishes no license metadata and no license file.
+
+These packages are downloaded from PyPI at install time. They are never
+vendored, copied or redistributed by this project. Their terms are set by
+their publisher; by installing the "agent" extra you accept those terms.

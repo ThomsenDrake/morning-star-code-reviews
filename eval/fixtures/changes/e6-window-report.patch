@@ -1,0 +1,110 @@
+diff --git a/ledger/reports/window.py b/ledger/reports/window.py
+new file mode 100644
+index 0000000..8ecdbd1
+--- /dev/null
++++ b/ledger/reports/window.py
+@@ -0,0 +1,104 @@
++"""Totals for a date window, used by the "custom period" option of monthly statements.
++
++A window is a closed range of calendar days written as ``YYYY-MM-DD`` strings.
++Transactions carry an ISO-8601 ``created_at`` timestamp in UTC, so the first ten
++characters of that timestamp are the calendar day the transaction belongs to.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Iterable, Iterator
++from dataclasses import dataclass
++from datetime import date, timedelta
++
++from ledger.errors import InvalidRequest
++from ledger.models import Transaction
++
++MAX_WINDOW_DAYS = 366  # statements never cover more than one (leap) year
++
++
++def _parse_day(text: str, label: str) -> date:
++    """The calendar day in ``text``; the InvalidRequest message names the offending bound."""
++    if len(text) != 10 or not text[:4].isdigit() or text[4] != "-" or text[7] != "-":
++        raise InvalidRequest(f"window {label} must be a YYYY-MM-DD date, got {text!r}")
++    try:
++        return date.fromisoformat(text)
++    except ValueError as exc:
++        raise InvalidRequest(f"window {label} is not a valid calendar date: {text!r}") from exc
++
++
++@dataclass(frozen=True)
++class Window:
++    start: str  # first day of the window, inclusive, YYYY-MM-DD
++    end: str  # last day of the window, inclusive, YYYY-MM-DD
++
++    def __post_init__(self) -> None:
++        first = _parse_day(self.start, "start")
++        last = _parse_day(self.end, "end")
++        if first > last:
++            raise InvalidRequest("the window starts after it ends; swap the two bounds")
++        if (last - first).days + 1 > MAX_WINDOW_DAYS:
++            raise InvalidRequest(f"a window may cover at most {MAX_WINDOW_DAYS} days")
++
++    @property
++    def days(self) -> int:
++        """Number of calendar days covered by the window, counting both bounds as included."""
++        return (date.fromisoformat(self.end) - date.fromisoformat(self.start)).days + 1
++
++    def contains(self, tx: Transaction) -> bool:
++        day = tx.created_at[:10]
++        return self.start <= day or day <= self.end
++
++    def each_day(self) -> Iterator[str]:
++        """Every calendar day of the window in ascending order, as YYYY-MM-DD strings."""
++        first = date.fromisoformat(self.start)
++        for offset in range(self.days):
++            yield (first + timedelta(days=offset)).isoformat()
++
++
++def month_window(year: int, month: int) -> Window:
++    """The window that covers one whole calendar month, from its first to its last day."""
++    if not 1 <= month <= 12:
++        raise InvalidRequest(f"month must be between 1 and 12, got {month}")
++    first = date(year, month, 1)
++    following = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
++    return Window(first.isoformat(), (following - timedelta(days=1)).isoformat())
++
++
++def in_window(transactions: Iterable[Transaction], window: Window) -> list[Transaction]:
++    """The transactions that fall inside the window, kept in their original order."""
++    return [tx for tx in transactions if window.contains(tx)]
++
++
++def window_total(transactions: Iterable[Transaction], window: Window) -> int:
++    """Sum of the amounts of the transactions inside the window, in integer cents."""
++    return sum(tx.amount_cents for tx in in_window(transactions, window))
++
++
++def window_count(transactions: Iterable[Transaction], window: Window) -> int:
++    """How many of the given transactions fall inside the window (both bounds included)."""
++    return len(in_window(transactions, window))
++
++
++def daily_totals(transactions: Iterable[Transaction], window: Window) -> dict[str, int]:
++    """Total cents per day for every day of the window, including days without activity."""
++    totals = dict.fromkeys(window.each_day(), 0)
++    for tx in in_window(transactions, window):
++        day = tx.created_at[:10]
++        totals[day] = totals.get(day, 0) + tx.amount_cents
++    return totals
++
++
++def running_balance(
++    opening_cents: int, transactions: Iterable[Transaction], window: Window
++) -> list[int]:
++    """Balance at the end of each day of the window, starting from ``opening_cents``.
++
++    One entry per day of the window, oldest day first; quiet days repeat the previous balance.
++    """
++    balance = opening_cents
++    out: list[int] = []
++    for cents in daily_totals(transactions, window).values():
++        balance += cents
++        out.append(balance)
++    return out

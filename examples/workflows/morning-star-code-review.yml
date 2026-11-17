@@ -1,0 +1,45 @@
+# Review every pull request opened from a branch of this repository.
+#
+# Copy to .github/workflows/morning-star-code-review.yml and set:
+#   secrets.MISTRAL_API_KEY            Mistral key of a workspace with Workflows access
+#   vars.MSREVIEW_APP_CLIENT_ID        your GitHub App's client id
+#   secrets.MSREVIEW_APP_PRIVATE_KEY   your GitHub App's private key (PEM)
+# Without the App credentials the review is attached to the run as a report.
+#
+# Pull requests from forks get no secrets on `pull_request`, so they are skipped here.
+# Review them with morning-star-code-review-forks.yml (maintainer approval per push),
+# or on demand with `msreview review <PR URL>`.
+name: Morning Star Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: morning-star-code-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # Pin to the full commit SHA of the release you reviewed.
+      - uses: ThomsenDrake/morning-star-code-reviews@v0.1.0
+        with:
+          mistral-api-key: ${{ secrets.MISTRAL_API_KEY }}
+          client-id: ${{ vars.MSREVIEW_APP_CLIENT_ID }}
+          app-private-key: ${{ secrets.MSREVIEW_APP_PRIVATE_KEY }}
+          # preset: best              # best | balanced | single | fast | mistral
+          # explorers: zai-glm-5-3,mistral-large-4
+          # verify: "true"
+          # max-cost-usd: "10.00"
+          # fail-on: never            # never | findings | high | critical
+          # deadline-minutes: "40"    # keep below timeout-minutes

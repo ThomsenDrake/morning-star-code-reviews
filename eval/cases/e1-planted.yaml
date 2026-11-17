@@ -1,0 +1,73 @@
+# E1: a feature PR with four planted bugs and two cosmetic edits.
+# Line numbers are head-commit lines; tests/unit/eval checks every
+# `expect_text` against the built head tree, so keep them in sync.
+case: e1
+name: Planted bugs
+pr: null  # filled from the make_test_prs.py output (--prs) at eval time
+eval: {default: true, runs: null}
+pull_request:
+  branch: msreview-eval/e1-planted
+  title: Plan changes and transaction search
+  body: |
+    Adds two features to the ledger service:
+
+    - `GET /accounts/{id}/transactions/search?q=...` searches memos and pages
+      through the matches (`ledger.pagination.paginate`).
+    - `POST /accounts/{id}/plan` moves an account to another plan in the middle
+      of a billing period and charges the new plan pro rata.
+
+    Also tidies an error message and a docstring.
+build:
+  - message: Add plan changes and transaction search
+    patches: [e1-planted.patch]
+tolerance: 3
+bugs:
+  - id: B1
+    description: >-
+      Cross-file argument order: money.prorate(amount_cents, used_days, period_days)
+      is called with period_days and remaining_days swapped. The callee lives in
+      ledger/money.py, which the PR does not change.
+    path: ledger/service.py
+    lines: [125, 125]
+    expect_text: money.prorate(new_plan.monthly_cents, period_days, remaining_days)
+    keywords: [argument, order, swap, prorate, used_days, period_days, remaining_days, revers, transpos]
+    alt_locations:
+      - {path: ledger/money.py, lines: [53, 64]}
+  - id: B2
+    description: >-
+      Off-by-one: paginate() treats the 1-based page number as 0-based, so page 1
+      returns the second page and the first page is unreachable.
+    path: ledger/pagination.py
+    lines: [84, 85]
+    expect_text: start = request.page * request.per_page
+    keywords: [off-by-one, off by one, skip, first page, page - 1, 1-based, one-based, zero-based, 0-based, offset]
+  - id: B3
+    description: >-
+      Inverted authorization: change_plan raises Forbidden for users who MAY modify
+      the account and lets everyone else change the plan.
+    path: ledger/handlers.py
+    lines: [92, 93]
+    expect_text: if auth.can_modify_account(request.user, account)
+    keywords: [invert, authoriz, authoris, permission, forbidden, negat, owner, anyone, access, missing not, "if not"]
+  - id: B4
+    description: SQL injection through an f-string in the memo search query.
+    path: ledger/db.py
+    lines: [146, 148]
+    expect_text: "LIKE '%{term}%'"
+    keywords: [sql, inject, f-string, interpolat, parameter, escap, sanitiz]
+cosmetic:
+  - id: C1
+    path: ledger/handlers.py
+    lines: [31, 34]
+    expect_text: Read a numeric id from the path parameters
+  - id: C2
+    path: ledger/service.py
+    lines: [48, 51]
+    expect_text: Overdrafts are not offered
+cosmetic_paths: []
+expect:
+  verdicts: [findings]
+  min_detected_per_run: 3
+  max_fp_medium: null
+  max_cosmetic_hits: 0
+  valid_anchors: true

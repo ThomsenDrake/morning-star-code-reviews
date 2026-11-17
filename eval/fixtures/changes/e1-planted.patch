@@ -1,0 +1,179 @@
+diff --git a/ledger/db.py b/ledger/db.py
+index 5b2b9b4..bf1f2fb 100644
+--- a/ledger/db.py
++++ b/ledger/db.py
+@@ -141,6 +141,14 @@ class Database:
+         ).fetchall()
+         return [_row_to_transaction(row) for row in rows]
+ 
++    def search_transactions(self, account_id: int, term: str) -> list[Transaction]:
++        """Transactions of one account whose memo contains ``term``, oldest first."""
++        rows = self._conn.execute(
++            f"SELECT * FROM transactions WHERE account_id = ? AND memo LIKE '%{term}%' ORDER BY id",
++            (account_id,),
++        ).fetchall()
++        return [_row_to_transaction(row) for row in rows]
++
+     def count_transactions(self, account_id: int) -> int:
+         row = self._conn.execute(
+             "SELECT COUNT(*) AS n FROM transactions WHERE account_id = ?", (account_id,)
+diff --git a/ledger/handlers.py b/ledger/handlers.py
+index 16c18b7..dd78744 100644
+--- a/ledger/handlers.py
++++ b/ledger/handlers.py
+@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
+ from typing import Any
+ 
+ from ledger import auth, money
+-from ledger.errors import InvalidRequest, LedgerError
++from ledger.errors import Forbidden, InvalidRequest, LedgerError
+ from ledger.models import Account, Transaction, User
+ from ledger.pagination import parse_page_request
+ from ledger.service import LedgerService
+@@ -28,9 +28,10 @@ class Request:
+ 
+ 
+ def _account_id(request: Request, name: str = "account_id") -> int:
++    """Read a numeric id from the path parameters."""
+     raw = request.params.get(name, "")
+     if not (raw.isascii() and raw.isdigit()):
+-        raise InvalidRequest(f"{name} must be a positive integer")
++        raise InvalidRequest(f"{name} must be a whole, positive number")
+     return int(raw)
+ 
+ 
+@@ -76,6 +77,31 @@ def list_transactions(service: LedgerService, request: Request) -> Response:
+     }
+ 
+ 
++def search_transactions(service: LedgerService, request: Request) -> Response:
++    account = service.get_account(_account_id(request))
++    auth.require_view(request.user, account)
++    page = service.search(account, request.params.get("q", ""), parse_page_request(request.params))
++    return 200, {
++        "items": [_render_transaction(tx, account.currency) for tx in page.items],
++        **page.meta(),
++    }
++
++
++def change_plan(service: LedgerService, request: Request) -> Response:
++    account = service.get_account(_account_id(request))
++    if auth.can_modify_account(request.user, account):
++        raise Forbidden("you may not change this account")
++    try:
++        day = int(request.body.get("day_of_period", "0"))
++    except ValueError as exc:
++        raise InvalidRequest("day_of_period must be a whole number") from exc
++    fee = service.change_plan(account, request.body.get("plan", ""), day)
++    body: Body = {"id": account.id, "plan": request.body.get("plan", "")}
++    if fee is not None:
++        body["fee"] = _render_transaction(fee, account.currency)
++    return 200, body
++
++
+ def deposit(service: LedgerService, request: Request) -> Response:
+     account = service.get_account(_account_id(request))
+     auth.require_modify(request.user, account)
+@@ -112,6 +138,8 @@ Handler = Callable[[LedgerService, Request], Response]
+ ROUTES: dict[str, Handler] = {
+     "GET /accounts/{account_id}": get_account,
+     "GET /accounts/{account_id}/transactions": list_transactions,
++    "GET /accounts/{account_id}/transactions/search": search_transactions,
++    "POST /accounts/{account_id}/plan": change_plan,
+     "POST /accounts/{account_id}/deposits": deposit,
+     "POST /accounts/{account_id}/withdrawals": withdraw,
+     "POST /accounts/{account_id}/transfers": transfer,
+diff --git a/ledger/pagination.py b/ledger/pagination.py
+index 8d191a2..bfc7641 100644
+--- a/ledger/pagination.py
++++ b/ledger/pagination.py
+@@ -2,7 +2,7 @@
+ 
+ from __future__ import annotations
+ 
+-from collections.abc import Mapping
++from collections.abc import Mapping, Sequence
+ from dataclasses import dataclass
+ from typing import Generic, TypeVar
+ 
+@@ -77,3 +77,15 @@ def parse_page_request(query: Mapping[str, str]) -> PageRequest:
+     if not 1 <= per_page <= MAX_PER_PAGE:
+         raise InvalidRequest(f"per_page must be between 1 and {MAX_PER_PAGE}")
+     return PageRequest(page=page, per_page=per_page)
++
++
++def paginate(items: Sequence[T], request: PageRequest) -> Page[T]:
++    """Cut one page out of a list that is already in memory (e.g. search results)."""
++    start = request.page * request.per_page
++    end = start + request.per_page
++    return Page(
++        items=list(items[start:end]),
++        page=request.page,
++        per_page=request.per_page,
++        total=len(items),
++    )
+diff --git a/ledger/service.py b/ledger/service.py
+index 11d03ec..1bc4bd9 100644
+--- a/ledger/service.py
++++ b/ledger/service.py
+@@ -10,7 +10,7 @@ from ledger import money
+ from ledger.db import Database
+ from ledger.errors import InsufficientFunds, InvalidRequest
+ from ledger.models import PLANS, Account, Statement, Transaction, User
+-from ledger.pagination import PageRequest
++from ledger.pagination import Page, PageRequest, paginate
+ 
+ 
+ class LedgerService:
+@@ -45,7 +45,10 @@ class LedgerService:
+         return self.db.insert_transaction(account.id, amount, memo or "deposit")
+ 
+     def withdraw(self, account: Account, amount_text: str, memo: str = "") -> Transaction:
+-        """Debit the account; the balance may not go below zero."""
++        """Debit the account.
++
++        Overdrafts are not offered, so the balance never goes below zero.
++        """
+         self._check_open(account)
+         amount = money.parse_amount(amount_text)
+         if self.db.balance(account.id) < amount:
+@@ -92,6 +95,39 @@ class LedgerService:
+         """Full monthly fee of the account's plan, in cents."""
+         return PLANS[account.plan].monthly_cents
+ 
++    def search(self, account: Account, term: str, request: PageRequest) -> Page[Transaction]:
++        """Transactions whose memo contains ``term``, one page at a time."""
++        term = term.strip()
++        if len(term) < 2:
++            raise InvalidRequest("search term must have at least two characters")
++        matches = self.db.search_transactions(account.id, term)
++        return paginate(matches, request)
++
++    def change_plan(
++        self, account: Account, plan_code: str, day_of_period: int, period_days: int = 30
++    ) -> Transaction | None:
++        """Move the account to another plan in the middle of a billing period.
++
++        The new plan is charged pro rata for the days that are left in the
++        period; the old plan is not refunded. Fees may take the balance below
++        zero, like every other fee. Returns the fee transaction, or None when
++        the remaining share is zero.
++        """
++        self._check_open(account)
++        new_plan = PLANS.get(plan_code)
++        if new_plan is None:
++            raise InvalidRequest(f"unknown plan: {plan_code!r}")
++        if new_plan.code == account.plan:
++            raise InvalidRequest("the account is already on this plan")
++        if not 0 <= day_of_period < period_days:
++            raise InvalidRequest("day_of_period must lie inside the period")
++        remaining_days = period_days - day_of_period
++        fee = money.prorate(new_plan.monthly_cents, period_days, remaining_days)
++        self.db.set_plan(account.id, new_plan.code)
++        if fee == 0:
++            return None
++        return self.db.insert_transaction(account.id, -fee, f"plan change to {new_plan.code}")
++
+     @staticmethod
+     def _check_open(account: Account) -> None:
+         if account.closed:

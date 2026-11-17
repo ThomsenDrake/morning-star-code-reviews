@@ -1,0 +1,2 @@
+# Patches must keep their trailing blanks (context lines of empty lines).
+*.patch -whitespace
