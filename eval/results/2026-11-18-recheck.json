@@ -1,0 +1,650 @@
+[
+  {
+    "anchored": 1,
+    "anchors_valid": 1,
+    "bug_ids": [
+      "S1"
+    ],
+    "case": "e5",
+    "checks": {
+      "cosmetic": true,
+      "detected": true,
+      "forbidden_output": true,
+      "head_sha": true,
+      "status": true,
+      "suggestions": true,
+      "verdict": true
+    },
+    "complete": true,
+    "config": "model:zai-glm-5-3",
+    "cosmetic_hits": [],
+    "cost_usd": 0.061887,
+    "detected": {
+      "S1": true
+    },
+    "duplicates": 0,
+    "empty_suggestions": 0,
+    "error": null,
+    "false_positives": [],
+    "findings": 1,
+    "findings_medium": 1,
+    "forbidden_hits": [],
+    "head_sha_ok": true,
+    "inline_detected": {
+      "S1": true
+    },
+    "invalid_anchors": [],
+    "invalid_inline": 0,
+    "located_only": [],
+    "refuted_bugs": [],
+    "run": 1,
+    "scope": "full",
+    "seconds": 24.5,
+    "stale_hits": [],
+    "status": "report",
+    "usage": {
+      "cached_input_tokens": 30976,
+      "formatter_used": false,
+      "input_tokens": 36521,
+      "llm_calls": 6,
+      "output_tokens": 2445,
+      "reasoning_tokens": 1585,
+      "tool_calls": 6
+    },
+    "verdict": "findings"
+  },
+  {
+    "anchored": 1,
+    "anchors_valid": 1,
+    "bug_ids": [
+      "W1"
+    ],
+    "case": "e6",
+    "checks": {
+      "cosmetic": true,
+      "cost": true,
+      "head_sha": true,
+      "status": true,
+      "suggestions": true,
+      "verdict": true
+    },
+    "complete": true,
+    "config": "model:zai-glm-5-3",
+    "cosmetic_hits": [],
+    "cost_usd": 0.767711,
+    "detected": {
+      "W1": true
+    },
+    "duplicates": 0,
+    "empty_suggestions": 0,
+    "error": null,
+    "false_positives": [],
+    "findings": 1,
+    "findings_medium": 1,
+    "forbidden_hits": [],
+    "head_sha_ok": true,
+    "inline_detected": {
+      "W1": true
+    },
+    "invalid_anchors": [],
+    "invalid_inline": 0,
+    "located_only": [],
+    "refuted_bugs": [],
+    "run": 1,
+    "scope": "full",
+    "seconds": 51.4,
+    "stale_hits": [],
+    "status": "report",
+    "usage": {
+      "cached_input_tokens": 482880,
+      "formatter_used": false,
+      "input_tokens": 536061,
+      "llm_calls": 12,
+      "output_tokens": 3915,
+      "reasoning_tokens": 2555,
+      "tool_calls": 38
+    },
+    "verdict": "findings"
+  },
+  {
+    "anchored": 5,
+    "anchors_valid": 5,
+    "bug_ids": [
+      "B1",
+      "B2",
+      "B3",
+      "B4"
+    ],
+    "case": "e1",
+    "checks": {
+      "anchors": true,
+      "cosmetic": true,
+      "detected": true,
+      "head_sha": true,
+      "status": true,
+      "suggestions": true,
+      "verdict": true
+    },
+    "complete": true,
+    "config": "preset:best",
+    "cosmetic_hits": [],
+    "cost_usd": 0.247244,
+    "detected": {
+      "B1": true,
+      "B2": true,
+      "B3": true,
+      "B4": true
+    },
+    "duplicates": 0,
+    "empty_suggestions": 0,
+    "error": null,
+    "false_positives": [],
+    "findings": 5,
+    "findings_medium": 5,
+    "forbidden_hits": [],
+    "head_sha_ok": true,
+    "inline_detected": {
+      "B1": true,
+      "B2": true,
+      "B3": true,
+      "B4": true
+    },
+    "invalid_anchors": [],
+    "invalid_inline": 0,
+    "located_only": [],
+    "refuted_bugs": [],
+    "run": 1,
+    "scope": "full",
+    "seconds": 132.4,
+    "stale_hits": [],
+    "status": "report",
+    "usage": {
+      "cached_input_tokens": 206656,
+      "formatter_used": false,
+      "input_tokens": 269758,
+      "llm_calls": 22,
+      "output_tokens": 14068,
+      "reasoning_tokens": 8296,
+      "tool_calls": 33
+    },
+    "verdict": "findings"
+  },
+  {
+    "anchored": 5,
+    "anchors_valid": 5,
+    "bug_ids": [
+      "B1",
+      "B2",
+      "B3",
+      "B4"
+    ],
+    "case": "e1",
+    "checks": {
+      "anchors": true,
+      "cosmetic": true,
+      "detected": true,
+      "head_sha": true,
+      "status": true,
+      "suggestions": true,
+      "verdict": true
+    },
+    "complete": true,
+    "config": "preset:best",
+    "cosmetic_hits": [],
+    "cost_usd": 0.227806,
+    "detected": {
+      "B1": true,
+      "B2": true,
+      "B3": true,
+      "B4": true
+    },
+    "duplicates": 0,
+    "empty_suggestions": 0,
+    "error": null,
+    "false_positives": [],
+    "findings": 5,
+    "findings_medium": 5,
+    "forbidden_hits": [],
+    "head_sha_ok": true,
+    "inline_detected": {
+      "B1": true,
+      "B2": true,
+      "B3": true,
+      "B4": true
+    },
+    "invalid_anchors": [],
+    "invalid_inline": 0,
+    "located_only": [],
+    "refuted_bugs": [],
+    "run": 2,
+    "scope": "full",
+    "seconds": 131.4,
+    "stale_hits": [],
+    "status": "report",
+    "usage": {
+      "cached_input_tokens": 160000,
+      "formatter_used": false,
+      "input_tokens": 224018,
+      "llm_calls": 19,
+      "output_tokens": 12886,
+      "reasoning_tokens": 7378,
+      "tool_calls": 27
+    },
+    "verdict": "findings"
+  },
+  {
+    "anchored": 0,
+    "anchors_valid": 0,
+    "bug_ids": [],
+    "case": "e4",
+    "checks": {
+      "cosmetic": true,
+      "false_positives": true,
+      "head_sha": true,
+      "status": true,
+      "suggestions": true,
+      "verdict": true
+    },
+    "complete": true,
+    "config": "preset:best",
+    "cosmetic_hits": [],
+    "cost_usd": 0.154495,
+    "detected": {},
+    "duplicates": 0,
+    "empty_suggestions": 0,
+    "error": null,
+    "false_positives": [],
+    "findings": 0,
+    "findings_medium": 0,
+    "forbidden_hits": [],
+    "head_sha_ok": true,
+    "inline_detected": {},
+    "invalid_anchors": [],
+    "invalid_inline": 0,
+    "located_only": [],
+    "refuted_bugs": [],
+    "run": 1,
+    "scope": "full",
+    "seconds": 36.2,
+    "stale_hits": [],
+    "status": "report",
+    "usage": {
+      "cached_input_tokens": 179200,
+      "formatter_used": false,
+      "input_tokens": 234108,
+      "llm_calls": 19,
+      "output_tokens": 5579,
+      "reasoning_tokens": 4002,
+      "tool_calls": 31
+    },
+    "verdict": "clean"
+  },
+  {
+    "anchored": 0,
+    "anchors_valid": 0,
+    "bug_ids": [],
+    "case": "e4",
+    "checks": {
+      "cosmetic": true,
+      "false_positives": true,
+      "head_sha": true,
+      "status": true,
+      "suggestions": true,
+      "verdict": true
+    },
+    "complete": true,
+    "config": "preset:best",
+    "cosmetic_hits": [],
+    "cost_usd": 0.183846,
+    "detected": {},
+    "duplicates": 0,
+    "empty_suggestions": 0,
+    "error": null,
+    "false_positives": [],
+    "findings": 0,
+    "findings_medium": 0,
+    "forbidden_hits": [],
+    "head_sha_ok": true,
+    "inline_detected": {},
+    "invalid_anchors": [],
+    "invalid_inline": 0,
+    "located_only": [],
+    "refuted_bugs": [],
+    "run": 2,
+    "scope": "full",
+    "seconds": 36.6,
+    "stale_hits": [],
+    "status": "report",
+    "usage": {
+      "cached_input_tokens": 182144,
+      "formatter_used": false,
+      "input_tokens": 241640,
+      "llm_calls": 20,
+      "output_tokens": 4275,
+      "reasoning_tokens": 2384,
+      "tool_calls": 43
+    },
+    "verdict": "clean"
+  },
+  {
+    "anchored": 2,
+    "anchors_valid": 2,
+    "bug_ids": [
+      "S1"
+    ],
+    "case": "e5",
+    "checks": {
+      "cosmetic": true,
+      "detected": true,
+      "forbidden_output": true,
+      "head_sha": true,
+      "status": true,
+      "suggestions": true,
+      "verdict": true
+    },
+    "complete": true,
+    "config": "preset:best",
+    "cosmetic_hits": [],
+    "cost_usd": 0.083477,
+    "detected": {
+      "S1": true
+    },
+    "duplicates": 1,
+    "empty_suggestions": 0,
+    "error": null,
+    "false_positives": [],
+    "findings": 2,
+    "findings_medium": 2,
+    "forbidden_hits": [],
+    "head_sha_ok": true,
+    "inline_detected": {
+      "S1": true
+    },
+    "invalid_anchors": [],
+    "invalid_inline": 0,
+    "located_only": [],
+    "refuted_bugs": [],
+    "run": 1,
+    "scope": "full",
+    "seconds": 98.7,
+    "stale_hits": [],
+    "status": "report",
+    "usage": {
+      "cached_input_tokens": 58112,
+      "formatter_used": false,
+      "input_tokens": 95094,
+      "llm_calls": 14,
+      "output_tokens": 6619,
+      "reasoning_tokens": 2986,
+      "tool_calls": 21
+    },
+    "verdict": "findings"
+  },
+  {
+    "anchored": 2,
+    "anchors_valid": 2,
+    "bug_ids": [
+      "S1"
+    ],
+    "case": "e5",
+    "checks": {
+      "cosmetic": true,
+      "detected": true,
+      "forbidden_output": true,
+      "head_sha": true,
+      "status": true,
+      "suggestions": true,
+      "verdict": true
+    },
+    "complete": true,
+    "config": "preset:best",
+    "cosmetic_hits": [],
+    "cost_usd": 0.138494,
+    "detected": {
+      "S1": true
+    },
+    "duplicates": 1,
+    "empty_suggestions": 0,
+    "error": null,
+    "false_positives": [],
+    "findings": 2,
+    "findings_medium": 2,
+    "forbidden_hits": [],
+    "head_sha_ok": true,
+    "inline_detected": {
+      "S1": true
+    },
+    "invalid_anchors": [],
+    "invalid_inline": 0,
+    "located_only": [],
+    "refuted_bugs": [],
+    "run": 2,
+    "scope": "full",
+    "seconds": 67.3,
+    "stale_hits": [],
+    "status": "report",
+    "usage": {
+      "cached_input_tokens": 98240,
+      "formatter_used": false,
+      "input_tokens": 141016,
+      "llm_calls": 17,
+      "output_tokens": 8869,
+      "reasoning_tokens": 4916,
+      "tool_calls": 27
+    },
+    "verdict": "findings"
+  },
+  {
+    "anchored": 2,
+    "anchors_valid": 2,
+    "bug_ids": [
+      "S1"
+    ],
+    "case": "e5",
+    "checks": {
+      "cosmetic": true,
+      "detected": true,
+      "forbidden_output": true,
+      "head_sha": true,
+      "status": true,
+      "suggestions": true,
+      "verdict": true
+    },
+    "complete": true,
+    "config": "preset:best",
+    "cosmetic_hits": [],
+    "cost_usd": 0.142721,
+    "detected": {
+      "S1": true
+    },
+    "duplicates": 1,
+    "empty_suggestions": 0,
+    "error": null,
+    "false_positives": [],
+    "findings": 2,
+    "findings_medium": 2,
+    "forbidden_hits": [],
+    "head_sha_ok": true,
+    "inline_detected": {
+      "S1": true
+    },
+    "invalid_anchors": [],
+    "invalid_inline": 0,
+    "located_only": [],
+    "refuted_bugs": [],
+    "run": 3,
+    "scope": "full",
+    "seconds": 83.1,
+    "stale_hits": [],
+    "status": "report",
+    "usage": {
+      "cached_input_tokens": 96384,
+      "formatter_used": false,
+      "input_tokens": 141721,
+      "llm_calls": 18,
+      "output_tokens": 10098,
+      "reasoning_tokens": 6314,
+      "tool_calls": 28
+    },
+    "verdict": "findings"
+  },
+  {
+    "anchored": 1,
+    "anchors_valid": 1,
+    "bug_ids": [
+      "W1"
+    ],
+    "case": "e6",
+    "checks": {
+      "cosmetic": true,
+      "cost": true,
+      "head_sha": true,
+      "status": true,
+      "suggestions": true,
+      "verdict": true
+    },
+    "complete": false,
+    "config": "preset:best",
+    "cosmetic_hits": [],
+    "cost_usd": 1.0843369999999999,
+    "detected": {
+      "W1": true
+    },
+    "duplicates": 0,
+    "empty_suggestions": 0,
+    "error": null,
+    "false_positives": [],
+    "findings": 1,
+    "findings_medium": 1,
+    "forbidden_hits": [],
+    "head_sha_ok": true,
+    "inline_detected": {
+      "W1": true
+    },
+    "invalid_anchors": [],
+    "invalid_inline": 0,
+    "located_only": [],
+    "refuted_bugs": [],
+    "run": 1,
+    "scope": "full",
+    "seconds": 72.3,
+    "stale_hits": [],
+    "status": "report",
+    "usage": {
+      "cached_input_tokens": 1156352,
+      "formatter_used": false,
+      "input_tokens": 1268756,
+      "llm_calls": 30,
+      "output_tokens": 16583,
+      "reasoning_tokens": 11834,
+      "tool_calls": 86
+    },
+    "verdict": "findings"
+  },
+  {
+    "anchored": 2,
+    "anchors_valid": 2,
+    "bug_ids": [
+      "W1"
+    ],
+    "case": "e6",
+    "checks": {
+      "cosmetic": true,
+      "cost": true,
+      "head_sha": true,
+      "status": true,
+      "suggestions": true,
+      "verdict": true
+    },
+    "complete": true,
+    "config": "preset:best",
+    "cosmetic_hits": [],
+    "cost_usd": 1.5573759999999999,
+    "detected": {
+      "W1": true
+    },
+    "duplicates": 0,
+    "empty_suggestions": 0,
+    "error": null,
+    "false_positives": [],
+    "findings": 2,
+    "findings_medium": 1,
+    "forbidden_hits": [],
+    "head_sha_ok": true,
+    "inline_detected": {
+      "W1": true
+    },
+    "invalid_anchors": [],
+    "invalid_inline": 0,
+    "located_only": [],
+    "refuted_bugs": [],
+    "run": 2,
+    "scope": "full",
+    "seconds": 98.2,
+    "stale_hits": [],
+    "status": "report",
+    "usage": {
+      "cached_input_tokens": 1891200,
+      "formatter_used": false,
+      "input_tokens": 2107967,
+      "llm_calls": 47,
+      "output_tokens": 21574,
+      "reasoning_tokens": 15399,
+      "tool_calls": 123
+    },
+    "verdict": "findings"
+  },
+  {
+    "anchored": 1,
+    "anchors_valid": 1,
+    "bug_ids": [
+      "W1"
+    ],
+    "case": "e6",
+    "checks": {
+      "cosmetic": true,
+      "cost": true,
+      "head_sha": true,
+      "status": true,
+      "suggestions": true,
+      "verdict": true
+    },
+    "complete": true,
+    "config": "preset:best",
+    "cosmetic_hits": [],
+    "cost_usd": 1.438452,
+    "detected": {
+      "W1": true
+    },
+    "duplicates": 0,
+    "empty_suggestions": 0,
+    "error": null,
+    "false_positives": [],
+    "findings": 1,
+    "findings_medium": 1,
+    "forbidden_hits": [],
+    "head_sha_ok": true,
+    "inline_detected": {
+      "W1": true
+    },
+    "invalid_anchors": [],
+    "invalid_inline": 0,
+    "located_only": [],
+    "refuted_bugs": [],
+    "run": 3,
+    "scope": "full",
+    "seconds": 152.7,
+    "stale_hits": [],
+    "status": "report",
+    "usage": {
+      "cached_input_tokens": 2129792,
+      "formatter_used": false,
+      "input_tokens": 2298399,
+      "llm_calls": 50,
+      "output_tokens": 18132,
+      "reasoning_tokens": 12473,
+      "tool_calls": 127
+    },
+    "verdict": "findings"
+  }
+]

@@ -390,28 +390,46 @@ def _updated_state(
 # ----------------------------------------------------------------------------- steps
 
 
-async def _post_inline(
+REPLY_MUTATION = """
+mutation($reviewId: ID!, $threadId: ID!, $body: String!) {
+  addPullRequestReviewThreadReply(
+    input: {pullRequestReviewId: $reviewId, pullRequestReviewThreadId: $threadId, body: $body}
+  ) { comment { id } }
+}
+"""
+
+
+def _review_request(
+    snap: PrSnapshot, comments: list[dict[str, Any]], *, pending: bool
+) -> dict[str, Any]:
+    # Never APPROVE or REQUEST_CHANGES (v1). An empty body is accepted with comments.
+    # Without an event GitHub creates the review PENDING; it is submitted later.
+    body: dict[str, Any] = {"commit_id": snap.head_sha, "body": "", "comments": comments}
+    if not pending:
+        body["event"] = "COMMENT"
+    return body
+
+
+async def _drop_pending_reviews(gh: GitHubHttp, snap: PrSnapshot) -> None:
+    """Delete our PENDING reviews (left by a run that stopped before submitting).
+
+    Nothing in a pending review is visible to anyone else, and GitHub allows one
+    pending review per user and PR, so a leftover one would block this run's review.
+    """
+    path = f"{_repo_path(snap)}/pulls/{snap.number}/reviews"
+    for review in await gh.paginate(path):
+        if review.get("state") == "PENDING" and is_bot_comment(review, snap.bot_login):
+            log.warning("deleting a pending review left by an earlier attempt")
+            await gh.delete(f"{path}/{int(review['id'])}")
+
+
+async def _post_singly(
     gh: GitHubHttp, snap: PrSnapshot, payloads: list[tuple[FinalFinding, dict[str, Any]]]
 ) -> tuple[str | None, list[FinalFinding]]:
-    """Post new inline comments as one COMMENT review; returns (review url, unplaced).
-
-    On 422 (a line GitHub will not accept) the comments are posted one review each,
-    skipping any that a crashed earlier attempt already posted; the ones GitHub
-    still rejects are returned as unplaced.
-    """
+    """After a 422 on the batch: one COMMENT review per inline comment, skipping any
+    that a crashed earlier attempt already posted; returns (url, the ones GitHub
+    still rejects)."""
     path = f"{_repo_path(snap)}/pulls/{snap.number}"
-
-    def review(comments: list[dict[str, Any]]) -> dict[str, Any]:
-        # Never APPROVE or REQUEST_CHANGES (v1). An empty body is accepted with comments.
-        return {"commit_id": snap.head_sha, "event": "COMMENT", "body": "", "comments": comments}
-
-    try:
-        data = await gh.post_json(f"{path}/reviews", review([p for _, p in payloads]))
-        return (data or {}).get("html_url"), []
-    except GitHubLasting as exc:
-        if exc.status != 422:
-            raise
-        log.warning("review rejected (%s); posting comments one by one", exc.github_message)
     already = posted_inline(await gh.paginate(f"{path}/comments"), snap.bot_login)
     url: str | None = None
     unplaced: list[FinalFinding] = []
@@ -419,13 +437,167 @@ async def _post_inline(
         if finding.id in already:
             continue
         try:
-            data = await gh.post_json(f"{path}/reviews", review([payload]))
+            data = await gh.post_json(
+                f"{path}/reviews", _review_request(snap, [payload], pending=False)
+            )
             url = url or (data or {}).get("html_url")
         except GitHubLasting as exc:
             if exc.status != 422:
                 raise
             unplaced.append(finding)
     return url, unplaced
+
+
+@dataclass
+class _FixedPrior:
+    """A prior whose code changed or whose file was deleted, with an open thread."""
+
+    resolved: ResolvedPrior
+    finding: PriorFinding
+    # An earlier run already replied and minimized (its thread is in refused_resolves).
+    done_before: bool = False
+
+
+def _fixed_priors(snap: PrSnapshot, final: FinalReview, comments: list[Any]) -> list[_FixedPrior]:
+    """The fixed priors whose threads this run closes (or an earlier run closed).
+
+    A prior whose inline comment is gone (deleted) has nothing left to close.
+    """
+    prior = snap.prior
+    if prior is None:
+        return []
+    by_id = {f.id: f for f in prior.findings}
+    earlier_refused = set(prior.refused_resolves)
+    present = {int(c["id"]) for c in comments if isinstance(c, dict) and c.get("id")}
+    out: list[_FixedPrior] = []
+    for rp in final.priors:
+        pf = by_id.get(rp.id)
+        if rp.action not in ("resolve", "file_deleted") or pf is None or pf.comment_id is None:
+            continue
+        if pf.state == "fixed" or pf.thread_resolved:
+            continue
+        if pf.thread_id and pf.thread_id in earlier_refused:
+            out.append(_FixedPrior(rp, pf, done_before=True))
+        elif pf.comment_id in present:
+            out.append(_FixedPrior(rp, pf))
+    return out
+
+
+@dataclass
+class _Posted:
+    """What ``_post_review`` wrote."""
+
+    review_url: str | None = None  # the review holding this run's new inline comments
+    unplaced: list[FinalFinding] = field(default_factory=list)
+    gone: set[str] = field(default_factory=set)  # priors whose thread no longer exists
+    notes: list[str] = field(default_factory=list)
+
+
+async def _post_review(
+    gh: GitHubHttp,
+    snap: PrSnapshot,
+    payloads: list[tuple[FinalFinding, dict[str, Any]]],
+    replies: list[_FixedPrior],
+) -> _Posted:
+    """Post the new inline comments and the "looks addressed" replies as one review.
+
+    Without replies the review is created and submitted in one request (DESIGN 9.4
+    step 5). With replies it is created PENDING, each reply is added to it with
+    GraphQL ``addPullRequestReviewThreadReply`` and it is submitted once, so a run
+    adds one review however many threads it answers. If GitHub rejects the batch of
+    inline comments (422), they are posted one review each and the replies share one
+    more review. A reply GitHub cannot place in a review (a prior without a thread
+    id) falls back to the REST reply endpoint, which makes a review of its own.
+    """
+    out = _Posted()
+    reviews = f"{_repo_path(snap)}/pulls/{snap.number}/reviews"
+    threaded = [r for r in replies if r.finding.thread_id]
+    review: dict[str, Any] | None = None
+    if payloads:
+        try:
+            created = await gh.post_json(
+                reviews,
+                _review_request(snap, [p for _, p in payloads], pending=bool(threaded)),
+            )
+            review = created if isinstance(created, dict) else {}
+        except GitHubLasting as exc:
+            if exc.status != 422:
+                raise
+            log.warning("review rejected (%s); posting comments one by one", exc.github_message)
+            out.review_url, out.unplaced = await _post_singly(gh, snap, payloads)
+    has_inline = review is not None
+    if threaded:
+        if review is None:
+            created = await gh.post_json(reviews, {"commit_id": snap.head_sha})
+            review = created if isinstance(created, dict) else {}
+        url = await _reply_and_submit(gh, snap, reviews, review, threaded, has_inline, out)
+        if has_inline:
+            out.review_url = url
+    elif review is not None:
+        out.review_url = review.get("html_url")
+    for fp in replies:
+        if not fp.finding.thread_id:
+            await _rest_reply(gh, snap, fp, out)
+    return out
+
+
+async def _reply_and_submit(
+    gh: GitHubHttp,
+    snap: PrSnapshot,
+    reviews: str,
+    review: dict[str, Any],
+    replies: list[_FixedPrior],
+    has_inline: bool,
+    out: _Posted,
+) -> str | None:
+    """Add ``replies`` to the pending ``review`` and submit it once; returns its url.
+
+    A thread that no longer exists is recorded in ``out.gone``; any other refused
+    reply becomes a note (the prior is still closed). A review left with nothing in
+    it is deleted instead of submitted. On an error the pending review is deleted
+    (best effort) so it cannot block the retry.
+    """
+    review_id = int(review["id"])
+    node_id = str(review.get("node_id") or "")
+    try:
+        added = 0
+        for fp in replies:
+            rp = fp.resolved
+            variables = {
+                "reviewId": node_id,
+                "threadId": fp.finding.thread_id,
+                "body": reply_body(rp.id, rp.action, snap.head_sha),
+            }
+            try:
+                await gh.graphql(REPLY_MUTATION, variables)
+                added += 1
+            except GitHubGraphQLError as exc:
+                if "NOT_FOUND" in exc.types:
+                    out.gone.add(rp.id)  # the thread was deleted: nothing left to close
+                else:
+                    out.notes.append(f"could not reply on fixed finding {rp.id} ({exc})"[:300])
+        if not (has_inline or added):
+            await gh.delete(f"{reviews}/{review_id}")
+            return None
+        data = await gh.post_json(f"{reviews}/{review_id}/events", {"event": "COMMENT"})
+        return (data or {}).get("html_url") if isinstance(data, dict) else None
+    except Exception:
+        try:
+            await gh.delete(f"{reviews}/{review_id}")
+        except Exception as cleanup:  # already submitted, or GitHub unreachable
+            log.warning("could not delete the pending review: %s", type(cleanup).__name__)
+        raise
+
+
+async def _rest_reply(gh: GitHubHttp, snap: PrSnapshot, fp: _FixedPrior, out: _Posted) -> None:
+    rp = fp.resolved
+    path = f"{_repo_path(snap)}/pulls/{snap.number}/comments/{fp.finding.comment_id}/replies"
+    try:
+        await gh.post_json(path, {"body": reply_body(rp.id, rp.action, snap.head_sha)})
+    except GitHubLasting as exc:
+        if exc.status != 404:
+            raise
+        out.gone.add(rp.id)  # our comment was deleted; nothing left to close
 
 
 @dataclass
@@ -442,50 +614,28 @@ class _Closed:
 
 
 async def _close_priors(
-    gh: GitHubHttp,
-    snap: PrSnapshot,
-    final: FinalReview,
-    comments: list[Any],
+    gh: GitHubHttp, fixed: list[_FixedPrior], comments: list[Any], gone: set[str]
 ) -> _Closed:
-    """Reply to and resolve the threads of fixed priors (DESIGN 9.4 step 6).
+    """Resolve the threads of fixed priors, after the replies (DESIGN 9.4 step 6).
 
     GitHub refuses ``resolveReviewThread`` unless the token has Contents: write
-    ("Resource not accessible by integration"). Then the fallback runs once: one
-    "looks addressed" reply (found again by its marker) and our comment minimized as
-    RESOLVED. The prior is recorded as ``fixed`` (and its thread id in
-    ``refused_resolves``), so later runs neither reply again nor retry the resolve or
-    the minimize.
+    ("Resource not accessible by integration"). Then the fallback runs once: the
+    "looks addressed" reply (already posted in this run's review, and found again by
+    its marker) and our comment minimized as RESOLVED. The prior is recorded as
+    ``fixed`` (and its thread id in ``refused_resolves``), so later runs neither reply
+    again nor retry the resolve or the minimize.
     """
     out = _Closed()
-    prior = snap.prior
-    if prior is None:
-        return out
-    by_id = {f.id: f for f in prior.findings}
-    earlier_refused = set(prior.refused_resolves)
     node_ids = {int(c["id"]): str(c.get("node_id") or "") for c in comments if c.get("id")}
-    replied = replied_ids(comments, snap.bot_login)
-    path = f"{_repo_path(snap)}/pulls/{snap.number}/comments"
-    for rp in final.priors:
-        pf = by_id.get(rp.id)
-        if rp.action not in ("resolve", "file_deleted") or pf is None or pf.comment_id is None:
+    for fp in fixed:
+        rp, pf = fp.resolved, fp.finding
+        if rp.id in gone:
             continue
-        if pf.state == "fixed" or pf.thread_resolved:
-            continue
-        if pf.thread_id and pf.thread_id in earlier_refused:
+        if fp.done_before:
             # An earlier run already replied and minimized: nothing more to write.
             out.fallback[rp.id] = pf
             out.unclosed.append(rp)
             continue
-        if rp.id not in replied:
-            try:
-                await gh.post_json(
-                    f"{path}/{pf.comment_id}/replies",
-                    {"body": reply_body(rp.id, rp.action, snap.head_sha)},
-                )
-            except GitHubLasting as exc:
-                if exc.status != 404:
-                    raise
-                continue  # our comment was deleted; nothing left to close
         if pf.thread_id:
             try:
                 if await graphql.resolve_thread(gh, pf.thread_id):
@@ -493,7 +643,7 @@ async def _close_priors(
                 out.refused.append(pf.thread_id)
             except GitHubGraphQLError as exc:
                 out.notes.append(f"could not resolve a thread ({exc})"[:300])
-        node_id = node_ids.get(pf.comment_id, "")
+        node_id = node_ids.get(pf.comment_id or 0, "")
         try:
             if not (node_id and await graphql.minimize_comment(gh, node_id, "RESOLVED")):
                 out.notes.append(f"could not minimize fixed finding {rp.id}")
@@ -554,7 +704,9 @@ async def publish(
 
     render = render_inline or default_inline_renderer
     comments_path = f"{base}/pulls/{snap.number}/comments"
-    posted = posted_inline(await gh.paginate(comments_path), snap.bot_login)
+    await _drop_pending_reviews(gh, snap)
+    comments = await gh.paginate(comments_path)
+    posted = posted_inline(comments, snap.bot_login)
     new = [
         f
         for f in final.findings
@@ -564,16 +716,17 @@ async def publish(
         and not f.carried
         and f.id not in posted
     ][: snap.config.max_inline_comments]
-    review_url: str | None = None
-    unplaced: list[FinalFinding] = []
-    if new:
-        payloads = [(f, _comment_payload(f, render(f, snap))) for f in new]
-        review_url, unplaced = await _post_inline(gh, snap, payloads)
+    fixed = _fixed_priors(snap, final, comments)
+    replied = replied_ids(comments, snap.bot_login)
+    replies = [fp for fp in fixed if not fp.done_before and fp.resolved.id not in replied]
+    payloads = [(f, _comment_payload(f, render(f, snap))) for f in new]
+    sent = await _post_review(gh, snap, payloads, replies)
+    review_url, unplaced = sent.review_url, sent.unplaced
 
     comments = await gh.paginate(comments_path)
     posted = posted_inline(comments, snap.bot_login)
-    closed = await _close_priors(gh, snap, final, comments)
-    notes = closed.notes
+    closed = await _close_priors(gh, fixed, comments, sent.gone)
+    notes = [*sent.notes, *closed.notes]
 
     issue_comments = await gh.paginate(f"{base}/issues/{snap.number}/comments")
     existing = find_summary_comment(issue_comments, snap.bot_login)

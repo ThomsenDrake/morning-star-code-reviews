@@ -11,7 +11,12 @@ from __future__ import annotations
 from typing import Any
 
 from morning_star_review.core.contract import ReviewRequest, Sealed
-from morning_star_review.core.errors import MsreviewPinRejected, MsreviewSealInvalid, for_activity
+from morning_star_review.core.errors import (
+    MsreviewForeignTask,
+    MsreviewPinRejected,
+    MsreviewSealInvalid,
+    for_activity,
+)
 from morning_star_review.core.runctx import RunContext, run_context
 from morning_star_review.core.seal import request_digest, verify
 
@@ -40,7 +45,7 @@ def _check(req: ReviewRequest, sealed: tuple[Sealed | None, ...]) -> RunContext:
         if not in_activity():
             raise MsreviewPinRejected("guard called outside an activity on a worker")
         if _current_workflow_id() != ctx.execution_id:
-            raise MsreviewPinRejected("task belongs to a different execution")
+            raise MsreviewForeignTask("task belongs to a different execution")
     if request_digest(req) != ctx.request_sha256:
         raise MsreviewPinRejected("request does not match the pinned request")
     for item in sealed:
@@ -54,7 +59,9 @@ def guard(req: ReviewRequest, *sealed: Sealed | None) -> RunContext:
 
     Raises ``MsreviewPinRejected`` / ``MsreviewSealInvalid`` (or ``MsreviewNoRunContext``).
     Inside an activity these become non-retryable ``ApplicationError``s whose ``type``
-    is the class name, so Temporal does not retry a task that can never succeed.
+    is the class name, so Temporal does not retry a task that can never succeed. The
+    exception is ``MsreviewForeignTask`` (another execution's task on our queue): it
+    stays retryable, because that run's own worker can succeed with it.
     """
     try:
         return _check(req, sealed)

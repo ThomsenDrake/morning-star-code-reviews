@@ -31,6 +31,7 @@ from morning_star_review.core.contract import (
     VerifyResult,
     usage_key,
 )
+from morning_star_review.diff.prepass import nothing_to_review, unreviewed_code
 from morning_star_review.review import render
 from morning_star_review.review.anchoring import line_text
 from morning_star_review.review.reconcile import (
@@ -42,7 +43,7 @@ from morning_star_review.review.reconcile import (
     refound_priors,
     sources_from_draft,
 )
-from morning_star_review.review.verdict import decide
+from morning_star_review.review.verdict import Assessment, assess
 
 __all__ = [
     "STATE_VERSION",
@@ -154,7 +155,7 @@ def _state_evidence(f: FinalFinding, head: HeadText) -> str:
 def _state(
     snap: PrSnapshot,
     info: RunInfo,
-    verdict: str,
+    assessment: Assessment,
     findings: Sequence[FinalFinding],
     priors: Sequence[ResolvedPrior],
     head: HeadText,
@@ -186,8 +187,9 @@ def _state(
             "tool_version": info.tool_version,
             "head_sha": snap.head_sha,
             "merge_base_sha": snap.merge_base_sha,
-            "complete": verdict != "incomplete",
-            "verdict": verdict,
+            # A "findings" review can be incomplete too: a later review must not rely on it.
+            "complete": assessment.complete,
+            "verdict": assessment.verdict,
             "config_hash": snap.config.config_hash,
             "reviewed_at": info.reviewed_at,
             "findings": items[:MAX_STATE_FINDINGS],
@@ -280,7 +282,9 @@ def finalize(
     )
     priors = refound_priors(priors, built.reported_ids)
     coverage = _coverage(prep, all_explores, snap.prior)
-    verdict, reasons = decide(
+    idle = None if prep.reviewable_paths else nothing_to_review(prep.excluded)
+    unreviewed = None if prep.reviewable_paths else unreviewed_code(prep.excluded)
+    assessment = assess(
         scope=prep.scope,
         expected_explorers=[r.model for r in prep.roles.explorers],
         explores=all_explores,
@@ -293,7 +297,10 @@ def finalize(
         priors=priors,
         prior_state=snap.prior,
         structured=len(merge.explorer_models) if merge is not None else len(all_drafts),
+        nothing_to_review=idle,
+        unreviewed_code=unreviewed,
     )
+    verdict, reasons = assessment.verdict, assessment.reasons
     usage = collect_usage(all_explores, all_drafts, verify)
     cost = sum(u.cost_usd for u in usage.values())
     verify_counts: dict[str, int] = {}
@@ -321,6 +328,7 @@ def finalize(
         head_sha=snap.head_sha,
         verdict=verdict,
         verdict_reasons=reasons,
+        complete=assessment.complete,
         scope=prep.scope,
         since_sha=prep.since_sha,
         findings=built.findings,
@@ -338,7 +346,7 @@ def finalize(
         priors=priors[:60],
         summary_md=render.summary(view),
         report_md=render.report(view, head),
-        state=_state(snap, info, verdict, built.findings, priors, head),
+        state=_state(snap, info, assessment, built.findings, priors, head),
         usage=usage,
         cost_usd=cost,
         coverage=coverage.as_dict(),

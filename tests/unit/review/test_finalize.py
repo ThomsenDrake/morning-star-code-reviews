@@ -368,14 +368,17 @@ def test_single_incomplete_golden(make) -> None:
         budget_exhausted=True,
         exhausted_by=["deadline"],
     )
-    assert final.verdict == "incomplete"
+    # The open finding gives "findings"; the review is still incomplete: the summary
+    # lists the gaps and the stored state is not complete, so the next run is full.
+    assert final.verdict == "findings"
     assert final.verdict_reasons == [
         "the zai-glm-5-3 explorer did not finish its review (out of deadline)",
         "1 of 2 reviewable changed files was not opened",
     ]
     f = final.findings[0]
     assert f.votes == [GLM] and f.verify_status is None and f.state == "open"
-    assert not final.state.complete
+    assert not final.state.complete and final.state.verdict == "findings"
+    assert "The review did not cover everything" in final.summary_md
     check_golden("single_incomplete_summary.md", final.summary_md)
     check_golden("single_incomplete_report.md", final.report_md)
 
@@ -447,7 +450,10 @@ def test_verifier_failure_keeps_candidates_but_blocks_clean(make) -> None:
         merge=merge,
         verify=None,
     )
-    assert final.verdict == "incomplete" and final.verdict_reasons == ["the verifier did not run"]
+    # The unconfirmed finding is open (summary only), so the verdict is "findings";
+    # without the verifier the review is not complete.
+    assert final.verdict == "findings" and final.verdict_reasons == ["the verifier did not run"]
+    assert not final.state.complete
     f = final.findings[0]
     assert f.verify_status == "uncertain" and f.state == "summary_only"  # one vote: summary only
     assert "#### Possible issues (not confirmed)" in final.summary_md
@@ -480,7 +486,8 @@ def test_verifier_configured_but_no_merge_publishes_nothing_as_confirmed(make) -
         make.heads().get,
         make.info(),
     )
-    assert final.verdict == "incomplete" and final.verdict_reasons == ["the verifier did not run"]
+    assert final.verdict == "findings" and final.verdict_reasons == ["the verifier did not run"]
+    assert not final.state.complete
     assert [(f.verify_status, f.state) for f in final.findings] == [("uncertain", "summary_only")]
 
 

@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 
 from morning_star_review.core import models as m
-from morning_star_review.core.contract import DEFAULT_ALLOWED_MODELS, OperatorPolicy, Usage
+from morning_star_review.core.contract import (
+    DEFAULT_ALLOWED_MODELS,
+    OperatorPolicy,
+    PresetName,
+    Usage,
+)
 
 ALL_EFFORTS = ["default", "low", "medium", "high", "max"]
 
@@ -176,10 +181,53 @@ def test_estimate_cost_never_undercounts_separately_reported_tokens() -> None:
     assert m.estimate_cost("mistral-large-4", odd) == pytest.approx(0.70 + 2.10)
 
 
-def test_tool_call_limit_caps_fast_models() -> None:
+def test_tool_call_limit_defaults_fast_models_lower() -> None:
     assert m.tool_call_limit("zai-glm-5-3", 60) == 60
     assert m.tool_call_limit("mistral-large-4", 60) == 60
     assert m.tool_call_limit("zai-glm-5-3-flash", 60) == 25
     assert m.tool_call_limit("deepseek-v4-1-flash-1017", 60) == 25
     assert m.tool_call_limit("zai-glm-5-3-flash", 10) == 10
     assert m.tool_call_limit("unknown", 60) == 60
+
+
+def test_fast_models_have_a_default_not_a_ceiling() -> None:
+    assert m.MODEL_TABLE["zai-glm-5-3-flash"].default_tool_calls == 25
+    assert m.MODEL_TABLE["deepseek-v4-1-flash-1017"].default_tool_calls == 25
+    # An explicit budget (config, CLI flag, Action input) may raise the per-model default.
+    assert m.tool_call_limit("zai-glm-5-3-flash", 60, explicit=True) == 60
+    assert m.tool_call_limit("deepseek-v4-1-flash-1017", 40, explicit=True) == 40
+    assert m.tool_call_limit("deepseek-v4-1-flash-1017", 120, explicit=True) == 120
+    # ...and lower it.
+    assert m.tool_call_limit("zai-glm-5-3", 12, explicit=True) == 12
+    assert m.tool_call_limit("zai-glm-5-3-flash", 10, explicit=True) == 10
+
+
+@pytest.mark.parametrize("model", ["zai-glm-5-3", "mistral-large-4", "deepseek-v4-1-flash-1017"])
+def test_best_preset_gives_every_explorer_60_tool_calls(model: str) -> None:
+    assert m.PRESETS["best"].explorer_tool_calls == 60
+    assert m.tool_call_limit(model, 60, preset="best") == 60
+    # Never above the run budget (already clipped to the operator cap)...
+    assert m.tool_call_limit(model, 40, preset="best") == 40
+    # ...and an explicit budget still wins.
+    assert m.tool_call_limit(model, 100, explicit=True, preset="best") == 100
+    assert model in {r.model for r in m.PRESETS["best"].explorers}
+
+
+@pytest.mark.parametrize("name", ["balanced", "single", "fast", "mistral"])
+def test_other_presets_keep_the_per_model_defaults(name: PresetName) -> None:
+    assert m.PRESETS[name].explorer_tool_calls is None
+    assert m.tool_call_limit("zai-glm-5-3-flash", 60, preset=name) == 25
+    assert m.tool_call_limit("zai-glm-5-3", 60, preset=name) == 60
+
+
+def test_fast_preset_explorer_defaults_to_25_but_can_be_raised() -> None:
+    (explorer,) = m.PRESETS["fast"].explorers
+    assert m.tool_call_limit(explorer.model, 60, preset="fast") == 25
+    assert m.tool_call_limit(explorer.model, 50, explicit=True, preset="fast") == 50
+
+
+def test_verifier_limit_uses_the_model_default_only() -> None:
+    # The verifier is called without a preset: the explorer budget of `best` does not apply.
+    assert m.tool_call_limit("zai-glm-5-3", 30) == 30
+    assert m.tool_call_limit("deepseek-v4-1-flash-1017", 30) == 25
+    assert m.tool_call_limit("deepseek-v4-1-flash-1017", 30, explicit=True) == 30

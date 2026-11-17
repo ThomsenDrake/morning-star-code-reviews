@@ -152,8 +152,6 @@ Code at head:
 
 Excluded (1): `uv.lock` (lock file).
 
-#### Run details
-
 <details><summary>Run details</summary>
 
 Execution `msreview-ci-octo-ledger-7-aaaaaaa-x1y2` · run `gha:octo/ledger/123/1` · version `0.1.0`

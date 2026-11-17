@@ -48,6 +48,8 @@ _UNTRUSTED = re.compile(r"(untrusted)(-)", re.IGNORECASE)
 # files past the cap are counted, and all of them stay reachable through the tools.
 SCOPE_TABLE_MAX_ROWS = 400
 SCOPE_TABLE_MAX_CHARS = 24_000
+EXCLUDED_TABLE_MAX_CHARS = 8_000  # the excluded-files list in the scope block
+EXCLUDED_PATH_MAX_CHARS = 200  # one excluded path as shown there
 PRIOR_MAX = 30
 _PRIOR_FIELD_MAX = 200
 
@@ -176,6 +178,10 @@ def _guidance(cfg: ResolvedConfig) -> str:
     )
 
 
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def _scope_line(scope: ScopeDecision) -> str:
     if scope.scope == "incremental" and scope.since_sha:
         return f"scope: incremental since {scope.since_sha[:7]} (changes after the last review)"
@@ -214,10 +220,19 @@ def _scope_block(snap: PrSnapshot, plan: PromptPlan, scope: ScopeDecision) -> st
         )
     if plan.excluded:
         lines.append(f"excluded from review by default ({len(plan.excluded)}):")
-        shown = plan.excluded[:SCOPE_TABLE_MAX_ROWS]
-        lines.extend(f"{defang(e.path)} ({defang(e.reason)})" for e in shown)
-        if len(shown) < len(plan.excluded):
-            lines.append(f"... and {len(plan.excluded) - len(shown)} more excluded files")
+        # A character budget as well as a row cap: the PR author picks these paths, and
+        # this text is resent on every model call (security review PL-6).
+        shown = 0
+        used = 0
+        for e in plan.excluded[:SCOPE_TABLE_MAX_ROWS]:
+            row = f"{defang(_clip(e.path, EXCLUDED_PATH_MAX_CHARS))} ({defang(e.reason)})"
+            if used + len(row) > EXCLUDED_TABLE_MAX_CHARS:
+                break
+            lines.append(row)
+            used += len(row) + 1
+            shown += 1
+        if shown < len(plan.excluded):
+            lines.append(f"... and {len(plan.excluded) - shown} more excluded files")
     lines.append("</review_scope>")
     return "\n".join(lines)
 

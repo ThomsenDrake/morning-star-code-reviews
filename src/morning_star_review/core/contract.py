@@ -103,6 +103,9 @@ class OperatorPolicy(Contract):
     verifier_minutes_cap: int = Field(default=8, ge=1, le=25)
     labels: bool = True  # Action input `labels`; the repo file can only turn labels off
     suggestions: bool = True  # Action input `suggestions`; the repo file can only turn them off
+    # The operator's default preset (CLI user config ``[defaults] preset``). Not an explicit
+    # run preset: a trusted repository file's preset and model settings win over it.
+    default_preset: PresetName | None = None
 
 
 class RunOverrides(Contract):

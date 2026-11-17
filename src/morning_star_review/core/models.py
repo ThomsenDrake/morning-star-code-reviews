@@ -44,15 +44,16 @@ class ModelInfo:
 
     ``efforts`` lists the efforts the API accepts besides ``"default"`` (which
     means "do not send ``reasoning_effort``" and is valid for every model).
-    ``max_tool_calls`` caps each agent run on this model below the run budget;
-    fast models keep exploring for a long time when allowed many tools.
+    ``default_tool_calls`` is the tool-call budget an agent run on this model gets
+    when nobody set a budget (fast models keep exploring for a long time when allowed
+    many tools). It is a default, not a ceiling: see ``tool_call_limit``.
     """
 
     efforts: frozenset[str]
     price_in: float  # USD per 1M input tokens (list price)
     price_out: float  # USD per 1M output tokens (list price)
     lifecycle: str
-    max_tool_calls: int | None = None
+    default_tool_calls: int | None = None
 
 
 MODEL_TABLE: dict[str, ModelInfo] = {
@@ -73,14 +74,14 @@ MODEL_TABLE: dict[str, ModelInfo] = {
         price_in=0.15,
         price_out=0.50,
         lifecycle="GA, third-party",
-        max_tool_calls=25,
+        default_tool_calls=25,
     ),
     "deepseek-v4-1-flash-1017": ModelInfo(
         efforts=frozenset({"low", "high", "max"}),
         price_in=0.30,
         price_out=1.20,
         lifecycle="Public Preview, third-party",
-        max_tool_calls=25,
+        default_tool_calls=25,
     ),
 }
 
@@ -101,6 +102,9 @@ class Preset:
     verifier: ModelRole | None
     formatter: ModelRole
     description: str
+    # Tool-call budget for every explorer of a run started from this preset when the
+    # budget was not set explicitly; it replaces the per-model defaults. None = use them.
+    explorer_tool_calls: int | None = None
 
 
 def _role(model: str, effort: Effort) -> ModelRole:
@@ -118,6 +122,7 @@ PRESETS: dict[PresetName, Preset] = {
         verifier=_role("zai-glm-5-3", "high"),
         formatter=_role("mistral-large-4", "low"),
         description="three explorers in parallel, merged, then verified",
+        explorer_tool_calls=60,
     ),
     "balanced": Preset(
         name="balanced",
@@ -227,9 +232,30 @@ def estimate_cost(model: str, usage: Usage) -> float:
     return (tokens_in * price_in + tokens_out * price_out) / 1_000_000
 
 
-def tool_call_limit(model: str, requested: int) -> int:
-    """Tool-call budget for one agent run on ``model`` (the per-model cap, if lower)."""
-    info = MODEL_TABLE.get(model)
-    if info is None or info.max_tool_calls is None:
+def tool_call_limit(
+    model: str,
+    requested: int,
+    *,
+    explicit: bool = False,
+    preset: PresetName | None = None,
+) -> int:
+    """Tool-call budget for one agent run on ``model``.
+
+    ``requested`` is the run's budget for the role, already clipped to the operator
+    cap. The per-model value (``ModelInfo.default_tool_calls``) is a default, not a
+    ceiling; the agent's time budget stays the real guard:
+
+    - ``explicit=True`` (the operator, the CLI, the Action or the repository config set
+      the budget): ``requested``, even above the per-model default.
+    - else, when ``preset`` (the preset the run started from; pass it for explorers
+      only) sets ``explorer_tool_calls``: that value, never above ``requested``. Every
+      explorer of the ``best`` preset gets 60.
+    - else the per-model default when it is lower than ``requested``.
+    """
+    if explicit:
         return requested
-    return min(requested, info.max_tool_calls)
+    fixed = PRESETS[preset].explorer_tool_calls if preset in PRESETS else None
+    if fixed is None:
+        info = MODEL_TABLE.get(model)
+        fixed = info.default_tool_calls if info is not None else None
+    return requested if fixed is None else min(requested, fixed)

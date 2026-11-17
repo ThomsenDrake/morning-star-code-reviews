@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import stat
 import subprocess
 import sys
@@ -23,6 +22,7 @@ from morning_star_review._version import __version__
 from morning_star_review.core.contract import DEFAULT_ALLOWED_MODELS
 from morning_star_review.core.errors import MsreviewError
 from morning_star_review.core.naming import NAME_PREFIX
+from morning_star_review.core.proc import git_executable
 from morning_star_review.platform import MistralPlatform, Platform, PlatformError
 
 __all__ = ["Check", "Report", "check_app_settings", "run_doctor"]
@@ -160,7 +160,7 @@ def run_doctor(
     src = os.environ if env is None else env
     report = Report()
     report.add("version", True, f"msreview {__version__} (python {sys.version.split()[0]})")
-    git = shutil.which("git", path=src.get("PATH"))
+    git = git_executable(src.get("PATH") or "")  # the git that reviews will run
     if git is None:
         report.add("git", False, "git is not on PATH")
     else:

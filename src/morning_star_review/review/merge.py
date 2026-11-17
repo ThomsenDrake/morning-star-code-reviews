@@ -1,13 +1,20 @@
 """Deterministic merge of explorer drafts into voted candidates (ADDENDUM D).
 
 Each explorer of an ensemble writes its own draft. The same bug usually shows up in
-several drafts with slightly different lines, evidence and titles. Two findings are
-the same when they are on the same path, in the same hunk with anchored lines at most
-three apart, and either their evidence matches (one contains the other, length ratio
-at least 0.6) or their titles share at least half of their significant words.
+several drafts with slightly different lines, ranges, evidence and titles. Two
+findings are the same when they are on the same path and near each other, and they
+are similar:
 
-A merged candidate keeps the highest severity and the longest explanation; its
-``votes`` are the models that reported it. No model is involved.
+- near: their line ranges (``line``..``end_line``) overlap or are at most three lines
+  apart, and, on the diff, they are in the same hunk. One explorer may flag a whole
+  function while another flags the one line inside it.
+- similar: their evidence matches (one contains the other, length ratio at least
+  0.6), or their titles share at least 40% of their significant words, or they have
+  the same category and their ranges overlap by at least half of the smaller range.
+
+A merged candidate keeps the highest severity, the longest explanation and the best
+anchor (on the diff with exact evidence first); its ``votes`` are the models that
+reported it. No model is involved.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ from morning_star_review.core.contract import (
 )
 from morning_star_review.core.ids import candidate_id, evidence_match
 from morning_star_review.review.anchoring import (
+    MAX_RANGE_SPAN,
     Anchored,
     anchor_finding,
     evidence_variants,
@@ -36,6 +44,7 @@ from morning_star_review.review.anchoring import (
 __all__ = [
     "LINE_WINDOW",
     "MAX_CANDIDATES",
+    "RANGE_OVERLAP",
     "TITLE_OVERLAP",
     "HeadText",
     "draft_models",
@@ -46,8 +55,9 @@ __all__ = [
 ]
 
 MAX_CANDIDATES = 60
-LINE_WINDOW = 3
-TITLE_OVERLAP = 0.5
+LINE_WINDOW = 3  # ranges at most this many lines apart are near
+TITLE_OVERLAP = 0.4  # Dice coefficient of significant title words
+RANGE_OVERLAP = 0.5  # share of the smaller range, for same-category findings
 
 HeadText = Callable[[str], list[str] | None]
 
@@ -121,26 +131,55 @@ class _Item:
     finding: DraftFinding
     where: Anchored
     hunk: int | None  # hunk of the anchored line, None when not on a changed line
+    lines: tuple[int, int] | None  # (first, last) line the finding covers, see _lines_of
+
+
+def _lines_of(where: Anchored, f: DraftFinding) -> tuple[int, int] | None:
+    """The lines a finding covers: its anchored range, else the range the model asked for.
+
+    A range that anchoring could not place (or a finding off the diff) still tells
+    which code the model meant; it moves with a snapped start. Ranges longer than
+    ``MAX_RANGE_SPAN`` count as their first line only.
+    """
+    start = where.line
+    if start is None:
+        return None
+    end = where.end_line
+    if end is None and f.line is not None and f.end_line is not None:
+        end = start + (f.end_line - f.line)
+    if end is None or end < start or end - start > MAX_RANGE_SPAN:
+        return start, start
+    return start, end
+
+
+def _gap(a: tuple[int, int], b: tuple[int, int]) -> int:
+    """Lines between two ranges; zero or less when they overlap (minus the overlap + 1)."""
+    return max(a[0], b[0]) - min(a[1], b[1])
+
+
+def _overlap_share(a: tuple[int, int] | None, b: tuple[int, int] | None) -> float:
+    """Overlapping lines as a share of the smaller range (0..1)."""
+    if a is None or b is None or _gap(a, b) > 0:
+        return 0.0
+    smaller = min(a[1] - a[0], b[1] - b[0]) + 1
+    return (1 - _gap(a, b)) / smaller
 
 
 def _near(a: _Item, b: _Item) -> bool:
-    if a.where.path != b.where.path:
+    # Same hunk when both are on the diff; both off the diff otherwise (hunk None).
+    if a.where.path != b.where.path or a.hunk != b.hunk:
         return False
-    la, lb = a.where.line, b.where.line
-    if a.hunk is not None and b.hunk is not None:
-        return (
-            a.hunk == b.hunk and la is not None and lb is not None and abs(la - lb) <= LINE_WINDOW
-        )
-    if a.hunk is None and b.hunk is None:  # neither on a changed line: compare model lines
-        if la is None or lb is None:
-            return la is None and lb is None
-        return abs(la - lb) <= LINE_WINDOW
-    return False
+    if a.lines is None or b.lines is None:
+        return a.lines is None and b.lines is None
+    return _gap(a.lines, b.lines) <= LINE_WINDOW
 
 
 def _similar(a: _Item, b: _Item) -> bool:
-    return _evidence_similar(a.finding.evidence, b.finding.evidence) or (
-        title_similarity(a.finding.title, b.finding.title) >= TITLE_OVERLAP
+    fa, fb = a.finding, b.finding
+    return (
+        _evidence_similar(fa.evidence, fb.evidence)
+        or title_similarity(fa.title, fb.title) >= TITLE_OVERLAP
+        or (fa.category == fb.category and _overlap_share(a.lines, b.lines) >= RANGE_OVERLAP)
     )
 
 
@@ -154,10 +193,11 @@ class _Cluster:
     items: list[_Item] = field(default_factory=list)
 
     def distance(self, item: _Item) -> int:
-        lines = [m.where.line for m in self.items if m.where.line is not None]
-        if item.where.line is None or not lines:
+        """Smallest line gap to a member (negative when ranges overlap: more is closer)."""
+        if item.lines is None:
             return 0
-        return min(abs(item.where.line - n) for n in lines)
+        gaps = [_gap(item.lines, m.lines) for m in self.items if m.lines is not None]
+        return min(gaps, default=0)
 
 
 def draft_models(drafts: Sequence[ReviewDraft]) -> list[str]:
@@ -192,7 +232,8 @@ def _items(
             where = anchor_finding(f, anchors, head(path), pr_paths)
             on_diff = where.kind in ("inline", "snapped")
             hunk = hunk_of(anchors.files.get(where.path), where.line) if on_diff else None
-            items.append(_Item(model, (SEVERITY_ORDER[f.severity], di, fi), f, where, hunk))
+            rank = (SEVERITY_ORDER[f.severity], di, fi)
+            items.append(_Item(model, rank, f, where, hunk, _lines_of(where, f)))
     return sorted(items, key=lambda it: it.rank)
 
 
@@ -230,13 +271,28 @@ def _placed_for_suggestion(item: _Item) -> bool:
     return item.where.kind == "inline" or (item.where.kind == "snapped" and item.where.exact)
 
 
-def _suggestion(cluster: _Cluster) -> str | None:
-    """The first suggestion written for exactly the representative's lines.
+def _anchor_quality(item: _Item) -> int:
+    """0: on the diff with exact evidence, 1: on the diff, 2: off the diff."""
+    on_diff = item.where.kind in ("inline", "snapped")
+    return 0 if on_diff and item.where.exact else 1 if on_diff else 2
+
+
+def _best_anchor(cluster: _Cluster) -> _Item:
+    """The member whose location the candidate takes (rank order on ties).
+
+    An explorer that flags a whole function next to one that quotes the exact
+    line yields the exact line, whichever is more severe.
+    """
+    return min(cluster.items, key=_anchor_quality)
+
+
+def _suggestion(cluster: _Cluster, anchor: _Item) -> str | None:
+    """The first suggestion written for exactly the anchor's lines.
 
     A suggestion replaces specific lines, so one written by another explorer for a
-    neighbouring line must not be attached to the representative's location.
+    neighbouring line must not be attached to the candidate's location.
     """
-    span = _span(cluster.items[0])
+    span = _span(anchor)
     return next(
         (
             m.finding.suggestion
@@ -248,15 +304,21 @@ def _suggestion(cluster: _Cluster) -> str | None:
 
 
 def _combine(cluster: _Cluster, models: list[str]) -> tuple[DraftFinding, list[str]]:
-    rep = cluster.items[0]  # most severe, earliest draft: items arrive in rank order
-    f, where = rep.finding, rep.where
+    """One candidate per cluster.
+
+    The claim (severity, category, title, fix) comes from the representative, the
+    most severe member of the earliest draft (items arrive in rank order). The
+    location and evidence come from the best anchor. The explanation is the longest.
+    """
+    rep, anchor = cluster.items[0], _best_anchor(cluster)
+    f, at, where = rep.finding, anchor.finding, anchor.where
     on_diff = where.kind in ("inline", "snapped")
-    line = where.line if on_diff else f.line
-    end_line = f.end_line
-    if end_line is not None and f.line is not None and line is not None:
-        end_line += line - f.line  # keep the requested range length; finalize re-checks it
+    line = where.line if on_diff else at.line
+    end_line = at.end_line
+    if end_line is not None and at.line is not None and line is not None:
+        end_line += line - at.line  # keep the requested range length; finalize re-checks it
     members = [m.finding for m in cluster.items]
-    evidence = f.evidence if f.evidence.strip() else _longest([m.evidence for m in members])
+    evidence = at.evidence if at.evidence.strip() else _longest([m.evidence for m in members])
     fix = f.fix if f.fix and f.fix.strip() else _longest([m.fix for m in members])
     merged = f.model_copy(
         update={
@@ -266,7 +328,7 @@ def _combine(cluster: _Cluster, models: list[str]) -> tuple[DraftFinding, list[s
             "evidence": evidence or "",
             "explanation": _longest([m.explanation for m in members]) or f.explanation,
             "fix": fix,
-            "suggestion": _suggestion(cluster),
+            "suggestion": _suggestion(cluster, anchor),
         }
     )
     voted = {m.model for m in cluster.items}

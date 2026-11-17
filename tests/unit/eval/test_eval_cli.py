@@ -44,17 +44,55 @@ def test_parse_config() -> None:
 
 def test_build_command_and_plan(cases: dict[str, CaseKey], tmp_path: Path) -> None:
     configs = [ev.parse_config("preset:best", "high"), ev.parse_config("model:m", "low")]
-    prs = {"e1": {"number": 7, "head_sha": "c" * 40}, "e6": {"number": 9}}
-    specs = ev.plan_runs(configs, [cases["e1"], cases["e6"]], 3, "acme/play", prs)
-    assert len(specs) == 2 * 3 + 2 * 1  # E6 runs once
+    prs = {"e1": {"number": 7, "head_sha": "C" * 40}, "e6": {"number": 9}}
+    both = [cases["e1"], cases["e6"]]
+    specs = ev.plan_runs(configs, both, None, "acme/play", prs)
+    assert len(specs) == 2 * 3 + 2 * 1  # no --runs: E6's own `eval.runs: 1`, else 3
+    # An explicit --runs wins for every case, E6 included.
+    assert len(ev.plan_runs(configs, both, 3, "acme/play", prs)) == 2 * 3 * 2
+    assert len(ev.plan_runs(configs, both, 1, "acme/play", prs)) == 2 * 1 * 2
+    assert ev.runs_for(cases["e6"], None) == 1 and ev.runs_for(cases["e6"], 5) == 5
+    assert ev.runs_for(cases["e1"], None) == ev.DEFAULT_RUNS
     first = specs[0]
     assert first.pr_url == "https://github.com/acme/play/pull/7"
     assert first.expected_head_sha == "c" * 40
     cmd = ev.build_command("msreview", first, tmp_path, ["--verbose"], True)
     assert cmd[:6] == ["msreview", "review", first.pr_url, "--post", "never", "--json"]
     assert cmd[-3:] == ["--preset", "best", "--verbose"] and "--force" in cmd
+    at = cmd.index("--expected-head-sha")
+    assert cmd[at + 1] == "c" * 40
+    e6 = next(spec for spec in specs if spec.case.case == "e6")
+    assert e6.expected_head_sha is None
+    assert "--expected-head-sha" not in ev.build_command("msreview", e6, tmp_path, [], True)
     with pytest.raises(SystemExit):
         ev.plan_runs(configs, [cases["e4"]], 1, "acme/play", prs)
+    with pytest.raises(SystemExit, match="bad head_sha"):
+        ev.plan_runs(configs, [cases["e1"]], 1, "acme/play", {"e1": {"number": 7, "head_sha": "x"}})
+
+
+def test_describe_runs_names_configs_cases_and_mode() -> None:
+    sha = ["--expected-head-sha", "a" * 40]
+    base = ["review", "https://github.com/a/b/pull/1", "--post", "never", "--json"]
+    metas = [
+        {"config": "preset:best", "case": "e1", "argv": [*base, *sha, "--preset", "best"]},
+        {"config": "preset:best", "case": "e1", "argv": [*base, *sha, "--preset", "best"]},
+        {"config": "model:m", "case": "e1", "argv": [*base, "--preset", "single"]},
+        {"config": "preset:best", "case": "e6", "argv": [*base, *sha, "--preset", "best"]},
+    ]
+    lines = ev.describe_runs(metas)
+    assert lines == [
+        "configs: preset:best, model:m",
+        "cases (runs per configuration): e1 x1-2, e6 x1",
+        "mode: report (`--post never`), Workflows worker, production prompts, tools and budgets",
+        "head SHA pinned (`--expected-head-sha`): 3/4 runs",
+    ]
+    local = ev.mode_of([*base, "--local", "--max-tool-calls", "90", "--deadline-minutes=50"])
+    assert local == (
+        "report (`--post never`), in-process (`--local`), "
+        "custom budgets (`--deadline-minutes`, `--max-tool-calls`)"
+    )
+    assert ev.mode_of(["review", "u"]).startswith("posting (`--post auto`)")
+    assert ev.describe_runs([])[0] == "configs: -"
 
 
 def test_parse_outcome_variants() -> None:
@@ -104,6 +142,10 @@ if sys.argv[1] == "--version":
 url = sys.argv[2]
 number = int(re.search(r"/pull/(\\d+)", url).group(1))
 assert "--post" in sys.argv and "never" in sys.argv
+if number == 11:  # e1 has a head SHA in prs.json: it must be pinned
+    assert sys.argv[sys.argv.index("--expected-head-sha") + 1] == "d" * 40
+else:
+    assert "--expected-head-sha" not in sys.argv
 print("msreview: scope=full inlined=4 on_demand=0 excluded=0", file=sys.stderr)
 print("msreview agent: complete=true rescued=false budget_exhausted=false", file=sys.stderr)
 findings = []
@@ -142,6 +184,10 @@ def test_run_and_score_end_to_end(tmp_path: Path) -> None:
     md = out.read_text()
     assert "hidden-playground" not in md
     assert "msreview 0.0.0-test" in md
+    assert "- configs: preset:best\n" in md
+    assert "- cases (runs per configuration): e1 x2, e4 x2\n" in md
+    assert "- mode: report (`--post never`), Workflows worker" in md
+    assert "- head SHA pinned (`--expected-head-sha`): 2/4 runs\n" in md
     assert "| preset:best | 4 | 2/8 (25%) | 2/8 |" in md
     scores = json.loads(out.with_suffix(".json").read_text())
     assert len(scores) == 4
@@ -159,6 +205,12 @@ def test_run_and_score_end_to_end(tmp_path: Path) -> None:
     assert ev.main(["score", "--raw-dir", str(raw), "--out", str(rescored)]) == 0
     text = rescored.read_text()
     assert "hidden-playground" not in text and "| preset:best | 4 |" in text
+    # The score header says what was run, like the run header.
+    assert "- runs: 4\n- configs: preset:best\n" in text
+    assert "- mode: report (`--post never`)" in text
+    only_e1 = tmp_path / "e1.md"
+    assert ev.main(["score", "--raw-dir", str(raw), "--out", str(only_e1), "--cases", "e1"]) == 0
+    assert "- cases (runs per configuration): e1 x2\n" in only_e1.read_text()
 
 
 def test_dry_run_prints_commands(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -190,3 +242,19 @@ def test_run_is_the_default_subcommand(tmp_path: Path, capsys: pytest.CaptureFix
         ev.main(["run", "--prs", str(prs), "--models", "a", "--resume"])
     with pytest.raises(SystemExit, match="needs --prs"):
         ev.main(["run", "--models", "a"])
+    with pytest.raises(SystemExit, match="--runs must be at least 1"):
+        ev.main(["run", "--prs", str(prs), "--models", "a", "--runs", "0", "--dry-run"])
+
+
+def test_runs_override_reaches_every_case(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prs = tmp_path / "prs.json"
+    sha = "e" * 40
+    prs.write_text(json.dumps({"repo": "acme/p", "cases": {"e6": {"number": 3, "head_sha": sha}}}))
+    argv = ["run", "--prs", str(prs), "--models", "a", "--cases", "e6", "--dry-run"]
+    assert ev.main([*argv, "--raw-dir", str(tmp_path)]) == 0
+    assert len(capsys.readouterr().out.strip().splitlines()) == 1  # the case's own runs: 1
+    assert ev.main([*argv, "--raw-dir", str(tmp_path), "--runs", "3"]) == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 3 and all(f"--expected-head-sha {sha}" in line for line in lines)

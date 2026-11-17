@@ -150,7 +150,12 @@ class AppSettings:
 
 
 def default_config_path(env: Mapping[str, str] | None = None) -> Path:
+    """``$MSREVIEW_CONFIG`` or ``~/.config/morning-star-review/config.toml``: the same file
+    as ``usersettings.config_path``, so ``[app]`` comes from the file the rest does."""
     source = os.environ if env is None else env
+    explicit = source.get("MSREVIEW_CONFIG", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
     home = source.get("HOME") or str(Path.home())
     return Path(home) / ".config" / "morning-star-review" / "config.toml"
 
@@ -335,7 +340,10 @@ async def mint_via_child(
     ``env`` replaces the allowlisted environment (tests); the default is
     ``child_env("mint")``.
     """
-    argv = [python or sys.executable, "-m", _CHILD_MODULE, "--repo", repo]
+    # -I (isolated mode): the cwd (perhaps a cloned repository with a json.py or an
+    # httpx/ package) is not put on sys.path, and PYTHON* variables are ignored. The
+    # child holds the App key command and password-manager tokens.
+    argv = [python or sys.executable, "-I", "-m", _CHILD_MODULE, "--repo", repo]
     if check_only:
         argv.append("--check")
     try:

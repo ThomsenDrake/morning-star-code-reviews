@@ -395,27 +395,30 @@ def test_second_evidence_like_key_inside_why_stays_prose() -> None:
 
 
 @pytest.mark.parametrize(
-    "terminator",
+    ("terminator", "complete"),
     [
-        "FINDING\nfile: b.py\nseverity: low\ntitle: second\nEND FINDING",
-        "SUMMARY: done",
-        "PRIOR f00000000001: fixed - gone",
-        "REVIEW COMPLETE",
-        "NO FINDINGS",
+        # Without a sentinel or a summary after it, closed blocks are still not enough.
+        ("FINDING\nfile: b.py\nseverity: low\ntitle: second\nEND FINDING", False),
+        ("SUMMARY: done", True),
+        ("PRIOR f00000000001: fixed - gone", False),
+        ("REVIEW COMPLETE", True),
+        ("NO FINDINGS", False),
     ],
 )
-def test_missing_end_finding_closes_at_the_next_structure(terminator: str) -> None:
+def test_missing_end_finding_closes_at_the_next_structure(terminator: str, complete: bool) -> None:
+    # Models often omit END FINDING; a later marker closes the block (live E5 runs).
     p = parse_notes(f"FINDING\nfile: a.py\nseverity: high\ntitle: first\nwhy: w\n{terminator}\n")
     assert p.findings[0].title == "first"
     assert p.findings[0].explanation == "w"
-    assert not p.closed_blocks
-    assert not p.looks_complete
+    assert p.closed_blocks
+    assert p.looks_complete is complete
 
 
 def test_missing_end_finding_at_end_of_text() -> None:
     p = parse_notes("FINDING\nfile: a.py\nseverity: high\ntitle: t\nwhy: w")
     assert len(p.findings) == 1 and p.lossless
     assert not p.closed_blocks and not p.sentinel
+    assert not p.looks_complete
 
 
 def test_end_finding_variants() -> None:
@@ -735,8 +738,9 @@ def test_messy_live_style_notes() -> None:
     assert (second.line, second.end_line) == (80, 82)
     assert p.priors[0].status == "still_open"
     assert p.summary.startswith("Two problems in the billing path")
-    assert not p.sentinel and not p.closed_blocks  # no END FINDING lines
-    assert p.ends_with_summary
+    assert not p.sentinel  # no REVIEW COMPLETE
+    assert p.closed_blocks  # no END FINDING lines, but FINDING 2 and PRIOR close the blocks
+    assert p.ends_with_summary and p.looks_complete
 
 
 def test_evidence_in_a_fenced_block() -> None:
@@ -1001,6 +1005,11 @@ _ADVERSARIAL = [
     "VERDICT" + " " * 60000 + "c1",
     "FINDING\nline: " + "1-" * 30000,
     ("FINDING\nfile: a.py\nseverity: low\ntitle: t\nEND FINDING\n") * 2000,
+    # One-line fields that the escape scanner walks character by character.
+    "FINDING\nfile: a.py\nseverity: low\ntitle: t\nwhy: " + "ab'\\n" * 15000,
+    "FINDING\nfile: a.py\nseverity: low\ntitle: t\nevidence: " + ("x" * 60 + "'\\t") * 1000,
+    "FINDING\nfile: a.py\nseverity: low\ntitle: " + '`\\n"\\n' * 15000,
+    "VERDICT c1\nstatus: confirmed\nevidence: " + "f'\\n" * 20000,
 ]
 
 
@@ -1037,3 +1046,166 @@ def test_an_unindented_end_finding_still_ends_an_unterminated_suggestion() -> No
     p = parse_notes(notes)
     assert len(p.findings) == 1 and p.findings[0].suggestion is None
     assert p.dropped_suggestions == 1 and p.looks_complete
+
+
+# --------------------------------------------------------------------------------------
+# Implicitly closed blocks (live E5 runs: END FINDING omitted, review still complete)
+# --------------------------------------------------------------------------------------
+
+_BLOCK_A = (
+    "FINDING 1: SQL injection in find_account\n"
+    "file: ledger/db.py\nline: 155\nend_line: 156\nseverity: critical\ncategory: security\n"
+    "evidence: `cur.execute(f\"SELECT * FROM accounts WHERE name = '{name}'\")`\n"
+    "why: The name comes from the request and is formatted into the SQL text.\n"
+    "fix: Pass the name as a bound parameter.\n"
+)
+_BLOCK_B = (
+    "FINDING 2: Last page is dropped\n"
+    "file: ledger/pagination.py\nline: 80\nseverity: medium\ncategory: correctness\n"
+    "evidence: for page in range(1, total_pages):\n"
+    "why: range() stops before total_pages.\n"
+)
+
+
+@pytest.mark.parametrize(
+    "notes",
+    [
+        # END FINDING missing before SUMMARY: (zai and deepseek E5 runs).
+        f"{_BLOCK_A}\nSUMMARY: Checked db.py; one injection.\n\nREVIEW COMPLETE\n",
+        # END FINDING missing before the next FINDING (the first block of a deepseek run).
+        f"{_BLOCK_A}\n{_BLOCK_B}END FINDING\n\nSUMMARY: Two problems.\nREVIEW COMPLETE\n",
+        # Missing everywhere, and the notes go straight to REVIEW COMPLETE.
+        f"{_BLOCK_A}\n{_BLOCK_B}\nREVIEW COMPLETE\n",
+        # Before PRIOR and NO FINDINGS-style trailers, with the summary at the end.
+        f"{_BLOCK_A}PRIOR f0123456789ab: fixed - uses parameters now\nSUMMARY: Done.\n",
+        # Bold markers, as models write them in markdown.
+        f"**{_BLOCK_A}**SUMMARY:** Checked db.py.\n**REVIEW COMPLETE**\n",
+    ],
+)
+def test_blocks_closed_by_a_later_marker_count_as_closed(notes: str) -> None:
+    p = parse_notes(notes)
+    assert p.closed_blocks
+    assert p.looks_complete
+    assert p.lossless and p.findings[0].title == "SQL injection in find_account"
+    assert p.findings[0].explanation.startswith("The name comes from the request")
+
+
+@pytest.mark.parametrize(
+    "notes",
+    [
+        # Cut off in the middle of a block, after a complete first block.
+        f"{_BLOCK_A}END FINDING\n{_BLOCK_B}",
+        # Cut off in the second block, the first one closed only implicitly.
+        f"{_BLOCK_A}{_BLOCK_B}",
+        # Cut off right after the marker.
+        f"{_BLOCK_A}END FINDING\nFINDING 2\n",
+        # A summary and sentinel earlier do not help when the notes then stop in a block.
+        f"SUMMARY: so far ok\nREVIEW COMPLETE\n{_BLOCK_A}why: and the next line",
+    ],
+)
+def test_notes_that_stop_inside_a_block_stay_incomplete(notes: str) -> None:
+    p = parse_notes(notes)
+    assert not p.closed_blocks
+    assert not p.looks_complete
+
+
+def test_an_unterminated_suggestion_closed_by_the_next_finding_counts_as_closed() -> None:
+    notes = (
+        "FINDING\nfile: a.py\nline: 1\nseverity: low\ntitle: T\nwhy: W\n"
+        f"suggestion:\n<<<\nx = 1\n{_BLOCK_B}END FINDING\nSUMMARY: s\nREVIEW COMPLETE\n"
+    )
+    p = parse_notes(notes)
+    assert p.marker_count == 2 and len(p.findings) == 2
+    assert p.dropped_suggestions == 1
+    assert p.closed_blocks and p.looks_complete
+
+
+# --------------------------------------------------------------------------------------
+# Escaped one-line fields (Mistral Large 4 writes multi-line code with literal "\n")
+# --------------------------------------------------------------------------------------
+
+_ESC_HEAD = "file: ledger/handlers.py\nline: 92\nend_line: 93\nseverity: high\ntitle: T\nwhy: W\n"
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected"),
+    [
+        # The live shape: backticks around two lines joined by a literal backslash-n.
+        (
+            r'`if auth.can_modify_account(request.user, account):\n        raise Forbidden("no")`',
+            'if auth.can_modify_account(request.user, account):\n        raise Forbidden("no")',
+        ),
+        # Leading indentation; the first line is what anchoring matches.
+        (
+            r"`    start = request.page * request.per_page\n    end = start + request.per_page`",
+            "start = request.page * request.per_page\n    end = start + request.per_page",
+        ),
+        # Without backticks, and with tab-indented Go code.
+        (r"if err != nil {\n\treturn err\n}", "if err != nil {\n\treturn err\n}"),
+        # A whole fenced block written on one line.
+        (r"```python\n    x = compute(y)\n```", "x = compute(y)"),
+        # Only the escape outside the f-string literal is a line break.
+        (r"msg = f'{a}\n'\nreturn msg", "msg = f'{a}\\n'\nreturn msg"),
+    ],
+)
+def test_escaped_evidence_is_unescaped(evidence: str, expected: str) -> None:
+    f = _one(f"{_ESC_HEAD}evidence: {evidence}")
+    assert f.evidence == expected
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        r'sep = "\n".join(lines)',  # an escape inside a string literal is code
+        r"print('a\tb', end='\n')",
+        r"`out.write(b'\r\n')`",
+        r"pattern = r'\s+\n'",
+        r"text.replace('\\n', ' ')",
+        r'value = "C:\\new\\table"',
+        r"line = a + \\n",  # an escaped backslash, not a line break
+    ],
+)
+def test_escapes_that_are_part_of_the_code_are_kept(evidence: str) -> None:
+    f = _one(f"{_ESC_HEAD}evidence: {evidence}")
+    assert f.evidence == evidence.strip("`")
+    assert "\n" not in f.evidence
+
+
+def test_text_with_a_real_newline_is_not_unescaped() -> None:
+    f = _one(f"{_ESC_HEAD}evidence:\n```python\nif a:\n    s = x.split(\\n)\n```")
+    assert f.evidence == "if a:\n    s = x.split(\\n)"
+
+
+def test_escaped_prose_fields_are_unescaped_outside_code_spans() -> None:
+    f = _one(
+        "file: a.py\nline: 3\nseverity: medium\n"
+        r"title: Split on `\n` loses data\nwhen lines end in CR"
+        "\n"
+        r"why: The loop doesn't stop.\n\nAn attacker's request passes `'\n'.join(x)` through."
+        "\n"
+        r"fix: Use this:\n```python\nfor row in rows:\n    handle(row)\n```"
+    )
+    assert f.title == "Split on `\\n` loses data when lines end in CR"
+    assert f.explanation == (
+        "The loop doesn't stop.\n\nAn attacker's request passes `'\\n'.join(x)` through."
+    )
+    assert f.fix == "Use this:\n```python\nfor row in rows:\n    handle(row)\n```"
+
+
+def test_multi_line_prose_is_left_as_written() -> None:
+    f = _one("file: a.py\nline: 3\nseverity: low\ntitle: T\nwhy: First line \\n here\nmore.")
+    assert f.explanation == "First line \\n here\nmore."
+
+
+def test_escaped_verdict_evidence_is_unescaped() -> None:
+    v = parse_verdicts(
+        "VERDICT c1\nstatus: confirmed\nline: 92\n"
+        "evidence: `if x:\\n        raise Forbidden()`\n"
+        "reason: Read handlers.py; the check is inverted.\nEND VERDICT\nVERIFY COMPLETE\n",
+        IDS,
+    )
+    (entry,) = v.entries
+    assert entry.evidence == "if x:\n        raise Forbidden()"
+    assert entry.reason == "Read handlers.py; the check is inverted."
+    kept = parse_verdicts('VERDICT c2\nstatus: confirmed\nevidence: s = "a\\nb"\nEND VERDICT', IDS)
+    assert kept.entries[0].evidence == 's = "a\\nb"'

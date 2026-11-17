@@ -1,7 +1,7 @@
 ### Morning Star Code Review report
-**Verdict: incomplete** · `aaaaaaa` · full review
+**Verdict: 1 open finding (1 high)** · `aaaaaaa` · full review
 
-The review is incomplete, so it cannot be called clean:
+The review did not cover everything, so there may be more findings:
 - the zai-glm-5-3 explorer did not finish its review (out of deadline)
 - 1 of 2 reviewable changed files was not opened
 
@@ -34,8 +34,6 @@ Code at head:
 1 of 2 reviewable changed files reviewed.
 
 Not opened: `ledger/money.py`.
-
-#### Run details
 
 <details><summary>Run details</summary>
 

@@ -9,14 +9,17 @@ from __future__ import annotations
 
 import os
 import secrets
-import shutil
 import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from morning_star_review.core.contract import ReviewOutcome
-from morning_star_review.core.jsonio import write_json_atomic, write_text_atomic
+from morning_star_review.core.jsonio import (
+    write_bytes_atomic,
+    write_json_atomic,
+    write_text_atomic,
+)
 
 if TYPE_CHECKING:
     from morning_star_review.driver import DriverConfig
@@ -116,7 +119,9 @@ def copy_reports(run_dir: Path, out_dir: Path, outcome: ReviewOutcome) -> Path:
     for name in REPORT_FILES:
         path = src / name
         if path.is_file() and not path.is_symlink():
-            shutil.copyfile(path, out_dir / name)
+            # Atomic replace: a symlink at the destination (for example one shipped in
+            # a PR checkout's msreview-reports/) is replaced, never followed.
+            write_bytes_atomic(out_dir / name, path.read_bytes(), mode=0o644)
             continue
         if name == "report.md":
             write_text_atomic(out_dir / name, _fallback_report(outcome), mode=0o644)

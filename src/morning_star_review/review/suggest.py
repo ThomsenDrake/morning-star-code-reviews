@@ -7,15 +7,24 @@ is recorded in the finding's internal ``notes``:
 
 1. the anchor is ``inline`` (or ``snapped`` with an exact evidence match), and the
    range is anchorable, inside one hunk and at most 20 lines long;
-2. the replacement is not empty or blank and differs from the current lines after
-   whitespace normalisation;
+2. the replacement is not empty or blank, differs from the current lines after
+   whitespace normalisation, and is not a no-op for the flagged code: when every
+   evidence line of the range is still there and the rest only changes whitespace or
+   comments, nothing would be fixed;
 3. its first non-blank line keeps the indentation style of the original line;
 4. the head file still parses with the replacement applied (Python, JSON, YAML,
-   TOML), or for other files the bracket balance does not change;
-5. it contains no marker (``<!--``, ``-->``, ``morning-star-review:``) and no line
-   that would close the fence it is posted in. ``@decorators``, ``#`` comments and
-   URLs are allowed: GitHub links no mention, reference or URL inside a fenced block,
-   and ``render_block`` picks a fence longer than any backtick run in the text.
+   TOML), or for other files the bracket balance does not change. A parse is not
+   enough: a replacement whose first lines repeat the head lines just before the
+   range, or whose last lines repeat the lines just after it, is dropped too (models
+   rewrite a whole call but anchor only its inner lines, and the duplicated
+   ``rows = conn.execute(`` still parses as a keyword argument); so is a replacement
+   that changes the line count by more than ``MAX_LINE_DELTA`` (scope creep);
+5. it contains no marker (``<!--`` or ``morning-star-review:``) and no line that
+   would close the fence it is posted in. ``-->`` alone is ordinary code (``i-->0``,
+   arrows in comments) and forges nothing without the other two. ``@decorators``,
+   ``#`` comments and URLs are allowed: GitHub links no mention, reference or URL
+   inside a fenced block, and ``render_block`` picks a fence longer than any
+   backtick run in the text.
 
 The explanation and the prose fix are sanitised as usual; only the code goes verbatim.
 """
@@ -29,12 +38,13 @@ import tomllib
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import PurePosixPath
 
 import yaml
 
 from morning_star_review.core.contract import AnchorFile, AnchorKind, FinalFinding, Suggestion
-from morning_star_review.core.ids import norm
+from morning_star_review.core.ids import evidence_match, norm
 from morning_star_review.core.sanitize import suggestion_hazards
 from morning_star_review.review.anchoring import (
     evidence_variants,
@@ -44,6 +54,7 @@ from morning_star_review.review.anchoring import (
 )
 
 __all__ = [
+    "MAX_LINE_DELTA",
     "MAX_SUGGESTION_CHARS",
     "MAX_SUGGESTION_LINES",
     "SuggestionCheck",
@@ -55,6 +66,7 @@ __all__ = [
 
 MAX_SUGGESTION_LINES = 20
 MAX_SUGGESTION_CHARS = 2000
+MAX_LINE_DELTA = 10  # replacement lines minus range lines, either way
 _WRAPPING_FENCE = re.compile(r"^\s*(`{3,}|~{3,})[\w+.#-]*\s*$")
 _BRACKETS = ("()", "[]", "{}")
 
@@ -192,6 +204,171 @@ def _range_problem(
     return None
 
 
+# --- rule 2: no-op for the flagged code ----------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Syntax:
+    """Just enough of a language to tell code from comments and layout."""
+
+    comments: tuple[str, ...] = ()  # line-comment starts
+    blocks: bool = False  # /* ... */ comments
+    indent_matters: bool = True
+
+
+def _for(suffixes: str, syn: _Syntax) -> dict[str, _Syntax]:
+    return {f".{suffix}": syn for suffix in suffixes.split()}
+
+
+_HASH = _Syntax(comments=("#",))
+_C_LIKE = _Syntax(comments=("//",), blocks=True, indent_matters=False)
+_C_AND_HASH = _Syntax(comments=("//", "#"), blocks=True, indent_matters=False)
+_SYNTAXES: dict[str, _Syntax] = {
+    **_for("py pyi rb sh bash zsh yaml yml toml cfg ini r pl pm ex exs nix ps1 jl tcl mk", _HASH),
+    **_for("js mjs cjs ts mts cts jsx tsx go rs java kt kts c h cc cpp cxx hpp hh", _C_LIKE),
+    **_for("cs swift scala dart m mm groovy gradle proto zig sol jsonc css scss less", _C_LIKE),
+    **_for("php tf hcl", _C_AND_HASH),
+    **_for("sql lua hs elm", _Syntax(comments=("--",), indent_matters=False)),
+}
+_QUOTES = "\"'`"
+
+
+def _syntax_of(path: str) -> _Syntax:
+    pure = PurePosixPath(path)
+    if pure.name in ("Dockerfile", "Makefile"):
+        return _HASH
+    return _SYNTAXES.get(pure.suffix.lower(), _Syntax())  # unknown: whitespace only
+
+
+def _strip_comment(line: str, syn: _Syntax) -> str:
+    """``line`` without its comment; quote-aware, one line at a time.
+
+    A line comment must start the line or follow whitespace (``http://``, ``$#``).
+    Misreads only make two lines look different, which keeps the suggestion.
+    """
+    if syn.blocks and re.match(r"\s*(\*/|\*\s|\*$)", line):
+        return ""  # inside a /** ... */ block
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote is not None:
+            out.append(line[i : i + 2] if ch == "\\" else ch)
+            i += 2 if ch == "\\" else 1
+            quote = None if ch == quote else quote
+            continue
+        if ch in _QUOTES:
+            quote = ch
+        elif syn.blocks and line.startswith("/*", i):
+            close = line.find("*/", i + 2)
+            if close < 0:
+                break
+            out.append(" ")
+            i = close + 2
+            continue
+        elif (i == 0 or line[i - 1].isspace()) and line.startswith(syn.comments, i):
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _code_key(lines: list[str], syn: _Syntax) -> str:
+    """The code of ``lines`` without comments, blank lines and insignificant spaces."""
+    keyed: list[str] = []
+    for line in lines:
+        code = _strip_comment(line, syn)
+        if code.strip():
+            body = "".join(code.split())
+            keyed.append(_indent(code) + body if syn.indent_matters else body)
+    return "\n".join(keyed)
+
+
+def _evidence_lines(original: list[str], evidence: str, syn: _Syntax) -> list[tuple[str, bool]]:
+    """Lines of the range that the evidence quotes (whole, by line, or ``\\n``-joined).
+
+    The flag says whether the quote is code only; then a comment the replacement adds
+    to that line (``# noqa``, ``// TODO``) does not count as changing it.
+    """
+    pieces = evidence_variants(evidence)
+    for text in (evidence, evidence.replace("\\n", "\n")):
+        pieces += [ln for ln in text.splitlines() if norm(ln)]
+    found: list[tuple[str, bool]] = []
+    for line in original:
+        quotes = [p for p in pieces if evidence_match(line, p)]
+        if quotes:
+            found.append((line, all(norm(_strip_comment(p, syn)) == norm(p) for p in quotes)))
+    return found
+
+
+def _noop_problem(
+    path: str, original: list[str], replacement: list[str], evidence: str
+) -> str | None:
+    syn = _syntax_of(path)
+    flagged = _evidence_lines(original, evidence, syn)
+    if not flagged:
+        return None
+    full = {norm(ln) for ln in replacement}
+    code = {norm(_strip_comment(ln, syn)) for ln in replacement}
+    for line, code_only in flagged:
+        if (norm(_strip_comment(line, syn)) not in code) if code_only else (norm(line) not in full):
+            return None  # an evidence line changed or went: a real fix, even of a comment
+    if _code_key(original, syn) != _code_key(replacement, syn):
+        return None
+    return "the replacement leaves the flagged code unchanged"
+
+
+# --- rule 4: boundary repeats and scope ------------------------------------------------
+
+_BARE_WORD = re.compile(r"\w+[:;,]?")  # "end", "else:", "pass", "break;"
+
+
+def _substantive(text: str) -> bool:
+    """A normalised line worth treating as a repeat: not punctuation or one bare word.
+
+    Brackets-only lines (``)``, ``});``) are left to the parse and bracket checks, and
+    one-word closers (``end``, ``fi``) legitimately end a nested replacement block.
+    """
+    return any(ch.isalnum() for ch in text) and not _BARE_WORD.fullmatch(text)
+
+
+def _repeats(replacement: list[str], context: list[str], original: list[str]) -> bool:
+    """Some leading lines of ``replacement`` equal the last lines of ``context``.
+
+    Compared normalised and without blank lines. At least one repeated line must be
+    substantive, and the range must not already start with the same lines (then the
+    head file repeats them itself). Callers reverse all three lists to compare the
+    trailing side.
+    """
+    rep, ctx, old = ([n for n in map(norm, part) if n] for part in (replacement, context, original))
+    for k in range(1, min(len(rep), len(ctx)) + 1):
+        lead = rep[:k]
+        if lead == ctx[-k:] and lead != old[:k] and any(_substantive(n) for n in lead):
+            return True
+    return False
+
+
+def _boundary_problem(
+    head_lines: list[str], start: int, end: int, replacement: list[str]
+) -> str | None:
+    window = len(replacement)  # non-blank context lines that could be repeated
+    original = head_lines[start - 1 : end]
+    before = [*islice((ln for ln in reversed(head_lines[: start - 1]) if ln.strip()), window)]
+    after = [*islice((ln for ln in head_lines[end:] if ln.strip()), window)]
+    if _repeats(replacement, before[::-1], original):
+        return "the replacement repeats the line before the range"
+    if _repeats(replacement[::-1], after[::-1], original[::-1]):
+        return "the replacement repeats the line after the range"
+    return None
+
+
+def _scope_problem(replacement: list[str], original: list[str]) -> str | None:
+    if abs(len(replacement) - len(original)) > MAX_LINE_DELTA:
+        return f"the replacement changes the line count by more than {MAX_LINE_DELTA}"
+    return None
+
+
 def _exact_in_range(head_lines: list[str], start: int, end: int, evidence: str) -> bool:
     """The evidence equals one line of the range, or the whole range (normalised)."""
     variants = [norm(v) for v in evidence_variants(evidence)]
@@ -201,6 +378,17 @@ def _exact_in_range(head_lines: list[str], start: int, end: int, evidence: str) 
     if norm("\n".join(texts)) in variants:
         return True
     return any(norm(t) in variants for t in texts)
+
+
+def _hazards(text: str) -> list[str]:
+    """Rule 5 on the text that is posted, against the fence ``render_block`` will use.
+
+    ``suggestion_hazards`` also counts a bare ``-->`` as a marker; in code it is an
+    arrow or ``i-->0``, so it is spaced out first. That cannot form ``<!--`` or
+    ``morning-star-review:`` (a line holding ``<!-->`` still holds ``<!--``), and no
+    line with ``-->`` in it could close a backtick fence.
+    """
+    return suggestion_hazards(text.replace("-->", "-- >"), fence=fence_for(text))
 
 
 def check(
@@ -241,13 +429,16 @@ def check(
         return _drop("the replacement is too long")
     if _flat(replacement) == _flat(original):
         return _drop("the replacement does not change the code")
-    problem = _indent_problem(replacement, original) or _syntax_problem(
-        path, lines, start, end, replacement
+    problem = (
+        _noop_problem(path, original, replacement, evidence)
+        or _scope_problem(replacement, original)
+        or _indent_problem(replacement, original)
+        or _boundary_problem(lines, start, end, replacement)
+        or _syntax_problem(path, lines, start, end, replacement)
     )
     if problem:
         return _drop(problem)
-    # Checked on the text that is posted, against the fence render_block will use.
-    hazards = suggestion_hazards(text, fence=fence_for(text))
+    hazards = _hazards(text)
     if hazards:
         return _drop(", ".join(hazards))
     return SuggestionCheck(suggestion=Suggestion(start_line=start, end_line=end, text=text))

@@ -33,6 +33,9 @@ EFFORTS = ("default", "low", "medium", "high", "max")
 FAIL_ON = ("never", "findings", "high", "critical")
 CLI_DEADLINE_MINUTES = 45
 CI_DEADLINE_MINUTES = 40
+# A GitHub App installation token is minted once, before the run, and expires after 60
+# minutes; publish (and report_failure) must still be able to use it (SEC-CI-7).
+MAX_DEADLINE_MINUTES = 55
 DEFAULT_OUT = "msreview-reports"
 
 
@@ -75,7 +78,7 @@ def _add_review_options(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--trust-repo-config",
         action="store_true",
-        help="let the repository's config choose models and budgets",
+        help="let the repository's config choose models, budgets, exclusions and instructions",
     )
     p.add_argument("--read-token", choices=("env", "gh", "none"), default=None)
     p.add_argument("--local", action="store_true", help="run in-process (no Workflows worker)")
@@ -176,8 +179,14 @@ def build_policy(
     review_drafts: bool = False,
     labels: bool = True,
     suggestions: bool = True,
+    default_preset: str | None = None,
 ) -> OperatorPolicy:
-    """The operator policy. An explicit budget above a default cap raises that cap."""
+    """The operator policy. An explicit budget above a default cap raises that cap.
+
+    ``default_preset`` is the operator's default (user config ``[defaults] preset``):
+    it only replaces the built-in default, so a trusted repository file still wins
+    over it. Only ``--preset`` / the Action ``preset`` input is an explicit run preset.
+    """
     from pydantic import ValidationError
 
     from morning_star_review.core.contract import OperatorPolicy
@@ -189,6 +198,10 @@ def build_policy(
         "labels": labels,
         "suggestions": suggestions,
     }
+    if default_preset is not None:
+        if default_preset not in PRESETS:
+            raise UsageError(f"config file: defaults.preset must be one of {', '.join(PRESETS)}")
+        data["default_preset"] = default_preset
     if allowed_models:
         data["allowed_models"] = allowed_models
     raises = {
@@ -239,7 +252,10 @@ def read_token_from(mode: str, env: Mapping[str, str]) -> str | None:
         return None
     if mode == "env":
         return _opt_str(env.get("GITHUB_TOKEN")) or _opt_str(env.get("GH_TOKEN"))
-    gh = shutil.which("gh", path=env.get("PATH"))
+    from morning_star_review.core.proc import absolute_path_entries
+
+    # Absolute PATH entries only: a relative one would find a "gh" in the cwd.
+    gh = shutil.which("gh", path=absolute_path_entries(env.get("PATH")))
     if gh is None:
         raise UsageError("--read-token gh needs the GitHub CLI (gh) on PATH")
     try:
@@ -312,6 +328,15 @@ async def _mint_secrets(
     )
 
 
+def _absolutize_env_paths() -> None:
+    """Make relative ``MSREVIEW_CONFIG`` / key paths absolute in ``os.environ`` (the mint
+    child reads them), so they keep naming the same files after the move to an empty cwd."""
+    for name in ("MSREVIEW_CONFIG", "MSREVIEW_APP_PRIVATE_KEY_PATH"):
+        value = os.environ.get(name, "").strip()
+        if value and not Path(value).expanduser().is_absolute():
+            os.environ[name] = str(Path(value).expanduser().resolve())
+
+
 def cmd_review(args: argparse.Namespace, env: Mapping[str, str] | None = None) -> int:
     from morning_star_review import driver
     from morning_star_review.core.naming import parse_pr_url
@@ -320,14 +345,18 @@ def cmd_review(args: argparse.Namespace, env: Mapping[str, str] | None = None) -
     src = os.environ if env is None else env
     settings = load_user_settings(src)
     # Resolve relative paths before the driver moves the process to an empty cwd.
+    if args.out and Path(args.out).expanduser().is_symlink():
+        # A checked-out PR could ship ./msreview-reports as a link to any directory.
+        raise UsageError(f"--out {args.out} is a symbolic link; pass the directory it points to")
     out_dir = Path(args.out).expanduser().resolve() if args.out else None
+    _absolutize_env_paths()  # the mint child starts after the move
     driver.prepare_process_env(telemetry=args.telemetry, verbose=args.verbose)
     try:
         ref = parse_pr_url(args.pr_url)
     except ValueError as exc:
         raise UsageError(str(exc)) from None
     overrides = build_overrides(
-        preset=args.preset or settings.preset,
+        preset=args.preset,  # explicit run preset; the user config's preset is a default
         explorers=_csv(args.explorers),
         explorer_model=_opt_str(args.explorer_model),
         formatter_model=_opt_str(args.formatter_model),
@@ -347,10 +376,14 @@ def cmd_review(args: argparse.Namespace, env: Mapping[str, str] | None = None) -
         allowed_models=settings.allowed_models,
         labels=not args.no_labels,
         suggestions=not args.no_suggestions,
+        default_preset=settings.preset,
     )
     agent_python = resolve_agent_python(args.agent_python, src, settings.agent_python)
-    if args.deadline_minutes <= 0:
-        raise UsageError("--deadline-minutes must be positive")
+    if not 0 < args.deadline_minutes <= MAX_DEADLINE_MINUTES:
+        raise UsageError(
+            f"--deadline-minutes must be between 1 and {MAX_DEADLINE_MINUTES} (the GitHub "
+            "App token the run posts with expires after 60 minutes)"
+        )
     key = load_mistral_key(src, settings)
     read_token = read_token_from(args.read_token or settings.read_token, src)
     fail_on = args.fail_on or settings.fail_on or "never"
@@ -383,7 +416,10 @@ def cmd_review(args: argparse.Namespace, env: Mapping[str, str] | None = None) -
     if args.json:
         sys.stdout.write(json.dumps(outcome.model_dump(mode="json"), ensure_ascii=False) + "\n")
     else:
+        from morning_star_review.core.sanitize import without_controls
+
         text = outcome.report_markdown or f"{outcome.status}: {outcome.reason or ''}".strip()
+        text = without_controls(text)  # PR paths and code: no terminal escape sequences
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
     sys.stdout.flush()
     return int(code)
@@ -408,8 +444,11 @@ def _ci_settings(env: Mapping[str, str]) -> dict[str, Any]:
     if not pr_url:
         raise UsageError("MSREVIEW_PR_URL is empty; run the Action on pull_request events")
     deadline = _opt_int(get("DEADLINE_MINUTES"), "deadline-minutes") or CI_DEADLINE_MINUTES
-    if deadline <= 0:
-        raise UsageError("deadline-minutes must be positive")
+    if not 0 < deadline <= MAX_DEADLINE_MINUTES:
+        raise UsageError(
+            f"deadline-minutes must be between 1 and {MAX_DEADLINE_MINUTES} (the GitHub "
+            "App token the run posts with expires after 60 minutes)"
+        )
     return {
         "post": post,
         "fail_on": fail_on,
@@ -490,11 +529,13 @@ async def remove_pr_label(token: str, pr_url: str, name: str) -> str:
 def cmd_ci(env: dict[str, str] | os._Environ[str] | None = None) -> int:
     """``msreview ci``: the Action's entry point (environment contract of DESIGN 10.2)."""
     from morning_star_review import driver, outputs
+    from morning_star_review.core.errors import MsreviewError
     from morning_star_review.usersettings import load_mistral_key, load_user_settings
 
     src = os.environ if env is None else env
     stop = outputs.StopCommands()
     stop.start()
+    key = ""
     try:
         s = _ci_settings(src)
         settings = load_user_settings(src)
@@ -545,6 +586,16 @@ def cmd_ci(env: dict[str, str] | os._Environ[str] | None = None) -> int:
                 note = asyncio.run(remove_pr_label(write_token, s["pr_url"], s["remove_label"]))
                 print(f"msreview: {note}", file=sys.stderr, flush=True)
         return int(code)
+    except (UsageError, MsreviewError) as exc:
+        # Exit 2 before or around the run: tell Actions why (once; run_review may have).
+        driver.report_ci_usage_failure(
+            exc,
+            secrets=[key] if key else [],
+            stop_commands=stop,
+            pr_url=src.get("MSREVIEW_PR_URL", ""),
+            env=src,
+        )
+        raise
     finally:
         stop.resume()
 

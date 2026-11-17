@@ -27,6 +27,7 @@ from urllib.parse import unquote, urlsplit
 
 from morning_star_review._version import __version__
 from morning_star_review.core.errors import MsreviewError
+from morning_star_review.core.proc import absolute_path_entries
 from morning_star_review.usersettings import default_agent_venv
 
 __all__ = [
@@ -104,13 +105,28 @@ def install_source(direct_url_json: str | None = None) -> InstallSource:
 def plan_commands(
     uv: str, venv: Path, requirements: Path, source: InstallSource, python: str
 ) -> list[list[str]]:
-    """The three ``uv`` commands that build the agent environment."""
+    """The three ``uv`` commands that build the agent environment.
+
+    Each has ``--no-config``: ``uv`` would otherwise read ``uv.toml`` or ``[tool.uv]``
+    from the cwd and its parents (perhaps an untrusted checkout), which can point the
+    unhashed build requirements of the last step at another index.
+    """
     vpy = str(venv / "bin" / "python")
     project = ["-e", source.spec] if source.editable else [source.spec]
     return [
-        [uv, "venv", "--python", python, str(venv)],
-        [uv, "pip", "install", "--python", vpy, "--require-hashes", "-r", str(requirements)],
-        [uv, "pip", "install", "--python", vpy, "--no-deps", *project],
+        [uv, "venv", "--no-config", "--python", python, str(venv)],
+        [
+            uv,
+            "pip",
+            "install",
+            "--no-config",
+            "--python",
+            vpy,
+            "--require-hashes",
+            "-r",
+            str(requirements),
+        ],
+        [uv, "pip", "install", "--no-config", "--python", vpy, "--no-deps", *project],
     ]
 
 
@@ -149,12 +165,16 @@ def check_agent_python(python: Path) -> dict[str, str]:
 
 def _run(cmd: Sequence[str], env: Mapping[str, str]) -> None:
     print("msreview setup: " + " ".join(cmd), file=sys.stderr, flush=True)
+    step = " ".join(word for word in cmd[1:3] if not word.startswith("-"))
     try:
-        res = subprocess.run(list(cmd), env=dict(env), timeout=_STEP_TIMEOUT_S, check=False)
+        # UV_NO_CONFIG as well as --no-config: also covers the uv the build backend runs.
+        res = subprocess.run(
+            list(cmd), env={**env, "UV_NO_CONFIG": "1"}, timeout=_STEP_TIMEOUT_S, check=False
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SetupError(f"`{cmd[1]} {cmd[2]}` did not finish ({type(exc).__name__})") from None
+        raise SetupError(f"`{step}` did not finish ({type(exc).__name__})") from None
     if res.returncode != 0:
-        raise SetupError(f"`{' '.join(cmd[1:3])}` failed with exit code {res.returncode}")
+        raise SetupError(f"`{step}` failed with exit code {res.returncode}")
 
 
 def run_setup(
@@ -183,7 +203,8 @@ def run_setup(
             print(f"agent environment: {target} ({state}, agents {versions.get('agents')})")
             if ok or check:
                 return 0 if ok else 1
-    uv = shutil.which("uv", path=src_env.get("PATH"))
+    # Absolute PATH entries only: a relative one would find a "uv" in the cwd.
+    uv = shutil.which("uv", path=absolute_path_entries(src_env.get("PATH")))
     if uv is None:
         raise SetupError("msreview setup needs uv on PATH (https://docs.astral.sh/uv/)")
     requirements = requirements_path()

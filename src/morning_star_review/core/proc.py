@@ -28,8 +28,10 @@ __all__ = [
     "GIT_SAFE_CONFIG",
     "MINT_PASS_ENV_VAR",
     "EnvBase",
+    "absolute_path_entries",
     "child_env",
     "git_auth_env",
+    "git_executable",
     "run_git",
     "run_git_bytes",
     "run_secret_command",
@@ -82,6 +84,7 @@ _MINT_PASS_NAMES = frozenset(
         "XDG_DATA_HOME",
         "XDG_CACHE_HOME",
         "XDG_RUNTIME_DIR",
+        "MSREVIEW_CONFIG",  # the mint child reads [app] from the same file as the driver
     }
 )
 _MINT_PASS_PREFIXES = ("BWS_", "OP_", "VAULT_", "MSREVIEW_APP_")
@@ -109,6 +112,24 @@ GIT_SAFE_CONFIG: tuple[str, ...] = (
 )
 
 _empty_home: str | None = None
+
+
+def absolute_path_entries(path: str | None) -> str:
+    """``path`` with relative and empty entries dropped (``_DEFAULT_PATH`` if none is left).
+
+    A relative entry (``./bin``, ``node_modules/.bin``, or the empty entry a leading or
+    trailing ``:`` makes) is resolved against the child's working directory, which may
+    be the untrusted PR checkout: a ``bin/git`` in the PR would run instead of git.
+    """
+    kept = [entry for entry in (path or "").split(os.pathsep) if Path(entry).is_absolute()]
+    return os.pathsep.join(kept) or _DEFAULT_PATH
+
+
+def git_executable(path: str | None = None) -> str | None:
+    """The absolute path of ``git`` on the absolute entries of ``path`` (default: ``$PATH``),
+    or ``None``. Every entry searched is absolute, so the result is too."""
+    search = absolute_path_entries(os.environ.get("PATH") if path is None else path)
+    return shutil.which("git", path=search)
 
 
 def _scratch_home() -> str:
@@ -146,7 +167,8 @@ def child_env(
     defaults to ``os.environ`` and is only read for the allowlisted names.
     """
     src = os.environ if source is None else source
-    env: dict[str, str] = {"PATH": src.get("PATH") or _DEFAULT_PATH, "LANG": "C.UTF-8"}
+    # Only absolute PATH entries: a relative one would resolve inside the child's cwd.
+    env: dict[str, str] = {"PATH": absolute_path_entries(src.get("PATH")), "LANG": "C.UTF-8"}
     if base == "git":
         env["HOME"] = home or _scratch_home()
         env.update(_GIT_ENV)
@@ -258,8 +280,13 @@ def run_git_bytes(
                 raise ValueError(f"invalid environment variable name: {name!r}")
             env[name] = value
             secrets.append(value)
-    argv = ["git", *GIT_SAFE_CONFIG, *args]
     sub = args[0] if args else "git"
+    # An absolute path: never a "git" file from the checkout found through a relative
+    # PATH entry (``cwd`` is often the untrusted PR head).
+    git = git_executable(env["PATH"])
+    if git is None:
+        raise MsreviewGitError(f"git {sub} could not start: git is not on PATH")
+    argv = [git, *GIT_SAFE_CONFIG, *args]
     try:
         res = _run(argv, cwd=repo_dir, env=env, timeout=timeout, input_bytes=input_bytes)
     except subprocess.TimeoutExpired as exc:

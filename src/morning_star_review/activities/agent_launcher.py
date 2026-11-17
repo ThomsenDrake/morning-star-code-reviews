@@ -82,6 +82,9 @@ def agent_env(ctx: RunContext, scratch: str) -> dict[str, str]:
         tmpdir=scratch,
         telemetry=ctx.telemetry,
         MISTRAL_API_KEY=ctx.mistral_api_key or None,
+        # On a self-hosted Actions runner, the job's orphan-process cleanup finds
+        # processes by this variable (the agent runs in its own session).
+        RUNNER_TRACKING_ID=os.environ.get("RUNNER_TRACKING_ID") or None,
     )
 
 

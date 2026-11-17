@@ -20,6 +20,7 @@ __all__ = [
     "MsreviewBadRequest",
     "MsreviewDigestMismatch",
     "MsreviewError",
+    "MsreviewForeignTask",
     "MsreviewGitError",
     "MsreviewGitHubLasting",
     "MsreviewNoRunContext",
@@ -27,6 +28,7 @@ __all__ = [
     "MsreviewRunDirMissing",
     "MsreviewSealInvalid",
     "MsreviewSecretCommandError",
+    "MsreviewTooLarge",
     "failure_text",
     "failure_type",
     "for_activity",
@@ -49,6 +51,23 @@ class MsreviewError(Exception):
 
 class MsreviewPinRejected(MsreviewError):  # noqa: N818 - DESIGN name; shown as the failure type
     """The task does not belong to this run (foreign execution id or request hash)."""
+
+    non_retryable = True
+
+
+class MsreviewForeignTask(MsreviewPinRejected):
+    """The task belongs to another execution served from the same task queue.
+
+    Retryable: two runs for one PR can briefly share a deployment (both chose it before
+    either worker registered), and Temporal hands a task to either worker. Rejected
+    here, it is retried, and the other run's worker can take it (security review PL-1).
+    """
+
+    non_retryable = False
+
+
+class MsreviewTooLarge(MsreviewError):  # noqa: N818 - shown as the failure type
+    """The pull request's file list would not fit in a workflow payload (~2 MB)."""
 
     non_retryable = True
 

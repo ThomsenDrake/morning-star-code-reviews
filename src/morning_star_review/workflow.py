@@ -7,6 +7,10 @@ Shape::
              -> merge -> verify                                (when the pipeline is on)
              -> finalize -> publish
 
+Explore, structure, merge and verify are skipped when no model has anything to review
+(a carry-over, or a pull request whose changed files are all excluded): ``finalize``
+then decides the verdict from the prepared plan alone.
+
 Workflow code does no I/O, reads no clock, environment or randomness: everything that
 touches the outside world is an activity. Any failure runs ``report_failure`` (best
 effort) and is re-raised, so the execution ends FAILED.
@@ -67,6 +71,7 @@ __all__ = [
     "WF_NAME",
     "CodeReviewWorkflow",
     "is_fatal",
+    "needs_models",
 ]
 
 WF_NAME = "morning-star-code-review"
@@ -116,6 +121,16 @@ def is_fatal(exc: BaseException) -> bool:
         nxt = getattr(cur, "cause", None)
         cur = nxt if isinstance(nxt, BaseException) else cur.__cause__
     return False
+
+
+def needs_models(prep: Prepared) -> bool:
+    """False when no model has anything to review, so explore, merge and verify are skipped.
+
+    That is a carry-over (no reviewable file changed since a review), or a pull request
+    whose changed files are all excluded (lock files, generated, binary, ...): an
+    explorer would only read excluded or unrelated files and report on them.
+    """
+    return prep.scope != "carry_over" and bool(prep.reviewable_paths)
 
 
 class _Failed:
@@ -196,7 +211,7 @@ class CodeReviewWorkflow:
             drafts: list[ReviewDraft] = []
             merged: MergeResult | None = None
             verified: VerifyResult | None = None
-            if prep.scope != "carry_over":
+            if needs_models(prep):
                 stage = "explore"
                 explores = await self._explore(req, snap, prep)
                 stage = "structure"
