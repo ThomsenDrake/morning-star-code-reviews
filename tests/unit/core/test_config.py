@@ -370,22 +370,115 @@ def test_effort_per_model_with_fallback() -> None:
 
 
 def test_effort_override_beats_repo_and_is_validated() -> None:
-    file = repo("reasoning_effort:\n  explorer: low\n  formatter: medium\n")
+    efforts = "reasoning_effort:\n  explorer: low\n  formatter: medium\n"
     cfg, warnings = resolve(
-        file,
-        RunOverrides(preset="mistral", explorer_effort="medium", formatter_effort="high"),
+        repo("preset: mistral\n" + efforts),
+        RunOverrides(explorer_effort="medium", formatter_effort="high"),
         trusted(),
     )
     assert explorers(cfg) == [("mistral-large-4", "medium")]
     assert cfg.roles.formatter_effort == "high"
     assert warnings == []
     cfg, warnings = resolve(
-        file, RunOverrides(preset="single", explorer_effort="medium"), trusted()
+        repo("preset: single\n" + efforts), RunOverrides(explorer_effort="medium"), trusted()
     )
     # GLM rejects "medium" from the override; the repo's "low" is next in line.
     assert explorers(cfg) == [("zai-glm-5-3", "low")]
     assert cfg.roles.formatter_effort == "medium"
     assert any("medium" in w for w in warnings)
+
+
+# Model precedence: preset < trusted repo file < explicit run preset < explicit overrides.
+
+REPO_MODELS = """\
+preset: single
+models:
+  explorer: mistral-large-4
+  formatter: zai-glm-5-3
+  verifier: mistral-large-4
+reasoning_effort:
+  explorer: low
+verify:
+  enabled: true
+budgets:
+  max_tool_calls: 40
+"""
+
+
+def test_trusted_repo_file_beats_its_preset() -> None:
+    cfg, warnings = resolve(repo(REPO_MODELS), RunOverrides(), trusted())
+    assert cfg.preset == "single"
+    assert explorers(cfg) == [("mistral-large-4", "low")]
+    assert cfg.roles.verifier is not None and cfg.roles.verifier.model == "mistral-large-4"
+    assert cfg.roles.formatter_model == "zai-glm-5-3"
+    assert warnings == []
+
+
+def test_explicit_run_preset_replaces_the_repo_file_models() -> None:
+    cfg, warnings = resolve(repo(REPO_MODELS), RunOverrides(preset="best"), trusted())
+    assert cfg.preset == "best"
+    assert explorers(cfg) == [
+        ("zai-glm-5-3", "high"),
+        ("mistral-large-4", "high"),
+        ("deepseek-v4-1-flash-1017", "high"),
+    ]
+    assert cfg.roles.verifier is not None
+    assert (cfg.roles.verifier.model, cfg.roles.verifier.effort) == ("zai-glm-5-3", "high")
+    assert (cfg.roles.formatter_model, cfg.roles.formatter_effort) == ("mistral-large-4", "low")
+    assert cfg.budgets.max_tool_calls == 40  # budgets are not model settings: still lowered
+    assert len(warnings) == 1
+    assert "models, reasoning_effort, verify" in warnings[0] and "best preset" in warnings[0]
+
+
+def test_explicit_run_preset_replaces_the_repo_ensemble_and_verify_switch() -> None:
+    file = repo(
+        "ensemble:\n  explorers: [mistral-large-4, zai-glm-5-3-flash]\nverify:\n  enabled: true\n"
+    )
+    cfg, warnings = resolve(file, RunOverrides(preset="fast"), trusted())
+    assert explorers(cfg) == [("zai-glm-5-3-flash", "high")]
+    assert cfg.roles.verifier is None  # fast has no verifier; the repo cannot add one here
+    assert not cfg.roles.ensemble
+    assert any("ensemble, verify" in w for w in warnings)
+    off = repo("verify:\n  enabled: false\n")
+    cfg, _ = resolve(off, RunOverrides(preset="balanced"), trusted())
+    assert cfg.roles.verifier is not None and cfg.roles.verifier.model == "mistral-large-4"
+
+
+def test_run_preset_equal_to_the_repo_preset_still_replaces_repo_models() -> None:
+    file = repo("preset: best\nmodels:\n  verifier: mistral-large-4\n")
+    cfg, _ = resolve(file, RunOverrides(), trusted())
+    assert cfg.roles.verifier is not None and cfg.roles.verifier.model == "mistral-large-4"
+    cfg, warnings = resolve(file, RunOverrides(preset="best"), trusted())
+    assert cfg.roles.verifier is not None and cfg.roles.verifier.model == "zai-glm-5-3"
+    assert any("models" in w for w in warnings)
+
+
+def test_explicit_model_overrides_beat_the_explicit_run_preset() -> None:
+    cfg, warnings = resolve(
+        repo(REPO_MODELS),
+        RunOverrides(
+            preset="fast",
+            explorers=["zai-glm-5-3", "mistral-large-4"],
+            explorer_effort="high",
+            verify=True,
+            verifier_model="mistral-large-4",
+            formatter_model="mistral-large-4",
+        ),
+        trusted(),
+    )
+    assert explorers(cfg) == [("zai-glm-5-3", "high"), ("mistral-large-4", "high")]
+    assert cfg.roles.verifier is not None and cfg.roles.verifier.model == "mistral-large-4"
+    assert cfg.roles.formatter_model == "mistral-large-4"
+    assert cfg.preset == "fast"
+    assert len(warnings) == 1  # only the note that the repo's model settings were replaced
+
+
+def test_run_preset_without_repo_model_settings_adds_no_warning() -> None:
+    file = repo("preset: single\nbudgets:\n  max_tool_calls: 40\nlabels: false\n")
+    cfg, warnings = resolve(file, RunOverrides(preset="mistral"), trusted())
+    assert warnings == []
+    assert explorers(cfg) == [("mistral-large-4", "high")]
+    assert cfg.budgets.max_tool_calls == 40 and not cfg.labels
 
 
 def test_repo_disables_verification() -> None:

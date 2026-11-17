@@ -140,22 +140,68 @@ def test_stripped_indentation_is_rejected(make) -> None:
     assert kept.suggestion is not None and kept.suggestion.text == "\tx := compute(2, 1)"
 
 
-# --- rule 5: no markers, mentions or URLs ---------------------------------------------
+# --- rule 5: no markers; code goes verbatim in a fence ---------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "        end = start + size  # <!-- morning-star-review:finding f1 -->",
+        "        end = start + size  # morning-star-review: finding f1",
+        "        end = start + size  # -->",
+        "```\n        end = start + size  # <!-- x\n```",  # inside a wrapping fence too
+    ],
+)
+def test_markers_are_rejected(make, raw) -> None:
+    res = run(make, raw)
+    assert res.suggestion is None
+    assert res.reason == "suggestion dropped: contains a marker"
+
+
+def test_decorator_suggestion_is_kept(make) -> None:
+    text = "    @staticmethod\n    def page(items, page, size):"
+    res = run(make, text, line=12)
+    assert res.reason is None
+    assert res.suggestion == Suggestion(start_line=12, end_line=12, text=text)
+    assert render_block(res.suggestion) == f"```suggestion\n{text}\n```"
 
 
 @pytest.mark.parametrize(
     "raw",
     [
         "        end = start + size  # thanks @octocat",
+        "        end = start + size  # see #12, GH-3 and owner/repo#4",
         "        end = start + size  # see https://example.com/x",
-        "        end = start + size  # <!-- morning-star-review:finding f1 -->",
         "        end = start + size  # www.example.com",
+        "        end = start + size  # [x](https://evil.example) <b>",
     ],
 )
-def test_hazards_are_rejected(make, raw) -> None:
+def test_mentions_references_and_urls_in_code_are_kept(make, raw) -> None:
     res = run(make, raw)
+    assert res.reason is None
+    assert res.suggestion is not None and res.suggestion.text == raw
+
+
+def test_long_backtick_run_is_kept_with_a_longer_fence(make) -> None:
+    # A docstring line of six backticks would close a ``` fence; the block uses seven.
+    text = '        return """\n``````\n"""'
+    res = run(make, text, line=33)
+    assert res.reason is None and res.suggestion is not None
+    assert res.suggestion.text == text
+    block = render_block(res.suggestion)
+    assert block == f"```````suggestion\n{text}\n```````"
+    inline = "        end = start + size  # `````` run"
+    kept = run(make, inline)
+    assert kept.suggestion is not None
+    assert render_block(kept.suggestion).startswith("```````suggestion\n")
+
+
+def test_a_line_that_closes_the_fence_is_rejected(make, monkeypatch) -> None:
+    # Defence in depth: should the fence ever be too short, the block is not posted.
+    monkeypatch.setattr(suggest, "fence_for", lambda text, char="`": "```")
+    res = run(make, '        return """\n```\n"""', line=33)
     assert res.suggestion is None
-    assert res.reason is not None and res.reason.startswith("suggestion dropped: contains")
+    assert res.reason == "suggestion dropped: contains a line that would close the suggestion fence"
 
 
 # --- rule 1: anchor and range ---------------------------------------------------------

@@ -14,8 +14,9 @@ effort) and is re-raised, so the execution ends FAILED.
 With an ensemble, an explorer (or its structure step) that fails with a retryable error
 is left out and the run continues with the others; the verdict then cannot be
 ``clean`` (an expected explorer has no result). A verifier that fails the same way
-leaves every candidate unconfirmed. Pin, seal, digest and bad-request failures always
-fail the run.
+leaves every candidate unconfirmed. Fatal failures (non-retryable: pin, seal, digest,
+bad request, an agent that refuses its job) always fail the run, and they fail it at
+once: the other explorers are cancelled instead of being waited for.
 """
 
 from __future__ import annotations
@@ -94,21 +95,70 @@ FATAL_FAILURES = frozenset(
 )
 
 
+_MAX_CHAIN = 8
+
+
 def is_fatal(exc: BaseException) -> bool:
-    """True when ``exc`` (raw or wrapped by Temporal) must fail the whole run."""
-    return failure_type(exc) in FATAL_FAILURES
+    """True when ``exc`` (raw or wrapped by Temporal) must fail the whole run.
+
+    Fatal means a known run-ending type, or any non-retryable error in the cause chain
+    (a non-retryable ``MsreviewError`` locally, a non-retryable ``ApplicationError`` on
+    a worker): retrying cannot fix it, so neither can waiting for other explorers.
+    """
+    if failure_type(exc) in FATAL_FAILURES:
+        return True
+    cur: BaseException | None = exc
+    for _ in range(_MAX_CHAIN):
+        if cur is None:
+            break
+        if getattr(cur, "non_retryable", False) is True:
+            return True
+        nxt = getattr(cur, "cause", None)
+        cur = nxt if isinstance(nxt, BaseException) else cur.__cause__
+    return False
+
+
+class _Failed:
+    """A member's non-fatal failure, returned instead of raised."""
+
+    __slots__ = ("exc",)
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+
+
+async def _member[T](aw: Awaitable[T]) -> T | _Failed:
+    try:
+        return await aw
+    except Exception as exc:
+        if is_fatal(exc):
+            raise
+        return _Failed(exc)
 
 
 async def _settled[T](aws: Sequence[Awaitable[T]]) -> tuple[list[T], list[Exception]]:
-    """Run ``aws`` concurrently; (results in order, failures). Cancellation propagates."""
-    outcomes = await asyncio.gather(*aws, return_exceptions=True)
+    """Run ``aws`` concurrently: (results in order, non-fatal failures).
+
+    Non-fatal failures let the other members finish. The first fatal failure cancels
+    every member still running (their activities stop their agent processes) and is
+    raised, so the run goes to ``report_failure`` without waiting for explorers whose
+    results can no longer be used. Only ``asyncio`` tasks and ``gather`` are used, so
+    the order of events stays deterministic under Temporal's workflow event loop.
+    """
+    tasks = [asyncio.ensure_future(_member(aw)) for aw in aws]
+    try:
+        outcomes = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        # Wait until the cancellations are delivered; their outcomes do not matter.
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     ok: list[T] = []
     failed: list[Exception] = []
     for item in outcomes:
-        if isinstance(item, Exception):
-            failed.append(item)
-        elif isinstance(item, BaseException):  # CancelledError and friends
-            raise item
+        if isinstance(item, _Failed):
+            failed.append(item.exc)
         else:
             ok.append(item)
     return ok, failed
@@ -158,8 +208,18 @@ class CodeReviewWorkflow:
                         stage = "verify"
                         verified = await self._verify(req, snap, prep, merged)
             stage = "finalize"
+            # Every explorer's result and draft, by seal: finalize loads the sealed
+            # payloads from the run directory (they would overflow this payload).
             final = await _finalize.finalize(
-                self._finalize_input(req, snap, prep, explores, drafts, merged, verified)
+                FinalizeInput(
+                    req=req,
+                    snap=snap,
+                    prep=prep,
+                    explore_seals=[e.seal for e in explores],
+                    draft_seals=[d.seal for d in drafts],
+                    merge=merged,
+                    verify=verified,
+                )
             )
             stage = "publish"
             return await _publish.publish(PublishInput(req=req, snap=snap, final=final))
@@ -211,35 +271,3 @@ class CodeReviewWorkflow:
             if is_fatal(exc):
                 raise
             return None  # every candidate stays unconfirmed; the verdict says why
-
-    @staticmethod
-    def _finalize_input(
-        req: ReviewRequest,
-        snap: PrSnapshot,
-        prep: Prepared,
-        explores: list[ExploreResult],
-        drafts: list[ReviewDraft],
-        merged: MergeResult | None,
-        verified: VerifyResult | None,
-    ) -> FinalizeInput:
-        if prep.roles.uses_pipeline:
-            # Every explorer's result goes in the lists; repeating the primary's in
-            # explore/draft would only grow the payload.
-            return FinalizeInput(
-                req=req,
-                snap=snap,
-                prep=prep,
-                explore=None,
-                draft=None,
-                explores=explores,
-                drafts=drafts,
-                merge=merged,
-                verify=verified,
-            )
-        return FinalizeInput(
-            req=req,
-            snap=snap,
-            prep=prep,
-            explore=explores[0] if explores else None,
-            draft=drafts[0] if drafts else None,
-        )

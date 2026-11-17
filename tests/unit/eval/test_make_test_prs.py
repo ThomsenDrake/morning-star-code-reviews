@@ -187,3 +187,15 @@ def test_dry_run_is_offline(capsys: pytest.CaptureFixture[str]) -> None:
     assert result["dry_run"] is True
     assert set(result["cases"]) == {"e1", "e2", "e4", "e5", "e6"}
     assert all(c["number"] is None for c in result["cases"].values())
+
+
+def test_git_failure_exits_2_without_traceback(
+    remote: tuple[Path, Path, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _bare, gh, _state = remote
+    missing = (tmp_path / "no-such-remote.git").as_uri()
+    argv = ["--repo", "acme/playground", "--gh", str(gh), "--remote-url", missing, "--cases", "e4"]
+    assert mk.main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("make_test_prs: git ")

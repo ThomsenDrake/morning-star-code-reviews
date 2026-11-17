@@ -120,7 +120,11 @@ def _prior_changes(snap: PrSnapshot, repo_dir: str) -> tuple[bool, list[str] | N
 
 
 def _incremental_plan(
-    snap: PrSnapshot, repo_dir: str, scope: ScopeDecision, first: dict[str, str]
+    snap: PrSnapshot,
+    repo_dir: str,
+    scope: ScopeDecision,
+    first: dict[str, str],
+    base_first: dict[str, str],
 ) -> tuple[prepass.PromptPlan, dict[str, FilePatch]] | None:
     assert scope.since_sha is not None  # noqa: S101 - set for incremental scopes
     try:
@@ -128,7 +132,9 @@ def _incremental_plan(
     except (MsreviewGitError, ValueError):
         return None
     files = prepass.incremental_files(list(snap.files), inc, scope.diff_paths)
-    return prepass.plan(files, inc, snap.config, first_lines=first), inc
+    # Generated markers are corroborated against the merge base, never the prior head.
+    plan = prepass.plan(files, inc, snap.config, first_lines=first, base_first_lines=base_first)
+    return plan, inc
 
 
 def _changed_refs(snap: PrSnapshot, full: prepass.PromptPlan) -> list[ChangedFileRef]:
@@ -164,7 +170,16 @@ def prepare_sync(req: ReviewRequest, snap: PrSnapshot, ctx: RunContext) -> Prepa
     patches = _patches(snap, run_dir, repo_dir)
     files = list(snap.files)
     first = head_first_lines(repo_dir, [f.path for f in files if f.status != "removed"])
-    full = prepass.plan(files, patches.best, cfg, first_lines=first, total_files=snap.changed_files)
+    # A generated marker excludes a file only when its merge-base version had one too.
+    base_first = prepass.base_first_lines(repo_dir, snap.merge_base_sha, files, first)
+    full = prepass.plan(
+        files,
+        patches.best,
+        cfg,
+        first_lines=first,
+        base_first_lines=base_first,
+        total_files=snap.changed_files,
+    )
     anchors_sha = write_model(run_dir / ANCHORS_JSON, build_anchor_map(files, patches.github))
     prepass.write_diff_files(full, run_dir)
     write_changed_files(run_dir, _changed_refs(snap, full))
@@ -182,7 +197,7 @@ def prepare_sync(req: ReviewRequest, snap: PrSnapshot, ctx: RunContext) -> Prepa
     )
     prompt_plan, prompt_patches = full, patches.best
     if scope.scope == "incremental":
-        inc = _incremental_plan(snap, repo_dir, scope, first)
+        inc = _incremental_plan(snap, repo_dir, scope, first, base_first)
         if inc is None:
             scope = ScopeDecision("full", None, [], "the diff since the last review failed")
         else:

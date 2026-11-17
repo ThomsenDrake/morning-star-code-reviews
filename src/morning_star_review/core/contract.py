@@ -817,18 +817,27 @@ class VerifyInput(Contract):
     merge: MergeResult
 
 
+SealRef = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+
+
 class FinalizeInput(Contract):
-    """``explore``/``draft`` are the primary explorer's; the pipeline fields are set
-    when ``prep.roles.uses_pipeline`` (``explores``/``drafts`` then hold every explorer's
-    result that reached this point)."""
+    """Input of ``finalize``.
+
+    ``explore_seals``/``draft_seals`` name every explorer's ``ExploreResult`` and
+    ``ReviewDraft`` that reached this point (explorer order, primary first) by their
+    seals. The sealed payloads themselves stay in the run directory, where the
+    activities that made them saved a copy (``activities.finalize.keep_for_finalize``):
+    with an ensemble they would add up to ~0.8 MB here, on top of the snapshot, the
+    plan and the merge, and Temporal payloads are limited to ~2 MB. ``finalize``
+    loads them and checks their seals, so it sees exactly the payloads the workflow
+    received. ``merge``/``verify`` are set when the pipeline ran.
+    """
 
     req: ReviewRequest
     snap: PrSnapshot
     prep: Prepared
-    explore: ExploreResult | None
-    draft: ReviewDraft | None
-    explores: list[ExploreResult] = Field(default_factory=list, max_length=5)
-    drafts: list[ReviewDraft] = Field(default_factory=list, max_length=5)  # one per explorer
+    explore_seals: list[SealRef] = Field(default_factory=list, max_length=5)
+    draft_seals: list[SealRef] = Field(default_factory=list, max_length=5)
     merge: MergeResult | None = None
     verify: VerifyResult | None = None
 

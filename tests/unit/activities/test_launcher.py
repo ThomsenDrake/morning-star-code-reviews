@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import secrets
@@ -117,6 +118,42 @@ async def test_endpoint_overrides_are_never_forwarded(
     assert "SERVER_URL" not in env and "MISTRAL_API_URL" not in env
     assert "AGENTS_SDK_COMPLETION_GATEWAY_API_BASE" not in env
     assert "GITHUB_TOKEN" not in env
+
+
+TELEMETRY_SWITCHES = (
+    "AGENTS_SDK_TELEMETRY_ENABLED",
+    "AGENTS_SDK_STUDIO_TRACING_ENABLED",
+    "OTEL_ENABLED",
+)
+
+
+async def test_telemetry_switches_follow_the_run_context(tmp_path: Path) -> None:
+    off = launcher.agent_env(_ctx(tmp_path, tmp_path), str(tmp_path))
+    assert off["AGENTS_SDK_TELEMETRY_ENABLED"] == "0"
+    assert off["AGENTS_SDK_STUDIO_TRACING_ENABLED"] == "0"
+    assert off["OTEL_ENABLED"] == "false"
+
+    opted_in = dataclasses.replace(_ctx(tmp_path, tmp_path), telemetry=True)
+    on = launcher.agent_env(opted_in, str(tmp_path))
+    assert not [name for name in TELEMETRY_SWITCHES if name in on]
+    assert on["MISTRAL_API_KEY"] == KEY  # everything else is unchanged
+    assert {k: v for k, v in off.items() if k not in TELEMETRY_SWITCHES} == on
+
+
+async def test_telemetry_opt_in_reaches_the_agent_process(tmp_path: Path) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    agent = _agent(
+        tmp_path,
+        f"""
+        (job_dir / "seen.json").write_text(json.dumps(dict(os.environ)))
+        (job_dir / "result.json").write_text({_result()!r})
+        """,
+    )
+    ctx = dataclasses.replace(_ctx(tmp_path, agent), telemetry=True)
+    await run_agent("explore", job, ctx, 30)
+    env = json.loads((job / "seen.json").read_text())
+    assert not [name for name in TELEMETRY_SWITCHES if name in env]
 
 
 async def test_exit_three_is_an_invalid_job_with_a_redacted_log_tail(tmp_path: Path) -> None:

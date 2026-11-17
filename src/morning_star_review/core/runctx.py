@@ -39,6 +39,9 @@ class RunContext:
     mistral_api_key: str = field(repr=False)  # forwarded to the agent subprocess env only
     agent_python: str
     cannot_post_reason: str | None = None
+    # Operator opt-in (--telemetry / Action input): the agent subprocess keeps the
+    # Agents SDK / OpenTelemetry defaults instead of the three telemetry-off switches.
+    telemetry: bool = False
 
     def __post_init__(self) -> None:
         if len(self.seal_key) < MIN_SEAL_KEY_BYTES:

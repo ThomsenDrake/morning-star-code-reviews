@@ -70,11 +70,17 @@ class AgentTimedOut(MsreviewError):  # noqa: N818 - shown as the failure type
 
 
 def agent_env(ctx: RunContext, scratch: str) -> dict[str, str]:
-    """Allowlisted environment for the agent: no GitHub tokens, no endpoint overrides."""
+    """Allowlisted environment for the agent: no GitHub tokens, no endpoint overrides.
+
+    Telemetry stays off (``AGENTS_SDK_TELEMETRY_ENABLED=0``,
+    ``AGENTS_SDK_STUDIO_TRACING_ENABLED=0``, ``OTEL_ENABLED=false``) unless the operator
+    opted in for this run (``ctx.telemetry``); then the three switches are left out.
+    """
     return child_env(
         "agent",
         home=scratch,
         tmpdir=scratch,
+        telemetry=ctx.telemetry,
         MISTRAL_API_KEY=ctx.mistral_api_key or None,
     )
 

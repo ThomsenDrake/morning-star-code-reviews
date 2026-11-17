@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 from fakegh import BOT
 from harness import Harness
 from wfkit import MISTRAL_KEY, SQLI, SWAP, TOKEN, notes_for
 
+from morning_star_review.activities import structure as _structure
 from morning_star_review.activities.agent_launcher import AgentCrashed
+from morning_star_review.activities.finalize import KEPT_DIR
 from morning_star_review.core.contract import (
     DraftFinding,
     FormatterDraft,
     PrSnapshot,
+    ReviewDraft,
     ReviewRequest,
+    Sealed,
 )
 from morning_star_review.core.errors import MsreviewSealInvalid
+from morning_star_review.core.jsonio import write_model
 from morning_star_review.workflow import _fetch_pr
 
 pytestmark = pytest.mark.timeout(120)
@@ -166,3 +172,24 @@ async def test_agent_environment_is_an_allowlist(
     ):
         assert name not in env
     assert all(TOKEN not in v for v in env.values())
+
+
+async def test_a_kept_draft_changed_on_disk_is_rejected(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = harness
+    h.spec("explore", notes=notes_for(h.repo, SQLI), opened_paths=["app/db.py"])
+    original = _structure.keep_for_finalize
+
+    def keep_tampered(run_dir: Path, sealed: Sealed) -> None:
+        original(run_dir, sealed)
+        assert isinstance(sealed, ReviewDraft)
+        changed = sealed.model_copy(update={"findings": []})  # same seal, other content
+        write_model(run_dir / KEPT_DIR / f"ReviewDraft-{sealed.seal}.json", changed)
+
+    monkeypatch.setattr(_structure, "keep_for_finalize", keep_tampered)
+    with pytest.raises(MsreviewSealInvalid):
+        await h.run()
+    outcome = h.outcome_file()
+    assert outcome["status"] == "failed"
+    assert "finalize" in outcome["reason"] and "MsreviewSealInvalid" in outcome["reason"]

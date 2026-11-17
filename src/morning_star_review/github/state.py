@@ -171,14 +171,22 @@ def encode_state(state: PriorState) -> str:
     return _pack(_with_findings(state, []))
 
 
-def decode_state(comment_body: str) -> PriorState | None:
-    """The state in ``comment_body``'s marker, or ``None`` on any problem.
+def _last_state_match(comment_body: str) -> re.Match[str] | None:
+    matches = list(_STATE_RE.finditer(comment_body))
+    return matches[-1] if matches else None
 
-    The decompressed size is capped at ``MAX_DECODED_STATE_BYTES``.
+
+def decode_state(comment_body: str) -> PriorState | None:
+    """The state in the LAST state marker of ``comment_body``, or ``None`` on any problem.
+
+    ``publish`` always appends our marker at the very end of the summary, so only the
+    last marker is trusted: an earlier one (text that slipped into the body above our
+    own marker) is never read. The decompressed size is capped at
+    ``MAX_DECODED_STATE_BYTES``.
     """
     if not comment_body or len(comment_body) > 2 * 1024 * 1024:
         return None
-    match = _STATE_RE.search(comment_body)
+    match = _last_state_match(comment_body)
     if match is None or len(match.group(1)) > _MAX_ENCODED_CHARS:
         return None
     try:

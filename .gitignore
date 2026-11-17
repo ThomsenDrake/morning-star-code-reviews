@@ -17,3 +17,6 @@ build/
 
 # Review reports written by `msreview review --report`
 msreview-reports/
+
+# Raw per-run eval outputs (kept locally; summaries are committed)
+eval/results/*-raw/

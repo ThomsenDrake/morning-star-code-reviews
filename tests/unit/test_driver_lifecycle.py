@@ -226,7 +226,9 @@ async def test_start_4xx_is_not_retried_and_terminates(tmp_path: Path) -> None:
     assert p.terminated == [outcome.execution_id]
 
 
-async def test_worker_crash_terminates_the_execution(tmp_path: Path) -> None:
+async def test_worker_crash_terminates_the_execution(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     p = FakePlatform()
     p.statuses = ["RUNNING"]
     w = Worker(p, crash_after=0.05)
@@ -234,9 +236,11 @@ async def test_worker_crash_terminates_the_execution(tmp_path: Path) -> None:
     assert code == driver.EXIT_FAILED
     assert "worker exited" in (outcome.reason or "")
     assert p.terminated == [outcome.execution_id]
+    # No worker of ours is left to report a late activity completion: no note.
+    assert driver.TERMINATED_ACTIVITY_NOTE not in capsys.readouterr().err
 
 
-async def test_deadline_terminates_once(tmp_path: Path) -> None:
+async def test_deadline_terminates_once(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     p = FakePlatform()
     p.statuses = ["RUNNING"]
     w = Worker(p)
@@ -246,6 +250,10 @@ async def test_deadline_terminates_once(tmp_path: Path) -> None:
     assert "deadline" in (outcome.reason or "")
     assert p.terminated == [outcome.execution_id]
     assert w.cancelled
+    err = capsys.readouterr().err
+    assert f"terminated execution {outcome.execution_id}" in err
+    # The worker was still running: the Temporal core's late-completion WARN is explained.
+    assert err.count(driver.TERMINATED_ACTIVITY_NOTE) == 1
 
 
 async def test_signal_terminates_exactly_once(tmp_path: Path) -> None:
@@ -420,6 +428,23 @@ async def test_local_mode_runs_in_process(tmp_path: Path) -> None:
     assert seen == [("local", False)]
 
 
+@pytest.mark.parametrize("telemetry", [False, True])
+async def test_telemetry_opt_in_reaches_the_run_context(tmp_path: Path, telemetry: bool) -> None:
+    seen: list[bool] = []
+
+    async def runner(req: Any) -> Any:
+        from morning_star_review.core.runctx import run_context
+
+        ctx = run_context()
+        seen.append(ctx.telemetry)
+        return outcome_dict(ctx.execution_id, status="report", reason="report mode")
+
+    h = driver.Hooks(timing=FAST, install_signals=False, local_runner=runner)
+    cfg = make_cfg(tmp_path, mode="local", telemetry=telemetry)
+    await driver.run_review(cfg, SECRETS, h)
+    assert seen == [telemetry]
+
+
 async def test_local_mode_failure_reads_outcome_file(tmp_path: Path) -> None:
     async def runner(req: Any) -> Any:
         from morning_star_review.core.runctx import run_context
@@ -550,3 +575,60 @@ async def test_signal_during_cleanup_does_not_interrupt_terminate(tmp_path: Path
     assert p.terminate_finished and p.terminated == [outcome.execution_id]
     assert code == driver.EXIT_FAILED and "deadline" in (outcome.reason or "")
     assert w.cancelled
+
+
+@pytest.fixture
+def sdk_config(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """The Workflows SDK config singleton, restored after the test."""
+    from mistralai.workflows.core.config.config import config as wf_config
+
+    monkeypatch.setattr(wf_config.worker, "local_retry_backoff_coefficient", None)
+    monkeypatch.setattr(wf_config.worker, "deployment_name", wf_config.worker.deployment_name)
+    monkeypatch.setattr(wf_config.common, "mistral_api_key", wf_config.common.mistral_api_key)
+    monkeypatch.setenv("MISTRAL_API_KEY", "placeholder")
+    monkeypatch.delenv("DEPLOYMENT_NAME", raising=False)
+    return wf_config
+
+
+def test_local_mode_drops_the_sdk_client_side_retry_wait(sdk_config: Any) -> None:
+    driver._configure_workflows_sdk(None, KEY, local=True)
+    assert sdk_config.worker.local_retry_backoff_coefficient == 0.0
+    assert driver.LOCAL_RETRY_BACKOFF_COEFFICIENT == 0.0
+    assert "DEPLOYMENT_NAME" not in os.environ
+
+
+def test_worker_mode_keeps_the_sdk_retry_settings(sdk_config: Any) -> None:
+    driver._configure_workflows_sdk("msreview-cli-o-r-pr1", KEY, local=False)
+    assert sdk_config.worker.local_retry_backoff_coefficient is None
+    assert sdk_config.worker.deployment_name == "msreview-cli-o-r-pr1"
+
+
+async def test_local_mode_surfaces_a_fatal_activity_error_quickly(sdk_config: Any) -> None:
+    """The SDK retries even non-retryable errors outside a worker; no waits between them."""
+    import time
+
+    from mistralai import workflows
+
+    from morning_star_review.core.errors import MsreviewError
+
+    class FatalError(MsreviewError):
+        non_retryable = True
+
+    attempts: list[float] = []
+
+    @workflows.activity(
+        start_to_close_timeout=timedelta(seconds=30),
+        retry_policy_max_attempts=6,
+        retry_policy_backoff_coefficient=3.0,
+        _skip_registering=True,
+    )
+    async def msreview_test_fatal_activity() -> None:
+        attempts.append(time.monotonic())
+        raise FatalError("fatal")
+
+    driver._configure_workflows_sdk(None, KEY, local=True)
+    begun = time.monotonic()
+    with pytest.raises(FatalError):
+        await msreview_test_fatal_activity()
+    assert len(attempts) == 6  # the SDK still re-runs it: only the waits are gone
+    assert time.monotonic() - begun < 1.0  # was ~3.1 s at 0.1, ~6 min at the default

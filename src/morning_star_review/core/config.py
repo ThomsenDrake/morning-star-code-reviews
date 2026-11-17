@@ -2,6 +2,20 @@
 
 ``effective = clip(policy caps, override(run overrides, override(repo config, preset)))``
 
+Model choice (explorers, ensemble, verifier on/off and model, formatter, efforts)
+follows, lowest to highest precedence:
+
+1. the preset (the repository file's ``preset``, else the built-in default);
+2. the trusted repository file's ``models``, ``ensemble``, ``verify`` and
+   ``reasoning_effort``;
+3. an explicit run preset (CLI ``--preset``, Action ``preset`` input), which replaces
+   all of layer 2: the run gets that preset's pipeline as published;
+4. explicit run model overrides (``--explorers``, ``--explorer-model``,
+   ``--verify``, ``--verifier-model``, ``--formatter-model``, the effort flags).
+
+Budgets are not part of this order: the repository file can only lower them, run
+overrides can raise them up to the operator caps, whatever the preset.
+
 The repository file (``.morning-star-review.yml``) is read from the PR's base
 commit only. It can lower budgets but never raise them, and when the operator
 does not trust it (CLI mode on someone else's repository) its model, effort,
@@ -230,11 +244,28 @@ def load_repo_config(
 
 # Repository settings that choose models or spend money; ignored when untrusted.
 _SPEND_SETTINGS = ("preset", "models", "reasoning_effort", "ensemble", "verify", "budgets")
+# Repository settings that choose models; an explicit run preset replaces them.
+_MODEL_SETTINGS = ("models", "reasoning_effort", "ensemble", "verify")
 
 
 def _ignored_spend_settings(repo: RepoConfig) -> list[str]:
     defaults = RepoConfig()
     return [name for name in _SPEND_SETTINGS if getattr(repo, name) != getattr(defaults, name)]
+
+
+def _without_model_settings(
+    spend: RepoConfig, run_preset: PresetName, warnings: list[str]
+) -> RepoConfig:
+    """``spend`` with the model settings an explicit run preset replaces reset to defaults."""
+    defaults = RepoConfig()
+    set_here = [name for name in _MODEL_SETTINGS if getattr(spend, name) != getattr(defaults, name)]
+    if not set_here:
+        return spend
+    warnings.append(
+        f"{REPO_CONFIG_FILE}: {', '.join(set_here)} not used because this run asked "
+        f"for the {run_preset} preset"
+    )
+    return spend.model_copy(update={name: getattr(defaults, name) for name in set_here})
 
 
 def _check_model(model: str, label: str, policy: OperatorPolicy, warnings: list[str]) -> str | None:
@@ -480,7 +511,9 @@ def resolve(
 ) -> tuple[ResolvedConfig, list[str]]:
     """Merge preset, repository config, run overrides and operator policy.
 
-    Returns the effective config and human-readable warnings for the summary. Bad
+    Model precedence: preset < trusted repository file < explicit run preset <
+    explicit run model overrides (see the module docstring). Returns the effective
+    config and human-readable warnings for the summary. Bad
     model ids or efforts never fail the run: they fall back with a warning. Raises
     ``ConfigError`` only when the policy itself leaves no usable model.
     """
@@ -495,6 +528,8 @@ def resolve(
                 "repository's config is not trusted for model and budget settings"
             )
     spend = file if trusted else RepoConfig()
+    if overrides.preset is not None:
+        spend = _without_model_settings(spend, overrides.preset, warnings)
 
     preset_name: PresetName = overrides.preset or spend.preset or DEFAULT_PRESET
     explorers = _resolve_explorers(preset_name, spend, overrides, policy, warnings)

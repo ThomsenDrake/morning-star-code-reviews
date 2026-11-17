@@ -453,22 +453,41 @@ def sanitize_inline(text: str, limit: int) -> str:
     return _fit(text, limit, transform)
 
 
-_ANY_URL = re.compile(r"(?i)\b(?:[a-z][a-z0-9+.-]{1,31}://|www\.)\S")
+_LINE_BREAK = re.compile(r"\r\n|\r|\n")  # CommonMark line endings
 
 
-def suggestion_hazards(text: str) -> list[str]:
-    """Reasons why raw replacement code must not be posted as a suggestion block.
+def _closes_fence(text: str, fence: str) -> bool:
+    """Some line of ``text`` would end a code block opened with ``fence``.
 
-    ADDENDUM E rule 5 on the raw text: a marker (``<!--``, ``-->``,
-    ``morning-star-review:``), an ``@mention`` or a URL. The prose rewrites of
-    ``sanitize_md`` (escaping ``<``, ``#123``...) are not applied: inside a fenced block
-    they would only corrupt valid code. Empty list = no hazard.
+    A closing fence (CommonMark 4.5) is at most three spaces of indentation, a run of
+    the fence character at least as long as the opening fence, then only blanks.
+    """
+    if len(fence) < 3 or set(fence) not in ({"`"}, {"~"}):
+        raise ValueError(f"not a code fence: {fence!r}")
+    closer = re.compile(rf"^ {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$")
+    return any(closer.match(line) for line in _LINE_BREAK.split(text))
+
+
+def suggestion_hazards(text: str, *, fence: str | None = None) -> list[str]:
+    """Reasons why replacement code must not be posted as a suggestion block.
+
+    ADDENDUM E rule 5, relaxed for code: the text is posted verbatim inside a fenced
+    block, where GitHub links no ``@mention``, ``#123`` reference or URL. So
+    ``@decorators``, ``#`` comments and URLs are fine; the hazards are
+
+    - a marker (``<!--``, ``-->``, ``morning-star-review:``), which could forge or
+      break the markers this tool finds its comments by;
+    - a line that would close ``fence``, the fence the block is posted in: the rest
+      of the text would then render as live Markdown. With ``fence=None`` the caller
+      uses a fence longer than any backtick run in ``text`` (``review.suggest
+      .fence_for``), which no line can close.
+
+    The prose rewrites of ``sanitize_md`` are not applied: inside a fenced block they
+    would only corrupt valid code. Empty list = no hazard.
     """
     reasons: list[str] = []
     if strip_markers(text) != text:
         reasons.append("contains a marker")
-    if _MENTION.search(text):
-        reasons.append("contains an @mention")
-    if _ANY_URL.search(text):
-        reasons.append("contains a URL")
+    if fence is not None and _closes_fence(text, fence):
+        reasons.append("contains a line that would close the suggestion fence")
     return reasons
