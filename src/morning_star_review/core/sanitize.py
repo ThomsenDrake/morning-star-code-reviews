@@ -21,6 +21,9 @@ people, cross-reference issues, link to phishing pages, or inject suggestion blo
 - the result is capped at ``limit`` characters.
 
 The function is idempotent: ``sanitize_md(sanitize_md(x, n), n) == sanitize_md(x, n)``.
+No rule deletes text between pieces it sanitised separately (an empty link ``[]()``
+stays as escaped brackets), and the output is checked: a result that still holds a
+marker or is not a fixed point is replaced by the text shown as code.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ __all__ = [
     "sanitize_md",
     "strip_markers",
     "suggestion_hazards",
+    "without_controls",
 ]
 
 ZWJ = "\u200d"  # zero-width joiner: breaks @/# autolinking, invisible
@@ -94,6 +98,17 @@ _BRACKET = re.compile(r"(?<!\\)((?:\\\\)*)([\[\]])")
 _TABLE_DELIM = re.compile(r"^[ \t>*+\-\d.):|]*$")
 _BLOCK_START = frozenset("#~>+*=-")
 _ORDERED_START = re.compile(r"^(\d{1,9})([.)])")
+
+
+# Terminal control characters: C0 except tab and newline, DEL, and C1 (0x9b is an 8-bit
+# CSI). Paths and code excerpts come from the PR; printed raw, ESC/OSC sequences could
+# write the clipboard, set the title or rewrite earlier lines of a report.
+_TERMINAL_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def without_controls(text: str) -> str:
+    """``text`` with terminal control characters replaced by U+FFFD (tab, newline kept)."""
+    return _TERMINAL_CONTROL.sub("\ufffd", text)
 
 
 def strip_markers(text: str) -> str:
@@ -172,11 +187,12 @@ def _link_replacement(m: re.Match[str]) -> str:
         if _allowed_url(dest):
             return f"[{text}]({dest})"
         # The brackets stay (escaped): bare link text could land at a line start and
-        # open a heading, a fence or a table row there.
-        label = f"\\[{text}\\]" if text.strip() else ""
+        # open a heading, a fence or a table row there. A replacement is never empty:
+        # deleting "[]()" would join the gaps on both sides, which were sanitised one
+        # by one, so "@[]()user" or "<[]()img" would become live after the join.
         if not dest:
-            return label
-        return f"{label} ({code_span(dest)})" if label else code_span(dest)
+            return f"\\[{text}\\]"
+        return f"\\[{text}\\] ({code_span(dest)})" if text.strip() else code_span(dest)
     url = m.group("autourl")
     return f"<{url}>" if _allowed_url(url) else code_span(url)
 
@@ -427,9 +443,40 @@ def _fit(text: str, limit: int, transform: Callable[[str], str]) -> str:
     return best
 
 
+def _verified(out: str, again: Callable[[str], str], fallback: Callable[[], str]) -> str:
+    """``out`` if it holds no marker and is a fixed point of ``again``, else ``fallback()``.
+
+    Defence in depth: every rule above is meant to keep both properties. A text that
+    breaks one shows a rule that let pieces join into something live, so it is shown
+    as code instead, where GitHub renders no Markdown, HTML, mention or link.
+    """
+    if strip_markers(out) == out and again(out) == out:
+        return out
+    return fallback()
+
+
+def _code_block(text: str) -> str:
+    body = strip_markers(text)
+    longest = max((len(run) for run in _BACKTICK_RUN.findall(body)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}text\n{body}\n{fence}"
+
+
+def _code_span_cell(text: str) -> str:
+    # Pipes stay escaped: GFM splits a table row at "|" even inside a code span.
+    return code_span(_PIPE.sub(r"\1\\|", strip_markers(" ".join(text.split()))))
+
+
 def sanitize_md(text: str, limit: int) -> str:
     """Sanitise untrusted Markdown for a GitHub comment; at most ``limit`` characters."""
-    return _fit(text, limit, lambda t: _blocks(_clean(t)))
+
+    def transform(t: str) -> str:
+        return _blocks(_clean(t))
+
+    out = _fit(text, limit, transform)
+    return _verified(
+        out, lambda o: _fit(o, limit, transform), lambda: _fit(_clean(text), limit, _code_block)
+    )
 
 
 def sanitize_inline(text: str, limit: int) -> str:
@@ -450,7 +497,10 @@ def sanitize_inline(text: str, limit: int) -> str:
         # inside code spans, and an escaped pipe also ends a bare URL for our matcher.
         return _prose(_PIPE.sub(r"\1\\|", flat), blocks=False)
 
-    return _fit(text, limit, transform)
+    out = _fit(text, limit, transform)
+    return _verified(
+        out, lambda o: _fit(o, limit, transform), lambda: _fit(_clean(text), limit, _code_span_cell)
+    )
 
 
 _LINE_BREAK = re.compile(r"\r\n|\r|\n")  # CommonMark line endings

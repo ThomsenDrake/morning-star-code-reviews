@@ -18,6 +18,7 @@ from morning_star_review.core.contract import (
     ReviewRequest,
 )
 from morning_star_review.core.errors import (
+    MsreviewForeignTask,
     MsreviewNoRunContext,
     MsreviewPinRejected,
     MsreviewSealInvalid,
@@ -125,13 +126,14 @@ def test_worker_mode_inside_our_activity_passes() -> None:
     assert result is ctx
 
 
-def test_worker_mode_rejects_a_foreign_execution_non_retryably() -> None:
+def test_worker_mode_rejects_a_foreign_execution_retryably() -> None:
+    # Security review PL-1: a sibling run's worker on the same task queue may get our
+    # task; rejected retryably, Temporal hands it out again (perhaps to our worker).
     install(on_worker=True)
-    with pytest.raises(ApplicationError) as info:
+    with pytest.raises(MsreviewForeignTask) as info:
         activity_env("someone-elses-execution").run(guard, make_request())
-    assert info.value.type == "MsreviewPinRejected"
-    assert info.value.non_retryable
-    assert isinstance(info.value.__cause__, MsreviewPinRejected)
+    assert isinstance(info.value, MsreviewPinRejected)
+    assert not info.value.non_retryable
 
 
 def test_worker_mode_rejects_request_mismatch_and_bad_seals_non_retryably() -> None:

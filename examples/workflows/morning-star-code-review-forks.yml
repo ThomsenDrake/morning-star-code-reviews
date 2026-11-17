@@ -7,11 +7,17 @@
 # - It never checks out or runs pull request code. The reviewer fetches the PR head
 #   into a temporary directory and its agent only has read-only tools (no network,
 #   no shell). Everything it posts is sanitised (no links, no mentions).
-# - Reviews run automatically only for trusted authors (OWNER, MEMBER, COLLABORATOR).
-#   For anyone else a maintainer adds the label "msreview: safe-to-review" after
-#   reading the change; the approval is bound to that head commit
-#   (expected-head-sha), and the label is removed after the review and on every new
-#   push, so each push needs a fresh approval.
+# - Reviews run automatically only for trusted authors (OWNER, MEMBER, COLLABORATOR)
+#   whose PR comes from their own fork (head repository owned by the author): a
+#   trusted author's PR from someone else's branch would let that someone push code
+#   that is reviewed with your keys. For anything else a maintainer adds the label
+#   "msreview: safe-to-review" after reading the change. The review is bound to the
+#   head commit at the moment the label is added (expected-head-sha), and the label
+#   is removed after the review and on every new push, so each push needs a fresh
+#   approval.
+# - Check the head commit before you add the label: a push that lands while you read
+#   (before the label) is the commit that gets reviewed. Anyone with triage or write
+#   access can add labels. See docs/security.md.
 # - The workflow token is read-only; the GitHub App token does all writes.
 # Residual risks (steerable review text, cost, rate limits): see docs/security.md.
 name: Morning Star Code Review (forks)
@@ -29,7 +35,8 @@ jobs:
       (
         (github.event.action != 'labeled' &&
          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
-                  github.event.pull_request.author_association)) ||
+                  github.event.pull_request.author_association) &&
+         github.event.pull_request.head.repo.owner.login == github.event.pull_request.user.login) ||
         (github.event.action == 'labeled' &&
          github.event.label.name == 'msreview: safe-to-review')
       )
@@ -55,12 +62,15 @@ jobs:
           remove-label: "msreview: safe-to-review"
 
   revoke-approval:
-    # A new push from an untrusted fork invalidates the maintainer's approval.
+    # A new push to a PR that is not reviewed automatically invalidates the approval.
     if: >-
       github.event.action == 'synchronize' &&
       github.event.pull_request.head.repo.full_name != github.repository &&
-      !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
-                github.event.pull_request.author_association) &&
+      (
+        !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
+                  github.event.pull_request.author_association) ||
+        github.event.pull_request.head.repo.owner.login != github.event.pull_request.user.login
+      ) &&
       contains(github.event.pull_request.labels.*.name, 'msreview: safe-to-review')
     runs-on: ubuntu-latest
     timeout-minutes: 5

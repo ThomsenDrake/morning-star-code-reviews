@@ -46,6 +46,8 @@ async def test_three_explorers_merge_and_verify(harness: Harness) -> None:
     # Three explorer jobs (one directory each), no formatter, one verifier.
     explores = h.calls("explore")
     assert sorted(c["model"] for c in explores) == sorted([GLM, LARGE, DEEPSEEK])
+    # The best preset gives every explorer the same tool budget (no flash cap of 25).
+    assert {c["max_tool_calls"] for c in explores} == {60}
     assert {c["job_dir"] for c in explores} == {f"explore-{m}" for m in (GLM, LARGE, DEEPSEEK)}
     (ver,) = h.calls("verify")
     assert ver["model"] == GLM and ver["job_dir"] == "verify"
@@ -148,7 +150,10 @@ async def test_verifier_crash_leaves_candidates_unconfirmed(harness: Harness) ->
     out = await h.run(h.request(preset="best"))
 
     assert out.status == "posted"
-    assert out.verdict == "incomplete"
+    # Never clean without the verifier; the open findings still give "findings", and
+    # the summary says what was not covered.
+    assert out.verdict == "findings"
+    assert "the verifier did not run" in (out.report_markdown or "")
     assert {f.verify_status for f in out.findings} == {"uncertain"}
     inline = {c["path"] for c in h.fake.review_comments}
     # Two or more votes and high severity still go inline (tagged unconfirmed).

@@ -20,6 +20,7 @@ from morning_star_review.activities.common import (
     RELATED_JSON,
     activity_errors,
     blocking,
+    check_payload_budget,
     progress,
     require_dir,
     write_changed_files,
@@ -40,6 +41,7 @@ from morning_star_review.diff import prepass, related
 from morning_star_review.diff.anchors import build_anchor_map
 from morning_star_review.diff.incremental import ScopeDecision, decide_scope
 from morning_star_review.diff.patch import FilePatch, local_patches, parse_patch
+from morning_star_review.diff.prepass import nothing_to_review
 from morning_star_review.diff.render import prompt_priors, render_prompt
 from morning_star_review.github.fetch import load_pr_patches
 from morning_star_review.gitops import (
@@ -56,6 +58,7 @@ __all__ = [
     "PROMPT_TXT",
     "REPO_DIR",
     "clone_url",
+    "nothing_to_review",
     "prepare",
     "prepare_sync",
     "set_test_clone_url",
@@ -195,6 +198,10 @@ def prepare_sync(req: ReviewRequest, snap: PrSnapshot, ctx: RunContext) -> Prepa
         req.force,
         prior_fetchable=fetchable,
     )
+    if not full.reviewable and scope.scope == "carry_over":
+        # Nothing in the pull request is reviewable, so the verdict cannot depend on an
+        # earlier review (which may have been incomplete): decide it afresh.
+        scope = ScopeDecision("full", None, [], nothing_to_review(full.excluded))
     prompt_plan, prompt_patches = full, patches.best
     if scope.scope == "incremental":
         inc = _incremental_plan(snap, repo_dir, scope, first, base_first)
@@ -203,16 +210,19 @@ def prepare_sync(req: ReviewRequest, snap: PrSnapshot, ctx: RunContext) -> Prepa
         else:
             prompt_plan, prompt_patches = inc
 
+    # No model runs for a carry-over or when no file is reviewable (all of them lock
+    # files, generated, binary, ...): the workflow then skips explore, merge and verify.
+    no_models = scope.scope == "carry_over" or not prompt_plan.reviewable
     boundary = secrets.token_hex(4)
     defs: list[related.RelatedDefinition] = []
-    if cfg.related_definitions and scope.scope != "carry_over":
+    if cfg.related_definitions and not no_models:
         ranked = [prompt_patches[p] for p in prompt_plan.ranked if p in prompt_patches]
         defs = related.collect(repo_dir, ranked, {f.path for f in files})
     write_json_atomic(run_dir / RELATED_JSON, related.dump_related(defs))
 
     priors = list(prior.findings) if prior is not None else []
-    if scope.scope == "carry_over":
-        prompt = ""  # no model call: nothing changed that needs a review
+    if no_models:
+        prompt = ""  # no model call: nothing (more) that needs a review
     else:
         prompt = render_prompt(
             snap, prompt_plan, scope, priors, cfg, boundary, cfg.budgets, related=defs
@@ -223,6 +233,8 @@ def prepare_sync(req: ReviewRequest, snap: PrSnapshot, ctx: RunContext) -> Prepa
         f"on_demand={len(prompt_plan.on_demand)} excluded={len(full.excluded)} "
         f"related={len(defs)} prompt_chars={len(prompt)}"
     )
+    if not prompt_plan.reviewable and scope.scope != "carry_over":
+        progress(f"msreview: nothing to review: {nothing_to_review(prompt_plan.excluded)}")
     return Prepared(
         job_root=str(run_dir),
         repo_dir=repo_dir,
@@ -255,4 +267,6 @@ async def prepare(inp: PrepareInput) -> Prepared:
     ctx = guard(inp.req, inp.snap)
     with activity_errors():
         prep = await blocking(lambda: prepare_sync(inp.req, inp.snap, ctx), {"stage": "prepare"})
+        # Explore, verify and finalize carry both; keep their inputs under the limit.
+        check_payload_budget(inp.snap, prep)
         return seal(prep, ctx)

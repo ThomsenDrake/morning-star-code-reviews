@@ -45,7 +45,16 @@ def test_source_from_wheel_and_fallback() -> None:
 def test_plan_requires_hashes_and_no_deps(tmp_path: Path) -> None:
     src = setup_agent.InstallSource(spec="/src", editable=True, origin="dir")
     cmds = setup_agent.plan_commands("uv", tmp_path / "v", Path("/r.txt"), src, "/usr/bin/python3")
-    assert cmds[0] == ["uv", "venv", "--python", "/usr/bin/python3", str(tmp_path / "v")]
+    assert cmds[0] == [
+        "uv",
+        "venv",
+        "--no-config",
+        "--python",
+        "/usr/bin/python3",
+        str(tmp_path / "v"),
+    ]
+    # Security review SEC-CI-4: no uv.toml / [tool.uv] from the cwd is ever read.
+    assert all("--no-config" in cmd for cmd in cmds)
     assert "--require-hashes" in cmds[1] and cmds[1][-2:] == ["-r", "/r.txt"]
     assert "--no-deps" in cmds[2] and cmds[2][-2:] == ["-e", "/src"]
 
@@ -136,7 +145,7 @@ def test_setup_runs_the_planned_commands(tmp_path: Path, monkeypatch: pytest.Mon
     env = {"PATH": str(fake_uv.parent)}
     assert setup_agent.run_setup(source="/src/pkg", venv=venv, env=env) == 0
     assert [c[1] for c in ran] == ["venv", "pip", "pip"]
-    assert ran[0][3] == sys.executable
+    assert ran[0][ran[0].index("--python") + 1] == sys.executable
     assert ran[2][-1] == "/src/pkg"
 
 

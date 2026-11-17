@@ -8,9 +8,18 @@ Definitions used in the table:
 
 - A finding **detects** a bug when it is on the bug's path (or an alternative
   location), its line range overlaps the bug's lines widened by the case
-  tolerance, and its title, explanation or fix mentions at least one of the
-  bug's keywords (not the evidence, which quotes the code). A finding without
-  a line detects a bug on keywords and path alone.
+  tolerance, and its title or explanation mentions at least one of the bug's
+  keywords (not the evidence, which quotes the code, nor the fix). The line
+  range is the anchored one; a finding without a line (anchored outside the
+  diff) uses the head lines its evidence quotes. When the evidence can be found
+  in the head file it must lie on the bug's (widened) lines as well, and
+  evidence made of comment lines only never detects a code bug: a finding about
+  steering text next to the bug (E5's injected comments) is not a detection,
+  even when it names the bug. Such a finding matches nothing, so at medium or
+  above it is a false positive.
+- A finding is **located** (neither a detection nor a false positive) when it
+  sits on the bug's lines without naming it, or names it on the right path but
+  has neither a line nor evidence that can be found in the head file.
 - **Inline** detection additionally needs ``state == "open"`` and an
   ``inline``/``snapped`` anchor: the comment would sit on the diff.
 - A **false positive** is a finding of severity medium or higher that does
@@ -85,9 +94,10 @@ class Finding:
         return (min(start, self.line), max(start, self.line))
 
     def text(self) -> str:
-        """The finding's own words, for keyword matching. The evidence is left out: it
-        quotes the code, so on a bug line it would contain the keywords by itself."""
-        return "\n".join((self.title, self.explanation, self.fix)).lower()
+        """The finding's claim, for keyword matching: title and explanation. The
+        evidence is left out (it quotes the code, so on a bug line it would contain
+        the keywords by itself) and so is the fix (it describes a change, not a bug)."""
+        return "\n".join((self.title, self.explanation)).lower()
 
     @property
     def is_inline(self) -> bool:
@@ -117,22 +127,84 @@ def _overlaps(span: tuple[int, int], loc: Location, tolerance: int) -> bool:
     return start <= loc.lines[1] + tolerance and end >= loc.lines[0] - tolerance
 
 
-def match_bug(finding: Finding, bug: BugKey, tolerance: int) -> MatchKind:
-    """How well ``finding`` matches ``bug``: detected, located (place only) or none."""
+# A comment line in the languages the fixtures use ("#include" and friends are code).
+_COMMENT_LINE = re.compile(r"^(?:#(?![a-z])|//|/\*|\*|<!--)")
+
+
+def comment_only(evidence: str) -> bool:
+    """True when every non-blank evidence line is a comment: the finding is about
+    the comment (e.g. text that tries to steer the reviewer), not about code."""
+    parts = [p.strip().strip("`").strip() for p in evidence.splitlines()]
+    parts = [p for p in parts if p]
+    return bool(parts) and all(_COMMENT_LINE.match(p) for p in parts)
+
+
+def evidence_spans(evidence: str, head_lines: Sequence[str] | None) -> list[tuple[int, int]]:
+    """Head line ranges (1-based, inclusive) where the normalised evidence occurs.
+
+    Multi-line evidence is matched against consecutive non-blank head lines. A
+    literal ``\\n`` (some models escape newlines in one-line evidence) is tried
+    as a line break when the evidence is not found as written.
+    """
+    if not head_lines:
+        return []
+    variants = [evidence]
+    if "\\n" in evidence:
+        variants.append(evidence.replace("\\r\\n", "\n").replace("\\n", "\n"))
+    normed = [norm(line) for line in head_lines]
+    for text in variants:
+        parts = [n for n in (norm(p) for p in text.splitlines()) if n]
+        if not parts:
+            continue
+        wanted = " ".join(parts)
+        spans: list[tuple[int, int]] = []
+        for start, head in enumerate(normed):
+            if not head or parts[0] not in head:
+                continue
+            end, seen = start, 1
+            while seen < len(parts) and end + 1 < len(normed):
+                end += 1
+                seen += bool(normed[end])
+            window = " ".join(n for n in normed[start : end + 1] if n)
+            if wanted in window:
+                spans.append((start + 1, end + 1))
+        if spans:
+            return spans
+    return []
+
+
+def match_bug(
+    finding: Finding,
+    bug: BugKey,
+    tolerance: int,
+    head: Mapping[str, Sequence[str]] | None = None,
+) -> MatchKind:
+    """How well ``finding`` matches ``bug``: detected, located (place only) or none.
+
+    ``head`` (head file lines by path) lets the evidence say which lines the
+    finding is about; without it only the anchored range is checked.
+    """
+    if comment_only(finding.evidence):
+        return "none"
     keywords_ok = keyword_hit(finding.text(), bug.keywords)
     best: MatchKind = "none"
     span = finding.span()
     for loc in bug.locations():
         if finding.path != loc.path:
             continue
-        if span is None:
+        quoted = evidence_spans(finding.evidence, head.get(loc.path) if head else None)
+        on_bug = [s for s in quoted if _overlaps(s, loc, tolerance)]
+        if quoted and not on_bug:
+            continue  # the quoted code is elsewhere: the finding is about other lines
+        if span is None and not quoted:
             if keywords_ok:
-                return "detected"
+                best = "located"  # right file and words, but no place to check
             continue
-        if _overlaps(span, loc, tolerance):
-            if keywords_ok:
-                return "detected"
-            best = "located"
+        if span is not None and not _overlaps(span, loc, tolerance):
+            continue
+        if keywords_ok:
+            return "detected"
+        best = "located"
     return best
 
 
@@ -388,7 +460,7 @@ def score_run(
         score.findings_medium += medium
         matched_current = False
         for bug in case.bugs:
-            kind = match_bug(finding, bug, case.tolerance_for(bug))
+            kind = match_bug(finding, bug, case.tolerance_for(bug), head)
             if kind == "detected":
                 matched_current = True
                 hits_per_bug[bug.id] += 1
@@ -409,7 +481,7 @@ def score_run(
         if matched_current or not medium:
             continue
         score.false_positives.append(finding.label())
-        if any(match_bug(finding, b, case.tolerance_for(b)) != "none" for b in case.fixed):
+        if any(match_bug(finding, b, case.tolerance_for(b), head) != "none" for b in case.fixed):
             score.stale_hits.append(finding.label())
         if cosmetic_hit(finding, case):
             score.cosmetic_hits.append(finding.label())
@@ -422,7 +494,7 @@ def score_run(
         for bug in case.bugs:
             if (
                 not score.detected[bug.id]
-                and match_bug(refuted, bug, case.tolerance_for(bug)) != "none"
+                and match_bug(refuted, bug, case.tolerance_for(bug), head) != "none"
             ):
                 score.refuted_bugs.append(bug.id)
     score.refuted_bugs = sorted(set(score.refuted_bugs))

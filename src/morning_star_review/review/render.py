@@ -34,12 +34,14 @@ from morning_star_review.core.sanitize import (
     sanitize_inline,
     sanitize_md,
     strip_markers,
+    without_controls,
 )
 from morning_star_review.review import suggest
 from morning_star_review.review.anchoring import line_text
 from morning_star_review.review.verdict import resolved_without_fix
 
 __all__ = [
+    "OTHER_HEADING",
     "REPORT_LIMIT",
     "SUMMARY_LIMIT",
     "SUMMARY_MARKER",
@@ -58,6 +60,9 @@ __all__ = [
 
 TOOL_NAME = "Morning Star Code Review"
 SUMMARY_MARKER = "<!-- morning-star-review:summary v1 -->"
+# Findings without an inline comment that are neither main nor "possible" findings:
+# outside the changed files, not on a changed line, or below the inline threshold.
+OTHER_HEADING = "#### Other findings"
 # The summary comment holds the summary plus the state marker (<= 20 KB) and must
 # stay under 60,000 characters.
 SUMMARY_LIMIT = 38_000
@@ -234,6 +239,9 @@ class SummaryInput:
     details: RunDetails | None  # None when show_usage is off
     over_cap: int = 0
     author_may_dismiss: bool = True
+    # False when the review has blockers (verdict.Assessment.complete); a "findings"
+    # review can be incomplete too, and then its reasons say what was not covered.
+    complete: bool = True
 
 
 def _plural(n: int, word: str, plural: str | None = None) -> str:
@@ -320,14 +328,26 @@ def _main_status(s: SummaryInput, f: FinalFinding, notes: Mapping[str, str]) -> 
     return "new, not confirmed" if f.verify_status == "uncertain" else "new"
 
 
+# Where a finding is anchored, in the words of the report's detail lines.
+_ANCHOR_WORDS = {
+    "inline": "on a changed line",
+    "snapped": "on a changed line (moved to the line that matches the evidence)",
+    "file": "in a changed file, not on a changed line",
+    "outside": "outside this PR's changed files",
+}
+
+
 def _other_reason(f: FinalFinding, threshold: Severity) -> str:
-    if f.anchor == "outside":
-        return "not in this PR's changed files"
-    if f.anchor == "file":
-        return "not on a changed line"
+    """Where an "Other findings" item is and why it has no inline comment.
+
+    The location words match the finding's detail line in the report.
+    """
+    if f.anchor in ("outside", "file"):
+        return _ANCHOR_WORDS[f.anchor]
+    where = _ANCHOR_WORDS["inline"]
     if _below_threshold(f, threshold):
-        return f"below the inline threshold ({threshold})"
-    return "summary only"
+        return f"{where}, below the inline threshold ({threshold})"
+    return where
 
 
 def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
@@ -377,8 +397,8 @@ def _other_section(s: SummaryInput) -> str:
     ]
     if not rows:
         return ""
-    return "#### Not on changed lines\n\n" + _table(
-        ["Severity", "Finding", "Location", "Why"], rows
+    return f"{OTHER_HEADING}\n\n" + _table(
+        ["Severity", "Finding", "Location", "Why not inline"], rows
     )
 
 
@@ -519,10 +539,15 @@ def _footer(s: SummaryInput) -> str:
 
 
 def _reasons_block(s: SummaryInput) -> str:
-    if s.verdict != "incomplete" or not s.verdict_reasons:
+    """``verdict_reasons``: why the review is incomplete, or notes about it."""
+    if not s.verdict_reasons:
         return ""
     items = "\n".join(f"- {_cell(r, 400)}" for r in s.verdict_reasons)
-    return f"The review is incomplete, so it cannot be called clean:\n{items}"
+    if s.verdict == "incomplete":
+        return f"The review is incomplete, so it cannot be called clean:\n{items}"
+    if not s.complete:
+        return f"The review did not cover everything, so there may be more findings:\n{items}"
+    return f"Notes on this review:\n{items}"
 
 
 def _shorten(text: str, limit: int) -> str:
@@ -553,7 +578,7 @@ def summary(s: SummaryInput, *, limit: int = SUMMARY_LIMIT) -> str:
     parts = [f"{SUMMARY_MARKER}\n### {TOOL_NAME}\n{verdict_headline(s)}", *_summary_sections(s)]
     if s.details is not None:
         parts.append(_details_section(s.details))
-    body = "\n\n".join(p for p in parts if p)
+    body = without_controls("\n\n".join(p for p in parts if p))
     footer = _footer(s)
     return _shorten(body, limit - len(footer) - 2) + "\n\n" + footer
 
@@ -593,14 +618,6 @@ def _excerpt(path: str, f: FinalFinding, head: HeadText) -> str:
             text = text[: _EXCERPT_LINE_MAX - 1] + "…"
         body.append(f"{n:>{width}}  {text}".rstrip())
     return "Code at head:\n\n" + _fenced("\n".join(body), _language(path))
-
-
-_ANCHOR_WORDS = {
-    "inline": "on a changed line",
-    "snapped": "on a changed line (moved to the line that matches the evidence)",
-    "file": "in a changed file, not on a changed line",
-    "outside": "outside this PR's changed files",
-}
 
 
 def _detail(i: int, f: FinalFinding, head: HeadText) -> str:
@@ -646,7 +663,7 @@ def report(s: SummaryInput, head_text: HeadText, *, limit: int = REPORT_LIMIT) -
     )
     tail = [coverage]
     if s.details is not None:
-        tail.append("#### Run details\n\n" + _details_section(s.details))
+        tail.append(_details_section(s.details))  # its <summary> is the heading
     tail_text = "\n\n".join(tail)
     budget = limit - len(head_part) - len(tail_text) - 400
     details: list[str] = []
@@ -664,7 +681,9 @@ def report(s: SummaryInput, head_text: HeadText, *, limit: int = REPORT_LIMIT) -
         used += len(block) + 2
     middle = "#### Findings in detail\n\n" + "\n\n".join(details) if details else ""
     text = "\n\n".join(p for p in (head_part, middle, tail_text) if p)
-    return _shorten(text, limit)
+    # Paths and code excerpts are PR text: no terminal control sequences in a report
+    # that `msreview review` prints (security review TERM-1).
+    return _shorten(without_controls(text), limit)
 
 
 def findings_json(

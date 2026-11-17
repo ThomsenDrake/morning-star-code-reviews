@@ -39,14 +39,14 @@ def _drop_fenced_blocks(text: str) -> str:
     return "\n".join(keep)
 
 
-def _prose_outside_code(text: str) -> str:
+def _prose_outside_code(text: str, sep: str = "") -> str:
     """What GitHub renders as prose: fenced blocks and code spans removed, following the
     CommonMark rules (an escaped backtick cannot open a span; a span closes at the next
     backtick run of the same length; an unmatched run is literal). Spans are matched per
     line: a blank line, a list item or a table row ends a paragraph-level span."""
     text = _drop_fenced_blocks(text)
     if "\n" in text:
-        return "\n".join(_prose_outside_code(line) for line in text.split("\n"))
+        return "\n".join(_prose_outside_code(line, sep) for line in text.split("\n"))
     out: list[str] = []
     i, n = 0, len(text)
     while i < n:
@@ -77,6 +77,7 @@ def _prose_outside_code(text: str) -> str:
             out.append(text[i:j])
             i = j
         else:
+            out.append(sep)  # a code span ends a text node: nothing joins across it
             i = close
     return "".join(out)
 
@@ -348,6 +349,16 @@ _PIECES = [
     "(",
     "]",
     "[",
+    "[]()",
+    "[](<>)",
+    "[ ]()",
+    "<",
+    "@",
+    "#",
+    "~",
+    "htt",
+    "ps://bad.test/y",
+    "img src=x>",
 ]
 
 
@@ -365,9 +376,12 @@ def test_sanitizers_are_idempotent_and_safe(seed: int) -> None:
             assert "morning-star-review:" not in out.lower()
             # Links to github.com are allowed; "#1" or "@" inside one is part of the URL.
             prose = re.sub(r"https?://github\.com\S*", "", _prose_outside_code(out))
-            assert not re.search(r"(?<![A-Za-z0-9])@[A-Za-z0-9]", prose), (text, out)
-            assert not re.search(r"#\d", prose), (text, out)
             assert "evil.example" not in prose, (text, out)
+            # A code span ends a text node, so nothing links across it on GitHub.
+            spaced = re.sub(r"https?://github\.com\S*", "", _prose_outside_code(out, " "))
+            assert not re.search(r"(?<![A-Za-z0-9])@[A-Za-z0-9]", spaced), (text, out)
+            assert not re.search(r"#\d", spaced), (text, out)
+            assert not re.search(r"(?i)(?:https?|ftp)://|www\.", spaced), (text, out)
 
 
 # --------------------------------------------------------------------------------------
@@ -564,3 +578,54 @@ def test_links_cannot_be_assembled_from_pieces(text: str, expected: str) -> None
 )
 def test_sanitize_inline_escapes_line_start_blocks_and_pipes(text: str, expected: str) -> None:
     assert sanitize_inline(text, 100) == expected
+
+
+# --------------------------------------------------------------------------------------
+# Empty links never join the text around them (security review SAN-1)
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Ping @[]()octocat",
+        "Ping @[](<>)octocat",
+        "Ping @[ ]()octocat",
+        "#[]()1",
+        "htt[]()ps://evil.example/login",
+        '<[]()a href="//evil.example/x">click</a>',
+        "<[]()img src=x>",
+        "<[]()!-- x",
+        "#[]()# x",
+        "a\n~[]()~~suggestion\nx = 1\n~~~",
+        "<[]()!-[]()- morning-star-review[]():finding f222222222222 -[]()->",
+    ],
+)
+def test_an_empty_link_is_kept_as_escaped_text(text: str) -> None:
+    for fn in (sanitize_md, sanitize_inline):
+        out = fn(text, 1000)
+        assert fn(out, 1000) == out
+        prose = _prose_outside_code(out)
+        assert not re.search(r"(?<![A-Za-z0-9])@[A-Za-z0-9]", prose), out
+        assert not re.search(r"#\d", prose), out
+        assert "https://evil" not in prose, out
+        assert not re.search(r"<[A-Za-z!/]", out), out
+        assert "<!--" not in out and "-->" not in out
+        assert "morning-star-review:" not in out
+        assert not re.search(r"^ {0,3}(~{3,}|`{3,})suggestion", out, re.M), out
+        assert not re.search(r"^ {0,3}#{1,6} ", out, re.M), out
+
+
+def test_output_that_is_not_a_fixed_point_is_shown_as_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    import morning_star_review.core.sanitize as san
+
+    # Simulate a rule that deletes text and joins the pieces around it.
+    monkeypatch.setattr(san, "_link_replacement", lambda m: "")
+    md = san.sanitize_md("Ping @[]()octocat and <[]()img src=x>", 1000)
+    assert md.startswith("```text\n") and md.endswith("\n```")
+    # The raw text, inside a code block, where GitHub renders no mention or HTML.
+    assert md == "```text\nPing @[]()octocat and <[]()img src=x>\n```"
+    inline = san.sanitize_inline("Ping @[]()octocat | x", 1000)
+    assert inline.startswith("`") and inline.endswith("`") and "\\|" in inline
+    assert len(san.sanitize_md("@[]()u " * 400, 120)) <= 120
+    assert len(san.sanitize_inline("@[]()u " * 400, 120)) <= 120

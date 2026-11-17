@@ -196,12 +196,61 @@ def test_sections_and_reasons(make) -> None:
         in text
     )
     assert "| listed here only (inline comment limit reached) |" in text
-    assert (
-        "| not in this PR's changed files |" in text
-        and "| below the inline threshold (medium) |" in text
-    )
+    # "Other findings" holds findings off the changed lines and below-threshold ones on
+    # them; each row says where the finding is, in the report's words.
+    other = text.split(render.OTHER_HEADING, 1)[1].split("\n\n#### ", 1)[0]
+    assert "| Severity | Finding | Location | Why not inline |" in other
+    assert "| outside this PR's changed files |" in other
+    assert "| on a changed line, below the inline threshold (medium) |" in other
+    assert "Not on changed lines" not in text and "| not on a changed line |" not in text
     assert "- Fixed bug (`a.py`): code changed" in text and "- Gone (`b.py`): file deleted" in text
     assert "- Dismissed (`c.py`): dismissed by alice" in text and "Old" not in text
+
+
+def test_reasons_for_findings_and_clean_verdicts(make) -> None:
+    # An incomplete review with open findings says what it did not cover.
+    gap = "1 of 2 reviewable changed files was not opened"
+    text = render.summary(
+        view(make, [ff(id="f1")], verdict="findings", verdict_reasons=[gap], complete=False)
+    )
+    assert f"The review did not cover everything, so there may be more findings:\n- {gap}" in text
+    assert "cannot be called clean" not in text
+    # Notes on a complete review (clean or findings) are listed as notes.
+    note = "nothing to review: all 2 changed files are lock files"
+    text = render.summary(view(make, verdict="clean", verdict_reasons=[note]))
+    assert f"Notes on this review:\n- {note}" in text
+    assert "did not cover" not in text and "incomplete" not in text
+    assert "Notes on" not in render.summary(view(make, verdict="clean"))
+
+
+def test_report_other_findings_match_their_detail_lines(make) -> None:
+    findings = [
+        ff(id="f1"),
+        ff(id="f2", anchor="outside", line=None, path="x.py", state="summary_only"),
+        ff(id="f3", anchor="file", line=3, path="y.py", state="summary_only"),
+        ff(id="f4", severity="low", state="summary_only", line=20),
+        ff(id="f5", anchor="snapped", severity="low", state="summary_only", line=30),
+    ]
+    details = render.RunDetails(
+        execution_id="msreview-x", run_label="cli:1", roles=None, usage={}, cost_usd=0.25
+    )
+    text = render.report(view(make, findings, details=details), lambda _path: None)
+    other = text.split(render.OTHER_HEADING, 1)[1].split("\n\n#### ", 1)[0]
+    rows = [ln for ln in other.split("\n") if ln.startswith("| ") and "Severity" not in ln]
+    assert [r.rsplit(" | ", 1)[1] for r in rows] == [
+        "outside this PR's changed files |",
+        "in a changed file, not on a changed line |",
+        "on a changed line, below the inline threshold (medium) |",
+        "on a changed line, below the inline threshold (medium) |",
+    ]
+    # Each row's location words open the finding's detail line too.
+    assert "`x.py` · outside this PR's changed files" in text
+    assert "`y.py:3` · in a changed file, not on a changed line" in text
+    assert "`ledger/service.py:20` · on a changed line\n" in text
+    assert "`ledger/service.py:30` · on a changed line (moved to" in text
+    # The run details appear once, as a collapsible block with its own title.
+    assert text.count("Run details") == 1
+    assert "<details><summary>Run details</summary>" in text and "#### Run details" not in text
 
 
 def test_coverage_lists_are_capped(make) -> None:
@@ -363,3 +412,18 @@ def test_outputs_are_safe_for_any_model_text(
     outputs += [render.inline_body(f, ", ".join(f.votes), SHA) for f in findings]
     for out in outputs:
         make.assert_safe(out)
+
+
+def test_reports_carry_no_terminal_control_sequences(make) -> None:
+    # Security review TERM-1: paths and code excerpts come from the PR and the CLI
+    # prints the report to a terminal.
+    osc = "\x1b]52;c;ZWNobyBwd25lZA==\x07"
+    path = f"deps/x{osc}.lock"
+    excluded = [ExcludedFile(path=path, reason="lock_file", changed_lines=1)]
+    cov = render.Coverage(reviewable=1, covered=1, excluded=excluded)
+    finding = ff(path=f"src/a{osc}.py", line=2, evidence="x = 1")
+    lines = ["import os", f"x = 1  # {osc}\x9b2J\r", "y = 2"]
+    v = view(make, [finding], coverage=cov)
+    for text in (render.summary(v), render.report(v, lambda _p: lines)):
+        assert not any(ch in text for ch in "\x1b\x07\x9b\r"), repr(text)
+        assert "�]52;c;" in text

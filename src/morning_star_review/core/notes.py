@@ -4,8 +4,9 @@ Explorer notes (DESIGN 6.7, plus the ADDENDUM E ``suggestion`` field) and verifi
 output (ADDENDUM D) are plain text, because models follow a simple line grammar far
 more reliably than a JSON schema while they are still using tools. The parsers accept
 the usual deviations (list markers, bold, backticks, numbering, field aliases, missing
-END lines, line ranges, mixed case). Whatever they cannot read is reported as
-``unparsed`` so the caller can fall back to the formatter.
+END lines, line ranges, mixed case, multi-line code written on one line with literal
+``\\n`` escapes). Whatever they cannot read is reported as ``unparsed`` so the caller
+can fall back to the formatter.
 """
 
 from __future__ import annotations
@@ -104,7 +105,10 @@ class ParsedNotes:
     unparsed: list[str] = field(default_factory=list)  # raw blocks that could not be read
     no_findings_declared: bool = False
     sentinel: bool = False  # REVIEW COMPLETE, with no FINDING after it
-    closed_blocks: bool = True  # every FINDING block had its END FINDING
+    # Every FINDING block was closed: by END FINDING, or implicitly by the next FINDING,
+    # PRIOR, NO FINDINGS, SUMMARY: or REVIEW COMPLETE (models often omit END FINDING).
+    # False only when the notes stop inside a block, which is what a cut-off looks like.
+    closed_blocks: bool = True
     ends_with_summary: bool = False  # summary text after the last block / NO FINDINGS
     dropped_suggestions: int = 0  # suggestion fields that were empty or unterminated
 
@@ -115,7 +119,11 @@ class ParsedNotes:
 
     @property
     def looks_complete(self) -> bool:
-        """The notes part of the explore-completeness rule (DESIGN 6.6)."""
+        """The notes part of the explore-completeness rule (DESIGN 6.6).
+
+        A block without END FINDING counts as closed when a later marker ends it (see
+        ``closed_blocks``); notes that stop inside a block are never complete.
+        """
         has_content = bool(self.findings or self.priors or self.summary)
         has_content = has_content or self.no_findings_declared
         return has_content and self.closed_blocks and (self.sentinel or self.ends_with_summary)
@@ -377,6 +385,79 @@ def _unwrap(text: str) -> str:
     return s
 
 
+_ESCAPES = {"n": "\n", "t": "\t"}
+_STRING_PREFIXES = frozenset({"b", "f", "r", "u", "br", "rb", "fr", "rf"})  # f'..', rb'..'
+_WORD_END = re.compile(r"[A-Za-z]+$")
+
+
+def _is_apostrophe(text: str, i: int) -> bool:
+    """``'`` at ``text[i]`` ends a word ("don't", "users'"), so it opens no string.
+
+    A string prefix such as ``f`` in ``f'{x}'`` is the exception: that quote opens one.
+    """
+    m = _WORD_END.search(text, max(0, i - 40), i)
+    if m is None:
+        return False
+    before = text[m.start() - 1] if m.start() else " "
+    standalone = not (before.isalnum() or before == "_")
+    return not (standalone and m.group().lower() in _STRING_PREFIXES)
+
+
+def _unescape(text: str, *, code_spans: bool) -> str:
+    """Undo literal ``\\n`` and ``\\t`` escapes in one-line text.
+
+    Some models (Mistral Large 4) write several lines of code on one line, joined by
+    the two characters backslash and ``n``. Text with a real newline is returned as
+    written, and so are sequences inside a string literal (``sep = "\\n"``), behind an
+    escaped backslash (``\\\\n``) and, with ``code_spans``, inside a backtick code span
+    (prose fields). Runs of three or more backticks are code fences, not spans.
+    """
+    if "\n" in text or "\\" not in text:
+        return text
+    out: list[str] = []
+    quote: str | None = None
+    changed = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if quote is None and nxt in _ESCAPES:
+                out.append(_ESCAPES[nxt])
+                changed = True
+            else:  # escaped backslash or quote, or an escape inside a literal: keep
+                out.append(text[i : i + 2])
+            i += 2
+            continue
+        if ch == "`":
+            j = i
+            while j < len(text) and text[j] == "`":
+                j += 1
+            if code_spans and j - i < 3 and quote in (None, "`"):
+                quote = None if quote == "`" else "`"
+            out.append(text[i:j])
+            i = j
+            continue
+        if ch in "\"'":
+            if quote == ch:
+                quote = None
+            elif quote is None and not (ch == "'" and _is_apostrophe(text, i)):
+                quote = ch
+        out.append(ch)
+        i += 1
+    return "".join(out) if changed else text
+
+
+def _code_value(text: str) -> str:
+    """An evidence value: one layer of wrapping removed and one-line escapes undone.
+
+    Backticks around the value are wrapping, not a code span, so they do not stop the
+    unescaping: ``if x:\\n    raise E()`` in backticks becomes two lines, and the
+    anchoring step then matches its first non-blank line (``evidence_variants``).
+    """
+    return _unwrap(_unescape(text.strip(), code_spans=False))
+
+
 def _cap(text: str, limit: int) -> str:
     text = text.strip()
     if len(text) <= limit:
@@ -627,14 +708,17 @@ def _build_finding(b: _Block) -> tuple[DraftFinding | None, int]:
     if b.text("end_line") and line is not None:
         last, _ = _line_range(b.text("end_line"))
         end = last if last is not None and last > line else None
-    title = _unwrap(b.text("title").split("\n")[0]) if b.text("title") else b.marker_rest
+    if b.text("title"):
+        title = _unwrap(_unescape(b.text("title").split("\n")[0], code_spans=True))
+    else:
+        title = _unescape(b.marker_rest, code_spans=True)
     severity = _severity(b.text("severity")) if b.text("severity") else None
     tm = _TITLE_SEVERITY.match(title)
     if tm:  # "FINDING 2 (high): ..." or "title: [HIGH] ..."
         severity = severity or _SEVERITY_ALIASES[tm.group("sev").lower()]
         title = title[tm.end() :]
     title = _unwrap(title.strip())
-    why = _prose(b.text("why"))
+    why = _prose(_unescape(b.text("why"), code_spans=True))
     stray = "\n".join(b.stray).strip()
     explanation = "\n\n".join(part for part in (why, stray) if part)
     if not title and explanation:
@@ -643,7 +727,7 @@ def _build_finding(b: _Block) -> tuple[DraftFinding | None, int]:
         explanation = title
     if not path or len(path) > 500 or severity is None or not title:
         return None, dropped
-    fix = _prose(b.text("fix"))
+    fix = _prose(_unescape(b.text("fix"), code_spans=True))
     finding = DraftFinding(
         path=path,
         line=line,
@@ -651,7 +735,7 @@ def _build_finding(b: _Block) -> tuple[DraftFinding | None, int]:
         severity=severity,
         category=_category(b.text("category")),
         title=_cap(" ".join(title.split()), _TITLE_MAX),
-        evidence=_cap(_unwrap(b.text("evidence")), _EVIDENCE_MAX),
+        evidence=_cap(_code_value(b.text("evidence")), _EVIDENCE_MAX),
         explanation=_cap(explanation, _EXPLANATION_MAX),
         fix=_cap(fix, _FIX_MAX) if fix and not _is_none_value(fix) else None,
         suggestion=b.suggestion_text,
@@ -701,12 +785,10 @@ def parse_notes(notes: str) -> ParsedNotes:
     sentinel_at = -1
     last_marker_at = -1
 
-    def close(explicit: bool) -> None:
+    def close() -> None:
         nonlocal block
         if block is None:
             return
-        if not explicit:
-            out.closed_blocks = False
         finding, dropped = _build_finding(block)
         out.dropped_suggestions += dropped
         if finding is None:
@@ -726,12 +808,12 @@ def parse_notes(notes: str) -> ParsedNotes:
         if _END_FINDING.match(bare):
             if block is not None:
                 block.raw.append(line)
-                close(True)
+                close()
                 tail = []
             continue
         marker = _finding_marker(bare)
         if marker is not None:
-            close(False)
+            close()
             in_summary = False
             structure_seen = True
             out.marker_count += 1
@@ -743,7 +825,7 @@ def parse_notes(notes: str) -> ParsedNotes:
         if not strict:
             prior = _prior_line(bare)
             if prior is not None:
-                close(False)
+                close()
                 in_summary = False
                 structure_seen = True
                 if isinstance(prior, PriorStatus):
@@ -753,7 +835,7 @@ def parse_notes(notes: str) -> ParsedNotes:
                     out.unparsed.append(_cap(prior, _BLOCK_MAX))
                 continue
             if _NO_FINDINGS.match(bare):
-                close(False)
+                close()
                 in_summary = False
                 structure_seen = True
                 out.no_findings_declared = True
@@ -761,7 +843,7 @@ def parse_notes(notes: str) -> ParsedNotes:
                 continue
             summary = _SUMMARY.match(bare)
             if summary is not None:
-                close(False)
+                close()
                 in_summary = True
                 structure_seen = True
                 # "**SUMMARY:** text" leaves the closing bold in front of the text.
@@ -771,7 +853,7 @@ def parse_notes(notes: str) -> ParsedNotes:
                     out.ends_with_summary = True
                 continue
             if _REVIEW_COMPLETE.match(bare):
-                close(False)
+                close()
                 in_summary = False
                 sentinel_at = index
                 continue
@@ -787,7 +869,9 @@ def parse_notes(notes: str) -> ParsedNotes:
                 out.ends_with_summary = True
             else:
                 preamble.append(line.strip())
-    close(False)
+    if block is not None:  # the notes stop inside a block: cut off, not complete
+        out.closed_blocks = False
+    close()
     out.priors = list(priors.values())
     out.sentinel = sentinel_at >= 0 and sentinel_at > last_marker_at
     explicit = "\n".join(summary_lines).strip()
@@ -908,7 +992,7 @@ def _build_verdict(v: _Verdict) -> VerifyEntry | None:
         return None
     line_text = v.text("line")
     line = None if _is_none_value(line_text) else _line_range(line_text)[0]
-    evidence_text = _unwrap(v.text("evidence"))
+    evidence_text = _code_value(v.text("evidence"))
     evidence = None if _is_none_value(evidence_text) else _cap(evidence_text, _EVIDENCE_MAX)
     severity_text = v.text("severity")
     severity = None if _is_none_value(severity_text) else _severity(severity_text)

@@ -77,7 +77,10 @@ async def test_failed_formatter_keeps_the_parsed_findings_and_blocks_clean(
 
     assert out.status == "posted"
     assert [f.title for f in out.findings] == [SWAP[2]]
-    assert out.verdict == "incomplete"
+    # A lossy draft blocks clean; the open finding still gives "findings", and the
+    # summary says what was not covered.
+    assert out.verdict == "findings"
+    assert "could not be fully parsed" in (out.report_markdown or "")
 
 
 async def test_explore_crash_reports_failure_and_raises(harness: Harness) -> None:

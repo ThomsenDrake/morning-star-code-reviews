@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import json
 import logging
+import math
 import os
 import secrets as pysecrets
 import shutil
@@ -19,20 +21,24 @@ import signal
 import sys
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from morning_star_review.core.contract import (
+    MAX_USAGE_KEYS,
     Mode,
     OperatorPolicy,
     ReviewOutcome,
     ReviewRequest,
+    Role,
     RunOverrides,
     Severity,
+    Usage,
     severity_at_least,
+    usage_key,
 )
 from morning_star_review.core.errors import MsreviewError
 from morning_star_review.core.naming import (
@@ -55,6 +61,9 @@ from morning_star_review.platform import (
     PlatformError,
 )
 
+if TYPE_CHECKING:
+    from morning_star_review.activities.fetch_pr import EarlySkip
+
 __all__ = [
     "EXIT_CANCELLED",
     "EXIT_FAILED",
@@ -69,7 +78,10 @@ __all__ = [
     "exit_code_for",
     "fail_on_triggered",
     "prepare_process_env",
+    "report_ci_usage_failure",
     "run_review",
+    "usage_from_run_dir",
+    "worker_registered",
 ]
 
 log = logging.getLogger(__name__)
@@ -150,6 +162,10 @@ class Timing:
     readiness_timeout_s: float = 90.0
     readiness_poll_s: float = 1.0
     live_heartbeat_s: float = 25.0  # a deployment heartbeat newer than this = live worker
+    # Readiness accepts a heartbeat this much older than our worker's start (the server's
+    # clock may run behind ours); later heartbeats (every 10 s) cover larger skews.
+    clock_skew_s: float = 5.0
+    precheck_timeout_s: float = 20.0  # the GitHub pre-check before any worker starts
     busy_wait_s: float = 30.0
     start_attempts: int = 3
     start_retry_s: float = 2.0
@@ -212,7 +228,9 @@ def _now() -> float:
 
 
 def _say(line: str) -> None:
-    print(line, file=sys.stderr, flush=True)
+    # After SIGHUP the terminal may be gone; a failed write must not stop the cleanup.
+    with contextlib.suppress(OSError, ValueError):
+        print(line, file=sys.stderr, flush=True)
 
 
 # ----------------------------------------------------------------------------- requests
@@ -241,16 +259,59 @@ def build_request(cfg: DriverConfig) -> tuple[ReviewRequest, PrRef]:
     return req, ref
 
 
-def _heartbeat_age(d: DeploymentState, now: datetime) -> float | None:
-    if d.last_heartbeat is None:
+def _aware(t: datetime | None) -> datetime | None:
+    if t is None:
         return None
-    hb = d.last_heartbeat if d.last_heartbeat.tzinfo else d.last_heartbeat.replace(tzinfo=UTC)
-    return (now - hb).total_seconds()
+    return t if t.tzinfo else t.replace(tzinfo=UTC)
+
+
+def _heartbeat_age(d: DeploymentState, now: datetime) -> float | None:
+    hb = _aware(d.last_heartbeat)
+    return None if hb is None else (now - hb).total_seconds()
+
+
+def _has_worker(d: DeploymentState | None) -> bool:
+    return d is not None and d.is_active and d.active_worker_count > 0
+
+
+def worker_registered(
+    d: DeploymentState | None,
+    *,
+    since: datetime,
+    before: DeploymentState | None,
+    skew_s: float,
+    before_known: bool = True,
+) -> bool:
+    """True when ``d`` shows that *our* worker registered (started at ``since``).
+
+    ``is_active`` and the worker count outlive a worker that just stopped (the server
+    expires them later), so they alone prove nothing. Either evidence counts:
+
+    - more active workers than ``before`` (the deployment just before our worker
+      started) had: a worker registered since, and no other driver's worker was live;
+    - a heartbeat newer than ``before``'s and no older than ``since`` minus the clock
+      skew allowed (the server's clock may run behind ours).
+
+    ``before_known=False`` (that read failed) leaves only the heartbeat rule.
+    """
+    if d is None or not _has_worker(d):
+        return False
+    if before_known:
+        had = before.active_worker_count if before is not None and _has_worker(before) else 0
+        if d.active_worker_count > had:
+            return True
+    hb = _aware(d.last_heartbeat)
+    if hb is None:
+        return False
+    old = _aware(before.last_heartbeat) if before is not None else None
+    if old is not None and hb <= old:
+        return False
+    return hb >= since - timedelta(seconds=skew_s)
 
 
 def is_live(d: DeploymentState | None, timing: Timing, now: datetime | None = None) -> bool:
     """A deployment with an active worker that heartbeated recently (another driver)."""
-    if d is None or not d.is_active or d.active_worker_count <= 0:
+    if d is None or not _has_worker(d):
         return False
     age = _heartbeat_age(d, now or datetime.now(UTC))
     return age is None or age < timing.live_heartbeat_s
@@ -285,8 +346,31 @@ async def choose_deployment(
     return deployment_name(mode, ref, suffix="x" + pysecrets.token_hex(2))
 
 
-async def sweep_orphans(platform: Platform, ref: PrRef, pr_url: str) -> list[str]:
-    """CI only: terminate RUNNING executions of earlier CI runs for this PR."""
+async def _served_by_live_worker(platform: Platform, eid: str, timing: Timing) -> bool:
+    """True when ``eid`` runs on a deployment whose worker heartbeats: another live run.
+
+    An unknown deployment (or a read error) counts as not live, so a true orphan is
+    still terminated.
+    """
+    try:
+        state = await platform.execution(eid)
+        if not state.deployment_name:
+            return False
+        return is_live(await platform.deployment(state.deployment_name), timing)
+    except PlatformError:
+        return False
+
+
+async def sweep_orphans(
+    platform: Platform, ref: PrRef, pr_url: str, timing: Timing | None = None
+) -> list[str]:
+    """CI only: terminate RUNNING executions of earlier CI runs for this PR.
+
+    Only orphans: an execution whose deployment still has a live worker belongs to a
+    run in progress (a workflow_dispatch review next to the pull_request one, say) and
+    is left alone (security review PL-5).
+    """
+    timing = timing or Timing()
     prefix = execution_id_prefix("ci", ref)
     terminated: list[str] = []
     try:
@@ -296,6 +380,9 @@ async def sweep_orphans(platform: Platform, ref: PrRef, pr_url: str) -> list[str
         return terminated
     for eid in running:
         if not eid.startswith(prefix):
+            continue
+        if await _served_by_live_worker(platform, eid, timing):
+            _say(f"msreview: execution {eid} has a live worker (another run); not terminated")
             continue
         try:
             await platform.terminate(eid)
@@ -335,6 +422,99 @@ def outcome_from_run_dir(run_dir: Path, eid: str) -> ReviewOutcome | None:
     return outcome if outcome.execution_id == eid else None
 
 
+# Agent job directories under the run dir hold the runner's ``meter.json``:
+# explore-<model>, format-<model>, verify and verify-format (activities/*).
+_JOB_DIR_PREFIXES = ("explore-", "format-", "verify")
+_PHASE_ROLES: dict[str, Role] = {"explore": "explorer", "verify": "verifier", "format": "formatter"}
+_METER_FILE = "meter.json"
+_METER_MAX_BYTES = 256 * 1024
+_METER_INTS = (
+    "llm_calls",
+    "tool_calls",
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+)
+
+
+def _non_negative(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return 0.0
+    number = float(value)
+    return number if math.isfinite(number) and number >= 0 else 0.0
+
+
+def _meter_usage(path: Path) -> tuple[str, Usage] | None:
+    """``(usage key, usage)`` from one agent job's ``meter.json``; None if unusable."""
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > _METER_MAX_BYTES:
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    role = _PHASE_ROLES.get(str(data.get("phase")))
+    model = data.get("model")
+    if role is None or not isinstance(model, str) or not model or len(model) > 100:
+        return None
+    counts = {k: data[k] for k in _METER_INTS if type(data.get(k)) is int and data[k] >= 0}
+    reasons = data.get("finish_reasons")
+    try:
+        usage = Usage(
+            model=model,
+            **counts,
+            cost_usd=round(_non_negative(data.get("cost_usd")), 6),
+            seconds=round(_non_negative(data.get("seconds")), 3),
+            finish_reasons=[str(r)[:20] for r in reasons][-200:]
+            if isinstance(reasons, list)
+            else [],
+        )
+    except ValueError:
+        return None
+    if usage.llm_calls == 0 and usage.cost_usd == 0:
+        return None
+    return usage_key(role, model), usage
+
+
+def usage_from_run_dir(run_dir: Path) -> dict[str, Usage]:
+    """Usage per ``role:model`` from the agent jobs' meters in ``run_dir``.
+
+    For runs that ended before ``finalize`` added up the usage (cancelled, terminated,
+    failed): the meters still count every model call that was made. Only our own job
+    directories are read (never the repository checkout).
+    """
+    out: dict[str, Usage] = {}
+    try:
+        jobs = sorted(p for p in run_dir.iterdir() if p.name.startswith(_JOB_DIR_PREFIXES))
+    except OSError:
+        return out
+    for job in jobs:
+        if job.is_symlink() or not job.is_dir():
+            continue
+        found = _meter_usage(job / _METER_FILE)
+        if found is None:
+            continue
+        key, usage = found
+        if key in out:
+            out[key] = out[key].plus(usage)
+        elif len(out) < MAX_USAGE_KEYS:
+            out[key] = usage
+    return out
+
+
+def with_metered_usage(outcome: ReviewOutcome, run_dir: Path) -> ReviewOutcome:
+    """``outcome`` with the meters' usage and cost when it reports none of its own."""
+    if outcome.usage:
+        return outcome
+    usage = usage_from_run_dir(run_dir)
+    if not usage:
+        return outcome
+    cost = round(sum(u.cost_usd for u in usage.values()), 6)
+    return outcome.model_copy(update={"usage": usage, "cost_usd": cost})
+
+
 # ----------------------------------------------------------------------------- the run
 
 
@@ -343,6 +523,7 @@ class RunFailed(MsreviewError):  # noqa: N818 - reads like the condition it repo
 
 
 WorkerFactory = Callable[[], Awaitable[None]]
+Precheck = Callable[[ReviewRequest, "DriverSecrets"], Awaitable["EarlySkip | None"]]
 
 
 @dataclass
@@ -357,6 +538,17 @@ class Hooks:
     local_runner: Callable[[ReviewRequest], Awaitable[Any]] | None = None
     # Point the real Workflows SDK config at the run (default: only with the real worker).
     configure_sdk: bool | None = None
+    # The GitHub skip pre-check before a worker starts (default: GitHub's REST API).
+    precheck: Precheck | None = None
+
+
+async def _default_precheck(req: ReviewRequest, secrets: DriverSecrets) -> EarlySkip | None:
+    from morning_star_review.activities.fetch_pr import early_skip
+    from morning_star_review.github.http import GitHubHttp
+
+    # The same credentials as fetch_pr's reads: the App token, else the read token.
+    async with GitHubHttp(secrets.github_token or secrets.read_token, timeout_s=10.0) as gh:
+        return await early_skip(req, gh, secrets.bot_login)
 
 
 async def _default_worker() -> None:
@@ -421,6 +613,10 @@ class _Run:
         self.stopping = False  # cleanup has begun; a signal must not interrupt it
         self.run_root = cfg.run_root or default_run_root(cfg.mode)
         self.ready_seconds: float | None = None
+        # The deployment as it was just before our worker started, and when it started.
+        self.before_worker: DeploymentState | None = None
+        self.before_known = False
+        self.worker_started_at: datetime | None = None
 
     @property
     def run_dir(self) -> Path:
@@ -506,10 +702,46 @@ class _Run:
             raise DriverError(f"cannot reach the Mistral Workflows API ({exc})") from None
         return who.namespace
 
+    async def early_skip(self) -> ReviewOutcome | None:
+        """The cheap GitHub checks of ``fetch_pr`` before any worker or execution exists.
+
+        A head that moved (superseded), a closed PR or a draft (without ``--force``), or
+        a head already reviewed completely with the same configuration ends the run
+        here with the skipped outcome ``fetch_pr`` would give. Any problem with the
+        check (network, rate limit, permissions) lets the run go on: ``fetch_pr``
+        decides again on the worker and reports real errors.
+        """
+        check = self.hooks.precheck or _default_precheck
+        try:
+            early = await asyncio.wait_for(
+                check(self.req, self.secrets), self.timing.precheck_timeout_s
+            )
+        except Exception as exc:  # TimeoutError included
+            detail = redact(f"{type(exc).__name__}: {exc}", self.secrets.values())[:300]
+            log.info("skip pre-check unavailable: %s", detail)
+            return None
+        if early is None:
+            return None
+        from morning_star_review.github.publish import SKIP_REASONS
+
+        _say(f"msreview: skip={early.skip} head={early.head_sha[:7]} (no worker started)")
+        return ReviewOutcome(
+            status="superseded" if early.skip == "superseded" else "skipped",
+            reason=SKIP_REASONS[early.skip],
+            verdict=early.prior_verdict,
+            pr_url=self.req.pr_url,
+            head_sha=early.head_sha[:64],
+            execution_id=self.eid,
+            notes=["Decided before starting a worker: no workflow execution was started."],
+        )
+
     async def run_on_worker(self) -> ReviewOutcome:
         from morning_star_review.core.runctx import set_run_context
 
         namespace = await self.preflight()
+        early = await self.early_skip()
+        if early is not None:
+            return early
         platform = self._platform()
         try:
             self.deployment = await choose_deployment(
@@ -522,7 +754,7 @@ class _Run:
             f"(workspace namespace {namespace[:8]})"
         )
         if self.cfg.mode == "ci":
-            await sweep_orphans(platform, self.ref, self.req.pr_url)
+            await sweep_orphans(platform, self.ref, self.req.pr_url, self.timing)
         set_run_context(self.context(on_worker=True))
         factory = self.hooks.worker
         configure = self.hooks.configure_sdk
@@ -533,8 +765,16 @@ class _Run:
         if factory is None:
             factory = _default_worker
         try:
+            self.before_known, self.before_worker = await self._deployment_now()
+            if self.before_known and is_live(self.before_worker, self.timing):
+                # Another run's worker registered after choose_deployment read the state.
+                self._move_to_fresh_deployment(configure)
+                self.before_known, self.before_worker = await self._deployment_now()
+            self.worker_started_at = datetime.now(UTC)
             self.worker = asyncio.create_task(self._guarded_worker(factory))
             await self._wait_ready()
+            if await self._shared_with_another_worker():
+                await self._restart_on_fresh_deployment(factory, configure)
             await self._start()
             state = await self._wait_done()
             return self._outcome_of(state)
@@ -544,6 +784,53 @@ class _Run:
             return self.fail(f"Workflows API error: {exc}")
         finally:
             await self.cleanup()
+
+    def _move_to_fresh_deployment(self, configure: bool) -> None:
+        """Switch to a ``-x<hex>`` deployment of our own (no worker of ours runs yet)."""
+        old = self._deployment_name()
+        self.deployment = deployment_name(
+            self.cfg.mode, self.ref, suffix="x" + pysecrets.token_hex(2)
+        )
+        _say(
+            f"msreview: another msreview worker joined deployment {old}; "
+            f"moving to {self.deployment}"
+        )
+        if configure:
+            _configure_workflows_sdk(self.deployment, self.secrets.mistral_api_key, local=False)
+
+    async def _shared_with_another_worker(self) -> bool:
+        """True when a worker other than ours registered on our deployment meanwhile.
+
+        Two runs for the same PR that start within seconds both pick the stable name
+        before either worker registers. Workers on one task queue get each other's
+        tasks, and every task handed to the wrong worker costs an attempt (security
+        review PL-1). The count is compared with the one read before our worker
+        started, so a stale count from an earlier, stopped worker does not matter.
+        """
+        if not self.before_known:
+            return False
+        try:
+            now = await self._platform().deployment(self._deployment_name())
+        except PlatformError:
+            return False
+        if now is None or not _has_worker(now):
+            return False
+        before = self.before_worker
+        had = before.active_worker_count if before is not None and _has_worker(before) else 0
+        return now.active_worker_count > had + 1
+
+    async def _restart_on_fresh_deployment(self, factory: WorkerFactory, configure: bool) -> None:
+        """Stop our worker, then start it again on a ``-x<hex>`` deployment of our own."""
+        worker, self.worker = self.worker, None
+        if worker is not None and not worker.done():
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
+                await asyncio.wait_for(worker, self.timing.worker_stop_timeout_s)
+        self._move_to_fresh_deployment(configure)
+        self.before_known, self.before_worker = await self._deployment_now()
+        self.worker_started_at = datetime.now(UTC)
+        self.worker = asyncio.create_task(self._guarded_worker(factory))
+        await self._wait_ready()
 
     async def _guarded_worker(self, factory: WorkerFactory) -> None:
         try:
@@ -568,11 +855,26 @@ class _Run:
             raise RunFailed("no deployment was chosen")
         return self.deployment
 
+    async def _deployment_now(self) -> tuple[bool, DeploymentState | None]:
+        """(read, state) of the deployment before our worker starts."""
+        try:
+            return True, await self._platform().deployment(self._deployment_name())
+        except PlatformError as exc:
+            if not exc.retryable:
+                raise
+            return False, None
+
     async def _wait_ready(self) -> None:
+        """Wait until our worker has registered: a heartbeat newer than its start.
+
+        A stale ``is_active`` from a worker that stopped moments ago does not count;
+        otherwise the start could be sent before our worker exists.
+        """
         name = self._deployment_name()
         platform = self._platform()
         limit = _now() + self.timing.readiness_timeout_s
         begun = _now()
+        since = self.worker_started_at or datetime.now(UTC)
         while True:
             if self.worker is not None and self.worker.done():
                 raise self._worker_failure()
@@ -582,7 +884,13 @@ class _Run:
                 if not exc.retryable:
                     raise
                 d = None
-            if d is not None and d.is_active and d.active_worker_count > 0:
+            if worker_registered(
+                d,
+                since=since,
+                before=self.before_worker,
+                skew_s=self.timing.clock_skew_s,
+                before_known=self.before_known,
+            ):
                 self.ready_seconds = _now() - begun
                 _say(f"msreview: worker ready in {self.ready_seconds:.1f}s")
                 return
@@ -637,13 +945,17 @@ class _Run:
             await self.hooks.sleep(min(self.timing.poll_s, max(0.0, self.remaining())))
 
     def _outcome_of(self, state: ExecutionState) -> ReviewOutcome:
-        if state.status == "COMPLETED":
-            try:
-                return ReviewOutcome.model_validate(state.result)
-            except ValueError:
-                found = outcome_from_run_dir(self.run_dir, self.eid)
-                return found or self.fail("the workflow returned an invalid result")
         found = outcome_from_run_dir(self.run_dir, self.eid)
+        if state.status == "COMPLETED":
+            # Only the outcome our own publish/report_failure activity wrote counts.
+            # The workflow's result is not sealed: a rogue worker on the (derivable)
+            # task queue could complete it with a forged "posted, clean" outcome
+            # (security review PL-3).
+            if found is None:
+                return self.fail(
+                    "the workflow completed, but this run's publish step left no outcome"
+                )
+            return found
         if found is not None and found.status == "failed":
             return found
         return self.fail(f"the workflow execution ended {state.status}")
@@ -679,7 +991,8 @@ class _Run:
 
 
 class _SignalGuard:
-    """Step 12: the first SIGTERM/SIGINT cancels the main task; later ones are ignored.
+    """Step 12: the first SIGTERM/SIGINT/SIGHUP/SIGQUIT cancels the main task; later ones
+    are ignored.
 
     Ignoring later signals keeps a second Ctrl-C (or Actions' SIGTERM after SIGINT) from
     interrupting the terminate call that the cancellation runs. A first signal that
@@ -696,7 +1009,9 @@ class _SignalGuard:
 
     def install(self, task: asyncio.Task[Any]) -> None:
         self._loop = asyncio.get_running_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
+        # SIGHUP (closed terminal, dropped SSH session) and SIGQUIT would otherwise end
+        # the process at once: no terminate, no worker stop, agents left running.
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
             try:
                 self._loop.add_signal_handler(sig, self._on_signal, sig, task)
             except (NotImplementedError, RuntimeError, ValueError):
@@ -727,19 +1042,103 @@ class _SignalGuard:
 # ----------------------------------------------------------------------------- entry
 
 
+# Set on an exception once report_ci_usage_failure has reported it.
+_CI_REPORTED = "_msreview_ci_reported"
+_CI_REASON_LIMIT = 500
+
+
+def report_ci_usage_failure(
+    error: BaseException | str,
+    *,
+    secrets: Sequence[str] = (),
+    stop_commands: Any = None,
+    pr_url: str = "",
+    env: Mapping[str, str] | None = None,
+) -> None:
+    """``msreview ci`` stops with exit 2 (usage or preflight): tell GitHub Actions why.
+
+    Writes ``status=failed`` (the other outputs empty) to ``$GITHUB_OUTPUT``, a short
+    step summary, and ``::error title=Morning Star Code Review::<reason>`` with the
+    reason redacted. An exception is reported once (``run_review`` reports its own
+    ``DriverError``; the CLI may pass the same one again). Best effort: a problem
+    writing these is printed and never changes the exit code.
+    """
+    from morning_star_review import outputs
+    from morning_star_review.core.redact import secret_env_values
+
+    if isinstance(error, BaseException):
+        if getattr(error, _CI_REPORTED, False):
+            return
+        with contextlib.suppress(AttributeError, TypeError):
+            setattr(error, _CI_REPORTED, True)
+    src = os.environ if env is None else env
+    known = [*secrets, *secret_env_values(src)]
+    reason = redact(str(error).strip() or "the review could not start", known)
+    reason = " ".join(reason.split())[:_CI_REASON_LIMIT]
+    try:
+        out = src.get("GITHUB_OUTPUT", "")
+        if out:
+            outputs.write_github_output(
+                out,
+                {
+                    "status": "failed",
+                    "verdict": "",
+                    "findings": "0",
+                    "execution-id": "",
+                    "report-path": "",
+                    "deployment": "",
+                },
+            )
+        summary = src.get("GITHUB_STEP_SUMMARY", "")
+        if summary:
+            lines = [
+                "### Morning Star Code Review",
+                "",
+                "Status: **failed** (the review did not start)",
+                "",
+                reason,
+                "",
+            ]
+            if pr_url:
+                lines += [f"Pull request: {redact(pr_url, known)[:300]}", ""]
+            outputs.write_step_summary(summary, "\n".join(lines))
+    except OSError as exc:
+        _say(f"msreview: could not write the Actions outputs ({type(exc).__name__})")
+    if isinstance(stop_commands, outputs.StopCommands):
+        stop_commands.resume()  # an annotation is ignored while commands are stopped
+    title = "Morning Star Code Review"
+    print(f"::error title={title}::{outputs.escape_command(reason)}", flush=True)
+
+
 async def run_review(
     cfg: DriverConfig, secrets: DriverSecrets, hooks: Hooks | None = None
 ) -> tuple[ReviewOutcome, int]:
     """Run one review and return ``(outcome, exit code)`` (DESIGN 11).
 
     Raises ``DriverError`` for usage, configuration and preflight problems (exit 2);
-    every other problem becomes a ``failed`` outcome. Reports and CI outputs are written
-    before returning.
+    in ci mode it reports them to GitHub Actions first (``report_ci_usage_failure``).
+    Every other problem becomes a ``failed`` outcome. Reports and CI outputs are
+    written before returning.
     """
+    try:
+        return await _run_review(cfg, secrets, hooks or Hooks())
+    except DriverError as exc:
+        if cfg.mode == "ci":
+            report_ci_usage_failure(
+                exc,
+                secrets=secrets.values(),
+                stop_commands=cfg.stop_commands,
+                pr_url=cfg.pr_url,
+            )
+        raise
+
+
+async def _run_review(
+    cfg: DriverConfig, secrets: DriverSecrets, hooks: Hooks
+) -> tuple[ReviewOutcome, int]:
     from morning_star_review import outputs
     from morning_star_review.core.runctx import clear_run_context
 
-    hooks = hooks or Hooks()
     if cfg.fail_on not in FAIL_ON_VALUES:
         raise DriverError(f"fail-on must be one of {', '.join(FAIL_ON_VALUES)}")
     if not secrets.mistral_api_key:
@@ -768,6 +1167,9 @@ async def run_review(
             name = signal.Signals(guard.received).name
             outcome = run.fail(f"cancelled by {name}")
             code = EXIT_CANCELLED
+        # A run that ended before finalize (cancelled, terminated, failed) still spent
+        # what its agents' meters recorded; report that instead of "usage: none".
+        outcome = with_metered_usage(outcome, run.run_dir)
         try:
             outputs.emit(cfg, outcome, run.run_dir, deployment=run.deployment)
         except Exception as exc:  # reporting problems never change the review result

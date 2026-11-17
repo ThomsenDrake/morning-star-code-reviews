@@ -100,7 +100,7 @@ inputs:
     required: false
     default: never
   deadline-minutes:
-    description: Driver deadline; keep it below the job's timeout-minutes.
+    description: Driver deadline (at most 55; the App token expires after 60 minutes); keep it below the job's timeout-minutes.
     required: false
     default: "40"
   telemetry:

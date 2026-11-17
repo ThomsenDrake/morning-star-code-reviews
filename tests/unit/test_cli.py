@@ -68,6 +68,15 @@ def test_policy_switches() -> None:
     assert (pol.labels, pol.suggestions, pol.allowed_models) == (False, False, ["zai-glm-5-3"])
 
 
+def test_policy_carries_the_operator_default_preset() -> None:
+    ov = cli.build_overrides()
+    pol = cli.build_policy(trust_repo_config=True, overrides=ov, default_preset="fast")
+    assert pol.default_preset == "fast" and ov.preset is None
+    assert cli.build_policy(trust_repo_config=True, overrides=ov).default_preset is None
+    with pytest.raises(cli.UsageError, match=r"defaults\.preset"):
+        cli.build_policy(trust_repo_config=True, overrides=ov, default_preset="cheapest")
+
+
 def ci_env(tmp_path: Path, **kw: str) -> dict[str, str]:
     agent = tmp_path / "agent-python"
     agent.write_text("#!/bin/sh\n")
@@ -219,10 +228,41 @@ def test_cmd_ci_removes_the_label_when_the_run_fails(
     assert removed == ["msreview: safe-to-review"]
 
 
-def test_cmd_ci_usage_error_exit_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    for name, value in ci_env(tmp_path, MSREVIEW_PR_URL="").items():
+def test_cmd_ci_usage_error_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    output, summary = tmp_path / "gh-output", tmp_path / "gh-summary"
+    env = ci_env(
+        tmp_path,
+        MSREVIEW_PR_URL="",
+        GITHUB_OUTPUT=str(output),
+        GITHUB_STEP_SUMMARY=str(summary),
+    )
+    for name, value in env.items():
         monkeypatch.setenv(name, value)
     assert cli.main(["ci"]) == 2
+    # A usage error before the run still tells Actions why, once.
+    assert "status=failed" in output.read_text(encoding="utf-8")
+    assert "MSREVIEW_PR_URL is empty" in summary.read_text(encoding="utf-8")
+    assert capsys.readouterr().out.count("::error title=Morning Star Code Review::") == 1
+
+
+def test_cmd_ci_reports_a_driver_error_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def failing_run(cfg: driver.DriverConfig, sec: driver.DriverSecrets) -> Any:
+        exc = driver.DriverError("preflight refused")
+        driver.report_ci_usage_failure(exc, stop_commands=cfg.stop_commands, env={})
+        raise exc
+
+    async def fake_remove(token: str, pr_url: str, name: str) -> str:
+        return "removed"
+
+    monkeypatch.setattr(driver, "run_review", failing_run)
+    monkeypatch.setattr(cli, "remove_pr_label", fake_remove)
+    with pytest.raises(driver.DriverError):
+        cli.cmd_ci(ci_env(tmp_path))
+    assert capsys.readouterr().out.count("::error title=Morning Star Code Review::") == 1
 
 
 def test_cmd_review_json_stdout(
@@ -283,3 +323,86 @@ def test_cmd_review_post_never_skips_minting(
     assert captured["cfg"].mode == "local"
     assert captured["sec"].github_token is None and captured["sec"].read_token is None
     assert "report" in capfd.readouterr().out
+
+
+def _review_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: str) -> None:
+    agent = tmp_path / "py"
+    agent.write_text("")
+    conf = tmp_path / "config.toml"
+    conf.write_text(config)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MSREVIEW_CONFIG", str(conf))
+    monkeypatch.setenv("MISTRAL_API_KEY", KEY)
+    monkeypatch.delenv("MSREVIEW_MISTRAL_API_KEY_COMMAND", raising=False)
+    monkeypatch.setenv("MSREVIEW_AGENT_PYTHON", str(agent))
+
+
+@pytest.mark.parametrize(
+    ("flags", "explicit"),
+    [([], None), (["--preset", "balanced"], "balanced")],
+)
+def test_cmd_review_user_config_preset_is_an_operator_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    flags: list[str],
+    explicit: str | None,
+) -> None:
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(driver, "run_review", _fake_run_review(captured, "report"))
+    _review_env(tmp_path, monkeypatch, '[defaults]\npreset = "fast"\n')
+    argv = ["review", PR, "--post", "never", "--read-token", "none", "--trust-repo-config"]
+    assert cli.main([*argv, *flags]) == 0
+    cfg = captured["cfg"]
+    # The config file's preset is a default below a trusted repository file; only
+    # --preset is an explicit run preset (which replaces the repository's model settings).
+    assert cfg.overrides.preset == explicit
+    assert cfg.policy.default_preset == "fast"
+    assert cfg.policy.trust_repo_config_models is True
+    capfd.readouterr()
+
+
+def test_cmd_review_rejects_an_unknown_user_config_preset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(driver, "run_review", _fake_run_review({}, "report"))
+    _review_env(tmp_path, monkeypatch, '[defaults]\npreset = "cheapest"\n')
+    assert cli.main(["review", PR, "--post", "never", "--read-token", "none"]) == 2
+    assert "defaults.preset" in capfd.readouterr().err
+
+
+def test_cmd_review_refuses_a_symlinked_report_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    # Security review SEC-CI-3: a PR checkout can ship ./msreview-reports as a link.
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (tmp_path / "msreview-reports").symlink_to(target)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(driver, "run_review", _fake_run_review({}))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    code = cli.main(["review", "octo-org/widgets#7", "--post", "never"])
+    assert code != 0
+    assert "symbolic link" in capfd.readouterr().err
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.parametrize("minutes", ["56", "90", "-5"])
+def test_ci_deadline_stays_within_the_app_token_lifetime(tmp_path: Path, minutes: str) -> None:
+    # Security review SEC-CI-7: the installation token is minted once and lasts 60 minutes.
+    with pytest.raises(cli.UsageError, match="between 1 and 55"):
+        cli._ci_settings(ci_env(tmp_path, MSREVIEW_DEADLINE_MINUTES=minutes))
+    assert cli._ci_settings(ci_env(tmp_path, MSREVIEW_DEADLINE_MINUTES="55"))["deadline_s"] == 3300
+
+
+def test_cli_deadline_stays_within_the_app_token_lifetime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(driver, "run_review", _fake_run_review({}))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MISTRAL_API_KEY", KEY)
+    agent = tmp_path / "py"
+    agent.write_text("")
+    monkeypatch.setenv("MSREVIEW_AGENT_PYTHON", str(agent))
+    code = cli.main(["review", "octo-org/widgets#7", "--deadline-minutes", "90"])
+    assert code != 0 and "between 1 and 55" in capfd.readouterr().err

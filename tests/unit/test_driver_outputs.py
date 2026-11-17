@@ -166,3 +166,21 @@ def test_github_output_values_are_single_line(tmp_path: Path) -> None:
     path = tmp_path / "o"
     outputs.write_github_output(str(path), {"status": "a\nb=c"})
     assert path.read_text() == "status=a b=c\n"
+
+
+def test_symlinks_in_the_report_dir_are_replaced_not_followed(tmp_path: Path) -> None:
+    # Security review SEC-CI-3: a PR checkout ships msreview-reports/report.md -> ~/.bashrc.
+    victim = tmp_path / "victim.rc"
+    victim.write_text("export SAFE=1\n")
+    out = tmp_path / "prcheckout" / "msreview-reports"
+    out.mkdir(parents=True)
+    for name in outputs.REPORT_FILES:
+        (out / name).symlink_to(victim)
+    run_dir = tmp_path / "run"
+    (run_dir / "report").mkdir(parents=True)
+    (run_dir / "report" / "report.md").write_text('x = "$(touch pwned)"\n')
+    outputs.copy_reports(run_dir, out, outcome())
+    assert victim.read_text() == "export SAFE=1\n"
+    for name in outputs.REPORT_FILES:
+        assert not (out / name).is_symlink()
+    assert (out / "report.md").read_text() == 'x = "$(touch pwned)"\n'

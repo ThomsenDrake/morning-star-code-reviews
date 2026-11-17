@@ -299,3 +299,46 @@ async def test_mint_via_child_requires_a_token_unless_checking(tmp_path: Path) -
     assert (await mc.mint_via_child("o/r", python=str(shim), env=env)).status == "error"
     checked = await mc.mint_via_child("o/r", python=str(shim), env=env, check_only=True)
     assert checked.status == "ok" and checked.slug == "s"
+
+
+async def test_mint_child_ignores_modules_in_the_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Security review SEC-CI-2: `msreview app-check` run inside a cloned repository.
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    marker = tmp_path / "PWNED"
+    for module in ("json.py", "argparse.py", "tomllib.py"):
+        (checkout / module).write_text(f"open({str(marker)!r}, 'a').write('{module}\\n')\n")
+    pkg = checkout / "morning_star_review"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(f"open({str(marker)!r}, 'a').write('pkg\\n')\n")
+    monkeypatch.chdir(checkout)
+    env = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": str(tmp_path),
+        "BWS_ACCESS_TOKEN": "fake-machine-token",
+        "PYTHONPATH": str(checkout),  # ignored in isolated mode as well
+    }
+    result = await mc.mint_via_child("octo-org/widgets", env=env, timeout_s=60, check_only=True)
+    assert result.status == "no_credentials"
+    assert not marker.exists()
+
+
+async def test_mint_child_reads_app_settings_from_msreview_config(tmp_path: Path) -> None:
+    # Security review SEC-CI-8: the same config file as the driver.
+    custom = tmp_path / "custom.toml"
+    custom.write_text('[app]\nclient_id = "Iv1.custom"\nprivate_key_command = "exit 3"\n')
+    home = tmp_path / "home"
+    home.mkdir()
+    assert mc.default_config_path({"MSREVIEW_CONFIG": str(custom), "HOME": str(home)}) == custom
+    assert mc.child_env("mint", source={"MSREVIEW_CONFIG": str(custom)})["MSREVIEW_CONFIG"] == str(
+        custom
+    )
+    env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(home)}
+    without = await mc.mint_via_child("o/r", env=env, timeout_s=60, check_only=True)
+    assert without.status == "no_credentials"
+    env["MSREVIEW_CONFIG"] = str(custom)
+    used = await mc.mint_via_child("o/r", env=env, timeout_s=60, check_only=True)
+    assert used.status != "no_credentials"  # the key command from custom.toml ran (and failed)
+    assert "exit code 3" in (used.reason or "")

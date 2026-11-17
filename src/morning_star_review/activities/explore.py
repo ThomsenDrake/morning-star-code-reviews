@@ -92,7 +92,8 @@ def explore_job(
     link_diffs(run_dir, job_dir, refs)
     budgets = agent_budgets(
         b,
-        max_tool_calls=tool_call_limit(role.model, b.max_tool_calls),
+        # Explorers only: the preset's explorer budget replaces the per-model default.
+        max_tool_calls=tool_call_limit(role.model, b.max_tool_calls, preset=snap.config.preset),
         seconds=b.explorer_minutes * 60,
         max_cost_usd=cost_share(prep.roles, b.max_cost_usd, "explorer"),
     )

@@ -240,3 +240,25 @@ def test_incremental_scope_table_counts_lines_since_prior_head(h) -> None:
     text = render_prompt(snap, inc_plan, scope, [], cfg, BOUNDARY, cfg.budgets)
     assert "a.py | modified | +2 -1 | inline" in text
     assert "+40 -9" not in text
+
+
+def test_long_excluded_paths_have_a_character_budget(h) -> None:
+    # Security review PL-6: 2000 binary files with ~610-char paths.
+    cfg = h.make_cfg()
+    files, patches = _synthetic(3, 4)
+    for k in range(2000):
+        path = "/".join(["d" * 200] * 3) + f"/blob_{k}.png"
+        files.append(
+            PrFile(
+                path=path, status="added", additions=0, deletions=0, has_patch=False, binary=True
+            )
+        )
+    snap = h.make_snapshot(files, cfg)
+    plan = prepass.plan(files, patches, cfg)
+    assert len(plan.excluded) == 2000
+    scope = ScopeDecision("full", None, plan.reviewable, "")
+    text = render_prompt(snap, plan, scope, [], cfg, BOUNDARY, cfg.budgets)
+    block = text[text.index("excluded from review by default") : text.index("</review_scope>")]
+    assert len(block) < 9_000
+    assert "more excluded files" in block
+    assert all(len(row) < 260 for row in block.splitlines())

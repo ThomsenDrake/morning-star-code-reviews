@@ -18,7 +18,7 @@ from functools import partial
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from morning_star_review.core.errors import MsreviewGitError
+from morning_star_review.core.errors import MsreviewGitError, MsreviewTooLarge
 from morning_star_review.core.proc import git_auth_env, run_git, run_git_bytes
 
 __all__ = [
@@ -32,6 +32,8 @@ __all__ = [
 ]
 
 FETCH_TIMEOUT = 600.0
+MAX_TREE_ENTRIES = 1_000_000  # files in the head tree
+MAX_TREE_BYTES = 4 * 2**30  # their total size: what the checkout writes to disk
 LOCAL_TIMEOUT = 60.0
 HEARTBEAT_EVERY = 15.0
 _FIRST_LINES_BYTES = 1024
@@ -123,6 +125,27 @@ def _checkout_head(repo_dir: str, head: str) -> None:
     )
 
 
+# Written to .git/info/attributes, which takes precedence over every .gitattributes
+# file in the tree. The PR head's .gitattributes must not change what is reviewed:
+# "auth.py -diff" would make the local diff and `git grep -I` treat a text file as
+# binary (excluded, unsearchable), and "working-tree-encoding=UTF-16LE" would check
+# out files the agent's tools then refuse to read. "!attr" means unspecified: git
+# decides binary-ness from the content and converts nothing.
+NEUTRAL_ATTRIBUTES = (
+    "* !diff !text !eol !working-tree-encoding !filter !ident !merge"
+    " !whitespace !conflict-marker-size !export-subst !export-ignore\n"
+)
+
+
+def _neutralise_attributes(repo_dir: str) -> None:
+    info = Path(repo_dir) / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    target = info / "attributes"
+    if target.is_symlink():
+        target.unlink()
+    target.write_text(NEUTRAL_ATTRIBUTES, encoding="utf-8")
+
+
 def _prepare_dir(repo_dir: str) -> None:
     path = Path(repo_dir)
     if path.exists() and not path.is_dir():
@@ -132,6 +155,7 @@ def _prepare_dir(repo_dir: str) -> None:
     path.mkdir(parents=True, exist_ok=True)
     # --template= : no sample hooks or other template files are copied in.
     run_git(None, ["init", "-q", "--template=", str(path)], timeout=LOCAL_TIMEOUT, check=True)
+    _neutralise_attributes(repo_dir)
 
 
 def _verify(spec: CheckoutSpec, token: str | None) -> None:
@@ -146,6 +170,39 @@ def _verify(spec: CheckoutSpec, token: str | None) -> None:
         text = f.read_text(encoding="utf-8", errors="replace")
         if _CONFIG_LEAKS.search(text) or (token and token in text):
             raise MsreviewGitError(f".git/{name} holds credentials or a remote after checkout")
+
+
+def tree_size(repo_dir: str, sha: str) -> tuple[int, int]:
+    """(entries, total blob bytes) of the tree at commit ``sha``."""
+    res = run_git_bytes(
+        repo_dir, ["ls-tree", "-r", "-l", "-z", _check_sha(sha)], timeout=FETCH_TIMEOUT, check=True
+    )
+    entries = 0
+    total = 0
+    for record in res.stdout.split(b"\0"):
+        if not record:
+            continue
+        entries += 1
+        meta = record.split(b"\t", 1)[0].split()
+        if len(meta) == 4 and meta[3].isdigit():
+            total += int(meta[3])
+    return entries, total
+
+
+def _check_tree_size(repo_dir: str, head: str) -> None:
+    """Refuse a head tree whose checkout would be enormous.
+
+    Many tree entries can point to one large, well-compressed blob: a pack of a few
+    kilobytes then writes gigabytes to the disk of the CLI user or the runner
+    (security review GIT-2). The sizes come from the tree itself, before checkout.
+    """
+    entries, total = tree_size(repo_dir, head)
+    if entries > MAX_TREE_ENTRIES or total > MAX_TREE_BYTES:
+        raise MsreviewTooLarge(
+            f"the head commit's tree is too large to check out ({entries} files, "
+            f"{total / 2**30:.1f} GiB; limits {MAX_TREE_ENTRIES} files, "
+            f"{MAX_TREE_BYTES / 2**30:.0f} GiB)"
+        )
 
 
 def has_commit(repo_dir: str, sha: str) -> bool:
@@ -183,6 +240,7 @@ def checkout(spec: CheckoutSpec, auth: GitAuth | None, heartbeat: Callable[[], N
         except MsreviewGitError:
             continue  # the caller checks has_commit() and falls back to a full review
     heartbeat()
+    _check_tree_size(spec.repo_dir, head)
     # Writing a large working tree can outlast the activity's heartbeat timeout too.
     _with_heartbeat(partial(_checkout_head, spec.repo_dir, head), heartbeat)
     _verify(spec, auth.token if auth is not None else None)

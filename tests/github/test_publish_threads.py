@@ -106,8 +106,17 @@ async def test_refused_resolve_replies_and_minimizes_once(fake: FakeGitHub, tmp_
     assert st.reply_ids_in(replies[0]["body"]) == [FID]
     assert fake.minimized == {comment["node_id"]}
     assert thread not in fake.resolved
-    mutations = [p for _, p in fake.mutations]
-    assert len(mutations) == 2  # one resolve attempt, one minimize
+    # One reply (inside the run's review), one resolve attempt, one minimize.
+    assert fake.mutation_names == [
+        "addPullRequestReviewThreadReply",
+        "resolveReviewThread",
+        "minimizeComment",
+    ]
+    # The reply went into one submitted review; no REST reply (a review of its own).
+    assert fake.posted("POST", "/replies") == []
+    [review] = fake.reviews
+    assert review["state"] == "COMMENTED" and review["user"]["login"] == BOT
+    assert fake.posted("POST", f"/reviews/{review['id']}/events") == [{"event": "COMMENT"}]
 
     state = st.decode_state(summary_comment(fake)["body"])
     assert state is not None

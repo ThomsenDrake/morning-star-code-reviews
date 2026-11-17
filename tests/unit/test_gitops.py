@@ -215,3 +215,72 @@ def test_slow_git_steps_keep_heartbeating(remote, tmp_path, monkeypatch) -> None
     monkeypatch.setattr(gitops, "_checkout_head", failing)
     with pytest.raises(MsreviewGitError, match="checkout failed"):
         checkout(_spec(remote, tmp_path / "repo2"), None, lambda: None)
+
+
+def test_in_tree_gitattributes_are_neutralised(tmp_path: Path) -> None:
+    # Security review GIT-1: the PR head's .gitattributes must not hide a text file
+    # from the local diff and git grep, nor re-encode files on checkout.
+    from morning_star_review.diff.patch import local_patches
+
+    src = tmp_path / "src"
+    src.mkdir()
+    git(src, "init", "-q", "-b", "main")
+    # Commit the hostile .gitattributes without applying it in the source repo.
+    (src / ".git" / "info").mkdir(exist_ok=True)
+    (src / ".git" / "info" / "attributes").write_text("* !working-tree-encoding !diff\n")
+    _write(src, {"auth.py": "def check(user):\n    return user.ok\n"})
+    git(src, "add", "-A")
+    git(src, "commit", "-q", "-m", "base")
+    base = git(src, "rev-parse", "HEAD")
+    _write(
+        src,
+        {
+            "auth.py": "def check(user):\n    return True\n",
+            "util.py": "def helper():\n    return 'needle'\n",
+            ".gitattributes": "auth.py -diff\n[attr]hide -diff\nutil.py hide\n"
+            "*.py working-tree-encoding=UTF-16LE\n",
+        },
+    )
+    git(src, "add", "-A")
+    git(src, "commit", "-q", "-m", "head")
+    head = git(src, "rev-parse", "HEAD")
+    repo = tmp_path / "co"
+    spec = CheckoutSpec(
+        repo_dir=str(repo), clone_url=src.as_uri(), shas=[head, base], head_sha=head
+    )
+    checkout(spec, None, lambda: None)
+    assert (repo / "auth.py").read_bytes() == b"def check(user):\n    return True\n"
+    patch = local_patches(str(repo), base, head, ["auth.py"])["auth.py"]
+    assert not patch.binary and patch.hunks
+    from morning_star_review.core.proc import run_git
+
+    grep = run_git(repo, ["grep", "-n", "-I", "-e", "needle", head], timeout=30)
+    assert "util.py" in grep.stdout
+
+
+def test_a_tree_bomb_is_refused_before_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Security review GIT-2: many entries for one well-compressed blob.
+    import morning_star_review.gitops as gitops
+    from morning_star_review.core.errors import MsreviewTooLarge
+
+    src = tmp_path / "src"
+    src.mkdir()
+    git(src, "init", "-q", "-b", "main")
+    blob = "0" * 1_000_000
+    _write(src, {f"bomb/f{i}.txt": blob for i in range(20)})
+    git(src, "add", "-A")
+    git(src, "commit", "-q", "-m", "bomb")
+    head = git(src, "rev-parse", "HEAD")
+    repo = tmp_path / "co"
+    spec = CheckoutSpec(repo_dir=str(repo), clone_url=src.as_uri(), shas=[head], head_sha=head)
+    assert gitops.tree_size(str(src), head) == (20, 20_000_000)
+    monkeypatch.setattr(gitops, "MAX_TREE_BYTES", 10_000_000)
+    with pytest.raises(MsreviewTooLarge, match="too large to check out"):
+        checkout(spec, None, lambda: None)
+    assert not (repo / "bomb").exists()
+    monkeypatch.setattr(gitops, "MAX_TREE_BYTES", 100_000_000)
+    monkeypatch.setattr(gitops, "MAX_TREE_ENTRIES", 10)
+    with pytest.raises(MsreviewTooLarge):
+        checkout(spec, None, lambda: None)

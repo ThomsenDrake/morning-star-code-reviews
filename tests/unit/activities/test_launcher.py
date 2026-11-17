@@ -254,3 +254,49 @@ async def test_heartbeats_carry_meter_counts(
     await run_agent("explore", job, _ctx(tmp_path, agent), 30)
     assert beats
     assert beats[0] == {"phase": "explore", "llm_calls": 4, "tool_calls": 7, "cost": 0.1235}
+
+
+def test_agent_env_forwards_the_runner_tracking_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Security review PL-4: the Actions orphan-process cleanup finds processes by it.
+    monkeypatch.setenv("RUNNER_TRACKING_ID", "github_0123")
+    assert launcher.agent_env(_ctx(tmp_path, tmp_path), str(tmp_path))["RUNNER_TRACKING_ID"] == (
+        "github_0123"
+    )
+    monkeypatch.delenv("RUNNER_TRACKING_ID")
+    assert "RUNNER_TRACKING_ID" not in launcher.agent_env(_ctx(tmp_path, tmp_path), str(tmp_path))
+
+
+def test_agent_exits_when_its_launcher_dies(tmp_path: Path) -> None:
+    # Security review PL-4: a driver killed without cleanup (SIGHUP, kill -9) must not
+    # leave the agent (in its own session) calling models for nobody.
+    import subprocess
+
+    pid_file = tmp_path / "agent.pid"
+    agent = (
+        "import os, time\n"
+        "from morning_star_review.agent.__main__ import _exit_when_orphaned\n"
+        "_exit_when_orphaned(0.1)\n"
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        "time.sleep(60)\n"
+    )
+    launcher_code = (
+        "import os, subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {agent!r}], start_new_session=True)\n"
+        "for _ in range(400):\n"
+        f"    if os.path.exists({str(pid_file)!r}):\n"
+        "        break\n"
+        "    time.sleep(0.05)\n"
+    )
+    subprocess.run([sys.executable, "-c", launcher_code], timeout=60, check=True)
+    pid = int(pid_file.read_text())
+    for _ in range(100):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(pid, 9)
+        pytest.fail("the agent outlived its launcher")

@@ -169,7 +169,8 @@ def test_run_git_returns_text_and_bytes(repo: Path) -> None:
     assert res.returncode == 0 and res.stdout.strip() == "first"
     raw = run_git_bytes(repo, ["show", "HEAD:a.txt"], timeout=30)
     assert raw.stdout == b"hello\n"
-    assert raw.args[0] == "git" and "core.hooksPath=" + os.devnull in raw.args
+    assert Path(raw.args[0]).name == "git" and Path(raw.args[0]).is_absolute()
+    assert "core.hooksPath=" + os.devnull in raw.args
 
 
 def test_run_git_disables_hooks(repo: Path) -> None:
@@ -282,3 +283,49 @@ def test_secret_command_timeout_kills_children(tmp_path: Path) -> None:
 def test_secret_command_missing_program() -> None:
     with pytest.raises(MsreviewSecretCommandError, match="exit code 127"):
         run_secret_command("definitely-not-a-real-program-msreview")
+
+
+# --------------------------------------------------------------------------------------
+# git is never found through a relative PATH entry (security review SEC-CI-1)
+# --------------------------------------------------------------------------------------
+
+
+def _plant_git(repo: Path, marker: Path) -> None:
+    for sub in ("bin", "."):
+        fake = repo / sub / "git"
+        fake.parent.mkdir(parents=True, exist_ok=True)
+        fake.write_text(f'#!/bin/sh\necho "HIJACKED $GIT_CONFIG_VALUE_0" > {marker}\nexit 0\n')
+        fake.chmod(0o755)
+
+
+@pytest.mark.parametrize("prefix", ["./bin:", "bin:", ":", ".:"])
+def test_git_in_the_checkout_never_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefix: str
+) -> None:
+    repo = tmp_path / "repo"
+    run_git(None, ["init", "-q", str(repo)], timeout=30, check=True)
+    marker = tmp_path / "PWNED"
+    _plant_git(repo, marker)
+    monkeypatch.setenv("PATH", prefix + os.environ.get("PATH", "/usr/bin:/bin"))
+    res = run_git(
+        repo,
+        ["rev-parse", "--verify", "--quiet", "0" * 40 + "^{commit}"],
+        env_extra=git_auth_env("ghs_" + "f" * 36),
+        timeout=30,
+    )
+    assert res.returncode != 0  # the real git: no such commit
+    assert not marker.exists()
+    assert Path(res.args[0]).is_absolute() and res.args[0] != str(repo / "bin" / "git")
+
+
+def test_child_envs_keep_only_absolute_path_entries() -> None:
+    src = {"PATH": "./bin::/usr/bin:node_modules/.bin:/bin:"}
+    for base in ("git", "agent", "mint"):
+        assert child_env(base, source=src)["PATH"] == "/usr/bin:/bin"  # type: ignore[arg-type]
+    assert child_env("git", source={"PATH": "./bin:."})["PATH"] == proc._DEFAULT_PATH
+
+
+def test_missing_git_is_a_git_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(MsreviewGitError, match="not on PATH"):
+        run_git(None, ["--version"], timeout=30)

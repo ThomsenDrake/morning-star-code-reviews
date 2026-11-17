@@ -43,6 +43,8 @@ class FakeGitHub:
     issue_comments: list[dict[str, Any]] = field(default_factory=list)
     review_comments: list[dict[str, Any]] = field(default_factory=list)
     reviews: list[dict[str, Any]] = field(default_factory=list)
+    # Comments of PENDING reviews by review id; visible only once the review is submitted.
+    pending: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
     repo_labels: dict[str, dict[str, Any]] = field(default_factory=dict)
     pr_labels: list[str] = field(default_factory=list)
     collaborators: dict[str, str] = field(default_factory=dict)  # login -> role_name
@@ -75,6 +77,16 @@ class FakeGitHub:
     @property
     def mutations(self) -> list[tuple[str, str]]:
         return [(m, p) for m, p in self.requests if p.startswith("/graphql:mutation")]
+
+    @property
+    def mutation_names(self) -> list[str]:
+        """The GraphQL mutations sent, by field name (``resolveReviewThread``, ...)."""
+        names: list[str] = []
+        for _, label, body in self.bodies:
+            if label == "/graphql:mutation":
+                found = re.search(r"\{\s*(\w+)\s*\(", str((body or {}).get("query", "")))
+                names.append(found.group(1) if found else "?")
+        return names
 
     def _id(self) -> int:
         self.next_id += 1
@@ -234,12 +246,42 @@ class FakeGitHub:
             parent = next((c for c in self.review_comments if c["id"] == int(rm.group(1))), None)
             if parent is None:
                 return httpx.Response(404, json={"message": "Not Found"})
+            # Like GitHub: a REST reply is a submitted review of its own.
+            rid = self._id()
+            self.reviews.append(
+                {
+                    "id": rid,
+                    "node_id": f"PRR_{rid}",
+                    "state": "COMMENTED",
+                    "body": "",
+                    "html_url": f"https://github.com/{self.owner}/{self.repo}/pull/{self.number}#pullrequestreview-{rid}",
+                    "user": {"login": BOT, "type": "Bot"},
+                }
+            )
             reply = self.add_review_comment(
                 parent["path"], parent["line"], body["body"], in_reply_to=parent["id"]
             )
             return httpx.Response(201, json=reply)
-        if sub == f"/pulls/{n}/reviews" and m == "POST":
-            return self._post_review(body)
+        if sub == f"/pulls/{n}/reviews":
+            if m == "POST":
+                return self._post_review(body)
+            if m == "GET":
+                return self._page(request, self.reviews)
+        sm = re.fullmatch(rf"/pulls/{n}/reviews/(\d+)/events", sub)
+        if sm and m == "POST":
+            return self._submit_review(int(sm.group(1)), body or {})
+        dm = re.fullmatch(rf"/pulls/{n}/reviews/(\d+)", sub)
+        if dm and m == "DELETE":
+            review = self._review(int(dm.group(1)))
+            if review is None:
+                return httpx.Response(404, json={"message": "Not Found"})
+            if review["state"] != "PENDING":
+                return httpx.Response(
+                    422, json={"message": "Can not delete a non-pending pull request review"}
+                )
+            self.reviews.remove(review)
+            self.pending.pop(review["id"], None)
+            return httpx.Response(200, json=review)
         if sub == f"/issues/{n}/labels":
             if m == "GET":
                 return self._page(request, [{"name": x} for x in self.pr_labels])
@@ -281,14 +323,35 @@ class FakeGitHub:
             return httpx.Response(200, json={"permission": legacy, "role_name": role})
         return httpx.Response(404, json={"message": f"fake: no route {m} {sub}"})
 
+    def _review(self, review_id: int) -> dict[str, Any] | None:
+        return next((r for r in self.reviews if r["id"] == review_id), None)
+
+    def _pending_review(self, login: str = BOT) -> dict[str, Any] | None:
+        """``login``'s pending review (GitHub allows one per user and PR)."""
+        return next(
+            (r for r in self.reviews if r["state"] == "PENDING" and r["user"]["login"] == login),
+            None,
+        )
+
     def _post_review(self, body: dict[str, Any]) -> httpx.Response:
-        if body.get("event") != "COMMENT":
+        """Create a review: submitted with ``event: COMMENT``, PENDING without an event."""
+        event = body.get("event")
+        if event not in (None, "COMMENT"):
             return httpx.Response(422, json={"message": "only COMMENT expected in tests"})
         if body.get("commit_id") != self.pr["head"]["sha"]:
             return httpx.Response(
                 422, json={"message": "commit_id is not part of the pull request"}
             )
-        for c in body.get("comments", []):
+        if self._pending_review() is not None:
+            return httpx.Response(
+                422,
+                json={
+                    "message": "Unprocessable Entity",
+                    "errors": ["User can only have one pending review per pull request"],
+                },
+            )
+        comments = body.get("comments") or []
+        for c in comments:
             if (c["path"], c["line"]) in self.invalid_lines:
                 return httpx.Response(
                     422,
@@ -297,19 +360,86 @@ class FakeGitHub:
                         "errors": ["Line could not be resolved"],
                     },
                 )
+        if event == "COMMENT" and not comments and not body.get("body"):
+            return httpx.Response(422, json={"message": "Body can't be blank"})
         rid = self._id()
         review = {
             "id": rid,
             "node_id": f"PRR_{rid}",
-            "state": "COMMENTED",
+            "state": "PENDING" if event is None else "COMMENTED",
             "body": body.get("body", ""),
             "html_url": f"https://github.com/{self.owner}/{self.repo}/pull/{self.number}#pullrequestreview-{rid}",
-            "user": {"login": BOT},
+            "user": {"login": BOT, "type": "Bot"},
         }
         self.reviews.append(review)
-        for c in body.get("comments", []):
-            self.add_review_comment(c["path"], c["line"], c["body"])
+        new = [
+            {"path": c["path"], "line": c["line"], "body": c["body"], "in_reply_to": None}
+            for c in comments
+        ]
+        if event is None:
+            self.pending[rid] = new
+        else:
+            self._materialize(new)
         return httpx.Response(200, json=review)
+
+    def _materialize(self, comments: list[dict[str, Any]]) -> None:
+        for c in comments:
+            self.add_review_comment(c["path"], c["line"], c["body"], in_reply_to=c["in_reply_to"])
+
+    def _submit_review(self, review_id: int, body: dict[str, Any]) -> httpx.Response:
+        review = self._review(review_id)
+        if review is None:
+            return httpx.Response(404, json={"message": "Not Found"})
+        if review["state"] != "PENDING":
+            return httpx.Response(422, json={"message": "Review has already been submitted"})
+        if body.get("event") != "COMMENT":
+            return httpx.Response(422, json={"message": "only COMMENT expected in tests"})
+        comments = self.pending.pop(review_id, [])
+        if not comments and not body.get("body"):
+            self.pending[review_id] = comments
+            return httpx.Response(422, json={"message": "Body can't be blank"})
+        review.update(state="COMMENTED", body=body.get("body", review["body"]))
+        self._materialize(comments)
+        return httpx.Response(200, json=review)
+
+    def _add_reply(self, variables: dict[str, Any]) -> httpx.Response:
+        """GraphQL ``addPullRequestReviewThreadReply`` into a pending review."""
+
+        def not_found(what: str) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {"addPullRequestReviewThreadReply": None},
+                    "errors": [{"type": "NOT_FOUND", "message": f"Could not resolve {what}"}],
+                },
+            )
+
+        review = next((r for r in self.reviews if r["node_id"] == variables.get("reviewId")), None)
+        if review is None or review["state"] != "PENDING":
+            return not_found("the pending review")
+        parent = next(
+            (
+                c
+                for c in self.review_comments
+                if c["in_reply_to_id"] is None
+                and self.thread_id_of(c["id"]) == variables.get("threadId")
+            ),
+            None,
+        )
+        if parent is None:
+            return not_found("the thread")
+        self.pending[review["id"]].append(
+            {
+                "path": parent["path"],
+                "line": parent["line"],
+                "body": variables["body"],
+                "in_reply_to": parent["id"],
+            }
+        )
+        return httpx.Response(
+            200,
+            json={"data": {"addPullRequestReviewThreadReply": {"comment": {"id": "PRRC_new"}}}},
+        )
 
     # ------------------------------------------------------------------ GraphQL
 
@@ -386,6 +516,8 @@ class FakeGitHub:
             else:
                 self.resolved[tid] = BOT[: -len("[bot]")]
             return httpx.Response(200, json={"data": {"x": {"thread": {"id": tid}}}})
+        if "addPullRequestReviewThreadReply" in query:
+            return self._add_reply(variables)
         if "minimizeComment" in query:
             self.minimized.add(variables["subjectId"])
             return httpx.Response(

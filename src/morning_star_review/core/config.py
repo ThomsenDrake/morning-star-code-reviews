@@ -5,12 +5,14 @@
 Model choice (explorers, ensemble, verifier on/off and model, formatter, efforts)
 follows, lowest to highest precedence:
 
-1. the preset (the repository file's ``preset``, else the built-in default);
-2. the trusted repository file's ``models``, ``ensemble``, ``verify`` and
-   ``reasoning_effort``;
-3. an explicit run preset (CLI ``--preset``, Action ``preset`` input), which replaces
-   all of layer 2: the run gets that preset's pipeline as published;
-4. explicit run model overrides (``--explorers``, ``--explorer-model``,
+1. the built-in default preset;
+2. the operator's default preset (``OperatorPolicy.default_preset``, from the CLI
+   user config ``[defaults] preset``): a default, not an explicit run preset;
+3. the trusted repository file: its ``preset``, then its ``models``, ``ensemble``,
+   ``verify`` and ``reasoning_effort``;
+4. an explicit run preset (CLI ``--preset``, Action ``preset`` input), which replaces
+   all of layer 3: the run gets that preset's pipeline as published;
+5. explicit run model overrides (``--explorers``, ``--explorer-model``,
    ``--verify``, ``--verifier-model``, ``--formatter-model``, the effort flags).
 
 Budgets are not part of this order: the repository file can only lower them, run
@@ -227,6 +229,10 @@ def load_repo_config(
         if mark is not None:
             where = f" at line {mark.line + 1}"
         return None, "invalid_fell_back", [f"{fallback}: not valid YAML{where}"]
+    except (ValueError, OverflowError, TypeError) as exc:
+        # Implicit scalars are built while loading: "2024-13-45" (a bad date) or an
+        # integer of more than 4300 digits raises here, not as a YAMLError.
+        return None, "invalid_fell_back", [f"{fallback}: bad value ({type(exc).__name__})"]
     if data is None:
         return RepoConfig(), "base_file", []
     if not isinstance(data, dict):
@@ -251,6 +257,34 @@ _MODEL_SETTINGS = ("models", "reasoning_effort", "ensemble", "verify")
 def _ignored_spend_settings(repo: RepoConfig) -> list[str]:
     defaults = RepoConfig()
     return [name for name in _SPEND_SETTINGS if getattr(repo, name) != getattr(defaults, name)]
+
+
+# Untrusted repository settings that could steer or empty the review itself: skip every
+# file (exclude), tell the explorer what to report (instructions), or hide findings
+# (inline_min_severity). Ignored like the spend settings (security review CFG-2).
+_STEERING_REVIEW = ("instructions", "path_instructions", "inline_min_severity")
+
+
+def _without_steering_settings(
+    repo: RepoConfig, warnings: list[str]
+) -> tuple[RepoReview, list[str]]:
+    """``repo.review`` and ``exclude`` without the settings an untrusted file may not set."""
+    default = RepoReview()
+    set_here = ["exclude"] if repo.exclude else []
+    set_here += [
+        f"review.{name}"
+        for name in _STEERING_REVIEW
+        if getattr(repo.review, name) != getattr(default, name)
+    ]
+    if set_here:
+        warnings.append(
+            f"{REPO_CONFIG_FILE}: ignored {', '.join(set_here)} because this repository's "
+            "config is not trusted to steer the review (--trust-repo-config uses them)"
+        )
+    review = repo.review.model_copy(
+        update={name: getattr(default, name) for name in _STEERING_REVIEW}
+    )
+    return review, []
 
 
 def _without_model_settings(
@@ -511,8 +545,9 @@ def resolve(
 ) -> tuple[ResolvedConfig, list[str]]:
     """Merge preset, repository config, run overrides and operator policy.
 
-    Model precedence: preset < trusted repository file < explicit run preset <
-    explicit run model overrides (see the module docstring). Returns the effective
+    Model precedence: built-in default preset < operator default preset < trusted
+    repository file < explicit run preset < explicit run model overrides (see the
+    module docstring). Returns the effective
     config and human-readable warnings for the summary. Bad
     model ids or efforts never fail the run: they fall back with a warning. Raises
     ``ConfigError`` only when the policy itself leaves no usable model.
@@ -531,7 +566,9 @@ def resolve(
     if overrides.preset is not None:
         spend = _without_model_settings(spend, overrides.preset, warnings)
 
-    preset_name: PresetName = overrides.preset or spend.preset or DEFAULT_PRESET
+    preset_name: PresetName = (
+        overrides.preset or spend.preset or policy.default_preset or DEFAULT_PRESET
+    )
     explorers = _resolve_explorers(preset_name, spend, overrides, policy, warnings)
     primary = explorers[0]
     verifier = _resolve_verifier(preset_name, spend, overrides, policy, primary, warnings)
@@ -545,7 +582,9 @@ def resolve(
         verifier=verifier,
     )
     budgets = _resolve_budgets(spend.budgets, overrides, policy, warnings)
-    review = file.review
+    review, exclude = file.review, list(file.exclude)
+    if repo is not None and not trusted:
+        review, exclude = _without_steering_settings(file, warnings)
     cfg = ResolvedConfig(
         roles=roles,
         budgets=budgets,
@@ -556,7 +595,7 @@ def resolve(
         author_may_dismiss=review.author_may_dismiss,
         instructions=review.instructions,
         path_instructions=[(p.path, p.instructions) for p in review.path_instructions],
-        exclude=list(file.exclude),
+        exclude=exclude,
         show_usage=file.summary.show_usage and policy.show_usage,
         preset=preset_name,
         labels=file.labels and policy.labels,

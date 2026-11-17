@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -44,8 +45,10 @@ __all__ = [
     "incremental_files",
     "is_generated",
     "kind_weight",
+    "nothing_to_review",
     "plan",
     "rank_score",
+    "unreviewed_code",
     "write_diff_files",
 ]
 
@@ -119,6 +122,26 @@ _MEDIA_EXT = frozenset(
         ".db",
         ".parquet",
     ]
+)
+# Files in a __snapshots__ directory are excluded only with these extensions (snapshot
+# data). The PR author picks the names: "tests/__snapshots__/conftest.py" is code that
+# pytest imports, and must stay reviewable.
+_SNAPSHOT_EXT = frozenset(
+    {".snap", ".ambr", ".json", ".txt", ".html", ".htm", ".svg", ".xml", ".yaml", ".yml"}
+    | {".md", ".csv", ".raw", ".png", ".jpg", ".jpeg", ".gif", ".webp", ""}
+)
+# Excluded content that can change what runs: when nothing else changed, the review
+# is not "clean", because nothing was reviewed (security review EXCL-1).
+_UNREVIEWED_CODE_REASONS = frozenset({"lock_file", "minified", "generated"})
+_UNREVIEWED_WORDS = {
+    "lock_file": "lock file",
+    "minified": "minified file",
+    "generated": "generated file",
+}
+_INERT_BINARY_EXT = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tif", ".tiff", ".psd", ".pdf"}
+    | {".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".m4a", ".wav", ".ogg"}
+    | {".flac", ".mov", ".avi", ".mkv", ".webm"}
 )
 _GENERATED_MARKERS = ("@generated", "DO NOT EDIT")
 # Lines the scan may cover when the base version corroborates the marker.
@@ -282,7 +305,9 @@ def default_exclusion_reason(path: str) -> str | None:
         return "minified"
     if name.endswith(".map"):
         return "source_map"
-    if "__snapshots__" in p.parts[:-1] or name.endswith(".snap"):
+    if name.endswith(".snap") or (
+        "__snapshots__" in p.parts[:-1] and p.suffix.lower() in _SNAPSHOT_EXT
+    ):
         return "snapshot"
     return None
 
@@ -382,6 +407,10 @@ def _generated(
     if head is None:
         return None
     base = base_lines.get(f.path) if _base_path(f) is not None else None
+    # A rename moves the base's marker to a path the PR author chose (a generated file
+    # renamed to tests/conftest.py, with code added): the marker is unverified there.
+    if f.status == "renamed" and f.previous_path != f.path:
+        base = None
     if base is not None and generated_marker_line(base, _GENERATED_SCAN_LINES) is not None:
         if is_generated(head, max_lines=_GENERATED_SCAN_LINES):
             return "generated"
@@ -610,3 +639,62 @@ def incremental_files(
             continue
         out.append(f.model_copy(update={"additions": fp.added, "deletions": fp.removed}))
     return out
+
+
+# Exclusion reasons in words: (one file, several files).
+_EXCLUDED_WORDS: dict[str, tuple[str, str]] = {
+    "lock_file": ("lock file", "lock files"),
+    "generated": ("generated", "generated"),
+    "binary": ("binary", "binary"),
+    "minified": ("minified", "minified"),
+    "source_map": ("source map", "source maps"),
+    "snapshot": ("snapshot", "snapshots"),
+    "no_changes": ("without line changes", "without line changes"),
+    "no_line_changes": ("without line changes", "without line changes"),
+    OVER_CEILING: ("over the review size limit", "over the review size limit"),
+}
+_REPO_CONFIG = ("excluded by the repository config", "excluded by the repository config")
+
+
+def _excluded_kind(reason: str) -> tuple[str, str]:
+    if reason.startswith("repository_config"):
+        return _REPO_CONFIG
+    return _EXCLUDED_WORDS.get(reason, ("excluded", "excluded"))
+
+
+def unreviewed_code(excluded: Sequence[ExcludedFile]) -> str | None:
+    """The excluded files that can change what runs (lock files, minified bundles,
+    generated code, non-media binaries) in words, e.g. ``2 lock files``; else ``None``.
+
+    Used when nothing was reviewable: such a pull request is not called ``clean``.
+    """
+    risky = [
+        e
+        for e in excluded
+        if e.reason in _UNREVIEWED_CODE_REASONS
+        or (e.reason == "binary" and PurePosixPath(e.path).suffix.lower() not in _INERT_BINARY_EXT)
+    ]
+    if not risky:
+        return None
+    counts = Counter(_UNREVIEWED_WORDS.get(e.reason, "binary file") for e in risky)
+    parts = [
+        f"{n} {kind if n == 1 else kind + 's'}"
+        for kind, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    return ", ".join(parts)
+
+
+def nothing_to_review(excluded: Sequence[ExcludedFile]) -> str:
+    """Why a pull request has no reviewable file, e.g. ``all 5 changed files are ...``."""
+    if not excluded:
+        return "the pull request changes no files"
+    counts = Counter(_excluded_kind(e.reason) for e in excluded)
+    if len(excluded) == 1:
+        return f"the only changed file is excluded from review ({next(iter(counts))[0]})"
+    parts = [
+        f"{n} {one if n == 1 else many}"
+        for (one, many), n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0][0]))
+    ]
+    if len(parts) == 1:
+        return f"all {len(excluded)} changed files are {next(iter(counts))[1]}"
+    return f"all {len(excluded)} changed files are excluded from review ({', '.join(parts)})"

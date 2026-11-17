@@ -29,6 +29,34 @@ ENDPOINT_OVERRIDES = (
 )
 
 
+ORPHAN_POLL_S = 2.0
+
+
+def _exit_when_orphaned(poll_s: float = ORPHAN_POLL_S) -> None:
+    """Exit once the launching process is gone (the agent runs in its own session).
+
+    A driver that dies without cleanup (SIGHUP of a closed terminal, kill -9, OOM)
+    would otherwise leave the agent calling models until its own deadline, for nobody.
+    The parent pid changes when the process is re-parented (to init or a subreaper).
+    """
+    import threading
+    import time
+
+    parent = os.getppid()
+    if parent <= 1:
+        return  # already orphaned at start: nothing to compare with
+
+    def watch() -> None:
+        while True:
+            time.sleep(poll_s)
+            if os.getppid() != parent:
+                print("msreview-agent: the launching process exited; stopping", file=sys.stderr)
+                sys.stderr.flush()
+                os._exit(EXIT_CRASH)
+
+    threading.Thread(target=watch, name="msreview-orphan-watch", daemon=True).start()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 2 or args[0] not in PHASES:
@@ -40,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     phase, job_dir = args
     for name in ENDPOINT_OVERRIDES:
         os.environ.pop(name, None)
+    _exit_when_orphaned()
     # Imported here so a usage error does not pay for loading the Agents SDK.
     from morning_star_review.agent import jobio, runner
 

@@ -148,7 +148,9 @@ def test_stripped_indentation_is_rejected(make) -> None:
     [
         "        end = start + size  # <!-- morning-star-review:finding f1 -->",
         "        end = start + size  # morning-star-review: finding f1",
-        "        end = start + size  # -->",
+        "        end = start + size  # MORNING-STAR-REVIEW :state",
+        "        end = start + size  # <!-->",  # "-->" spacing must not hide the "<!--"
+        "        end = start + size  # <!--->",
         "```\n        end = start + size  # <!-- x\n```",  # inside a wrapping fence too
     ],
 )
@@ -156,6 +158,22 @@ def test_markers_are_rejected(make, raw) -> None:
     res = run(make, raw)
     assert res.suggestion is None
     assert res.reason == "suggestion dropped: contains a marker"
+
+
+@pytest.mark.parametrize(
+    ("raw", "path", "line"),
+    [
+        ("        end = start + size  # -->", PY, 14),
+        ("        end = start + size  # a --> b --> c", PY, 14),
+        ("\tx := compute(2, 1) // state --> done", "cmd/main.go", 4),
+    ],
+)
+def test_a_bare_comment_close_is_ordinary_code(make, raw, path, line) -> None:
+    # Only "<!--" and our own prefix could forge or break a marker; "-->" is an arrow.
+    res = run(make, raw, path=path, line=line)
+    assert res.reason is None
+    assert res.suggestion is not None and res.suggestion.text == raw
+    assert raw in render_block(res.suggestion)
 
 
 def test_decorator_suggestion_is_kept(make) -> None:

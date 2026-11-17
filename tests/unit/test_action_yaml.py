@@ -143,6 +143,13 @@ def test_fork_workflow_follows_addendum_g() -> None:
     revoke = doc["jobs"]["revoke-approval"]
     assert "synchronize" in revoke["if"] and "!contains" in revoke["if"]
     assert revoke["permissions"] == {}
+    # Security review SEC-CI-6: the automatic path also needs the head repository to be
+    # the trusted author's own; anything else goes through the label (and its revocation).
+    owner_check = (
+        "github.event.pull_request.head.repo.owner.login == github.event.pull_request.user.login"
+    )
+    assert owner_check in " ".join(review["if"].split())
+    assert owner_check.replace("==", "!=") in " ".join(revoke["if"].split())
     text = FORKS.read_text()
     assert "actions/checkout" not in text  # never check out PR code
     # Concurrency groups are repository-wide: the non-fork workflow joins its group even

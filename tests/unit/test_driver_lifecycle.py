@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -59,6 +61,8 @@ class FakePlatform:
         self.running: list[str] = []
         self.whoami_error: PlatformError | None = None
         self.on_start: Any = None
+        self.writes_outcome = True  # False: a result no activity of ours wrote
+        self.foreign: dict[str, str] = {}  # other runs' executions -> their deployment
 
     async def whoami(self) -> Whoami:
         self.calls.append(("whoami", None))
@@ -86,10 +90,17 @@ class FakePlatform:
 
     async def execution(self, execution_id: str) -> ExecutionState:
         self.calls.append(("execution", execution_id))
+        if execution_id in self.foreign:
+            return ExecutionState(execution_id, "RUNNING", None, self.foreign[execution_id])
         status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
         result = None
         if status == "COMPLETED":
             result = self.result or outcome_dict(execution_id)
+            if self.writes_outcome and RUN_ROOT is not None:
+                # What our own publish activity does on the worker: write outcome.json.
+                run_dir = RUN_ROOT / execution_id
+                run_dir.mkdir(parents=True, exist_ok=True)
+                (run_dir / "outcome.json").write_text(json.dumps(result))
         return ExecutionState(execution_id, status, result)
 
     async def terminate(self, execution_id: str) -> None:
@@ -105,6 +116,18 @@ class FakePlatform:
 
     async def aclose(self) -> None:
         return None
+
+
+RUN_ROOT: Path | None = None
+
+
+@pytest.fixture(autouse=True)
+def _run_root(tmp_path: Path) -> Iterator[None]:
+    """The run root ``make_cfg`` uses, for the fake publish step's outcome.json."""
+    global RUN_ROOT
+    RUN_ROOT = tmp_path / "runs"
+    yield
+    RUN_ROOT = None
 
 
 def outcome_dict(eid: str, **kw: Any) -> dict[str, Any]:
@@ -162,7 +185,12 @@ class Worker:
             self.platform.worker_running = False
 
 
+async def no_skip(req: Any, secrets: Any) -> None:
+    """The GitHub pre-check: nothing to skip (no network in these tests)."""
+
+
 def hooks(platform: FakePlatform, worker: Worker, **kw: Any) -> driver.Hooks:
+    kw.setdefault("precheck", no_skip)
     return driver.Hooks(platform=platform, worker=worker, timing=FAST, install_signals=False, **kw)
 
 
@@ -256,19 +284,27 @@ async def test_deadline_terminates_once(tmp_path: Path, capsys: pytest.CaptureFi
     assert err.count(driver.TERMINATED_ACTIVITY_NOTE) == 1
 
 
+class SecondSignalDuringTerminate(FakePlatform):
+    """Sends a second signal while the cleanup's terminate call runs."""
+
+    async def terminate(self, execution_id: str) -> None:
+        os.kill(os.getpid(), signal.SIGINT)
+        await asyncio.sleep(0.05)  # the handler runs (and must ignore it) meanwhile
+        await super().terminate(execution_id)
+
+
 async def test_signal_terminates_exactly_once(tmp_path: Path) -> None:
-    p = FakePlatform()
+    p = SecondSignalDuringTerminate()
     p.statuses = ["RUNNING"]
     w = Worker(p)
 
     def on_start(eid: str) -> None:
-        loop = asyncio.get_running_loop()
-        # SIGTERM, then a second SIGINT that must be ignored.
-        loop.call_later(0.05, os.kill, os.getpid(), signal.SIGTERM)
-        loop.call_later(0.06, os.kill, os.getpid(), signal.SIGINT)
+        # SIGTERM; the second signal (SIGINT) comes during the cleanup and is ignored.
+        # (A timer for it could fire after the handlers are removed: a flaky test.)
+        asyncio.get_running_loop().call_later(0.05, os.kill, os.getpid(), signal.SIGTERM)
 
     p.on_start = on_start
-    h = driver.Hooks(platform=p, worker=w, timing=FAST, install_signals=True)
+    h = driver.Hooks(platform=p, worker=w, timing=FAST, install_signals=True, precheck=no_skip)
     outcome, code = await driver.run_review(make_cfg(tmp_path), SECRETS, h)
     assert code == driver.EXIT_CANCELLED
     assert outcome.status == "failed"
@@ -277,6 +313,26 @@ async def test_signal_terminates_exactly_once(tmp_path: Path) -> None:
     assert w.cancelled
     # Handlers are removed afterwards: the default SIGINT handler is back.
     assert signal.getsignal(signal.SIGINT) is not None
+
+
+@pytest.mark.parametrize("sig", [signal.SIGHUP, signal.SIGQUIT])
+async def test_hangup_cleans_up_like_sigterm(tmp_path: Path, sig: signal.Signals) -> None:
+    # Security review PL-4: a closed terminal (SIGHUP) must not leave the execution
+    # running and the worker (with its agents) alive.
+    p = FakePlatform()
+    p.statuses = ["RUNNING"]
+    w = Worker(p)
+
+    def on_start(eid: str) -> None:
+        asyncio.get_running_loop().call_later(0.05, os.kill, os.getpid(), sig)
+
+    p.on_start = on_start
+    h = driver.Hooks(platform=p, worker=w, timing=FAST, install_signals=True, precheck=no_skip)
+    outcome, code = await driver.run_review(make_cfg(tmp_path), SECRETS, h)
+    assert code == driver.EXIT_CANCELLED
+    assert sig.name in (outcome.reason or "")
+    assert p.terminated == [outcome.execution_id]
+    assert w.cancelled
 
 
 async def test_refused_key_is_a_preflight_error(tmp_path: Path) -> None:
@@ -324,6 +380,23 @@ async def test_ci_sweeps_only_its_own_orphans(
     assert outcome.execution_id.startswith("msreview-ci-")
 
 
+async def test_ci_sweep_spares_executions_with_a_live_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Security review PL-5: a second CI run for the PR must not terminate a live run.
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    p = FakePlatform()
+    live = "msreview-ci-octo-org-widgets-pr7-abcdef1-0a0b0c0d"
+    orphan = "msreview-ci-octo-org-widgets-pr7-abcdef1-1a1b1c1d"
+    p.running = [live, orphan]
+    p.foreign = {live: "msreview-ci-octo-org-widgets-1445a6-pr7-x1234", orphan: "gone"}
+    p.live_names = {"msreview-ci-octo-org-widgets-1445a6-pr7-x1234"}
+    cfg = make_cfg(tmp_path, mode="ci", policy=OperatorPolicy(trust_repo_config_models=True))
+    _outcome, code = await driver.run_review(cfg, SECRETS, hooks(p, Worker(p)))
+    assert code == 0
+    assert p.terminated == [orphan]
+
+
 async def test_failed_execution_uses_report_failure_outcome(tmp_path: Path) -> None:
     p = FakePlatform()
     p.statuses = ["RUNNING", "FAILED"]
@@ -356,7 +429,21 @@ async def test_invalid_completed_result_is_a_failure(tmp_path: Path) -> None:
     p.result = {"not": "an outcome"}
     outcome, code = await driver.run_review(make_cfg(tmp_path), SECRETS, hooks(p, Worker(p)))
     assert code == driver.EXIT_FAILED
-    assert "invalid result" in (outcome.reason or "")
+    assert "left no outcome" in (outcome.reason or "")
+
+
+async def test_a_forged_completed_result_is_not_trusted(tmp_path: Path) -> None:
+    # Security review PL-3: a rogue worker on the task queue completes the workflow
+    # with "posted, clean"; our publish activity never ran and wrote no outcome.json.
+    p = FakePlatform()
+    p.statuses = ["COMPLETED"]
+    p.writes_outcome = False
+    p.result = outcome_dict("msreview-cli-somebody-else-1", report_markdown="# forged")
+    cfg = make_cfg(tmp_path, fail_on="findings")
+    outcome, code = await driver.run_review(cfg, SECRETS, hooks(p, Worker(p)))
+    assert code == driver.EXIT_FAILED
+    assert outcome.status == "failed" and outcome.execution_id != "msreview-cli-somebody-else-1"
+    assert "forged" not in (outcome.report_markdown or "")
 
 
 async def test_run_dir_is_removed_unless_kept(tmp_path: Path) -> None:
@@ -568,7 +655,7 @@ async def test_signal_during_cleanup_does_not_interrupt_terminate(tmp_path: Path
     p = SlowTerminate()
     p.statuses = ["RUNNING"]
     w = Worker(p)
-    h = driver.Hooks(platform=p, worker=w, timing=FAST, install_signals=True)
+    h = driver.Hooks(platform=p, worker=w, timing=FAST, install_signals=True, precheck=no_skip)
     outcome, code = await driver.run_review(make_cfg(tmp_path, deadline_s=1), SECRETS, h)
     # The deadline started the cleanup; the SIGTERM that came during the terminate call
     # must not cancel it, and the worker must still be stopped.
@@ -632,3 +719,53 @@ async def test_local_mode_surfaces_a_fatal_activity_error_quickly(sdk_config: An
         await msreview_test_fatal_activity()
     assert len(attempts) == 6  # the SDK still re-runs it: only the waits are gone
     assert time.monotonic() - begun < 1.0  # was ~3.1 s at 0.1, ~6 min at the default
+
+
+class CrowdedPlatform(FakePlatform):
+    """A second run's worker registers on the stable deployment right after ours."""
+
+    def __init__(self, *, live_before: bool = False) -> None:
+        super().__init__()
+        self.started_on: list[str] = []
+        self.live_before = live_before
+        self.deployment_reads = 0
+
+    async def deployment(self, name: str) -> DeploymentState | None:
+        self.calls.append(("deployment", name))
+        stable = name == deployment_name("cli", REF)
+        self.deployment_reads += 1
+        if stable and self.live_before and self.deployment_reads >= 2:
+            # Registered between choose_deployment and our pre-start read.
+            return DeploymentState(name, True, 1, datetime.now(UTC))
+        if self.worker_running:
+            return DeploymentState(name, True, 2 if stable else 1, datetime.now(UTC))
+        return None
+
+    async def start(
+        self, *, workflow: str, deployment: str, execution_id: str, payload: Any
+    ) -> None:
+        self.started_on.append(deployment)
+        await super().start(
+            workflow=workflow, deployment=deployment, execution_id=execution_id, payload=payload
+        )
+
+
+async def test_a_second_worker_on_our_deployment_moves_us_away(tmp_path: Path) -> None:
+    # Security review PL-1: two runs for one PR picked the same stable deployment.
+    p = CrowdedPlatform()
+    w = Worker(p)
+    outcome, code = await driver.run_review(make_cfg(tmp_path), SECRETS, hooks(p, w))
+    assert code == 0 and outcome.status == "posted"
+    assert w.starts == 2  # stopped on the shared deployment, started again on our own
+    assert len(p.started_on) == 1
+    assert p.started_on[0].startswith(deployment_name("cli", REF).rsplit("-pr", 1)[0])
+    assert p.started_on[0] != deployment_name("cli", REF) and "-x" in p.started_on[0]
+
+
+async def test_a_worker_that_registered_before_ours_is_not_shared(tmp_path: Path) -> None:
+    p = CrowdedPlatform(live_before=True)
+    w = Worker(p)
+    _outcome, code = await driver.run_review(make_cfg(tmp_path), SECRETS, hooks(p, w))
+    assert code == 0
+    assert w.starts == 1  # moved before our worker started
+    assert p.started_on and "-x" in p.started_on[0]

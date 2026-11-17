@@ -20,7 +20,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 
 from morning_star_review.core.contract import (
     AgentBudgets,
@@ -35,7 +35,12 @@ from morning_star_review.core.contract import (
     Role,
     Usage,
 )
-from morning_star_review.core.errors import MsreviewError, MsreviewRunDirMissing, for_activity
+from morning_star_review.core.errors import (
+    MsreviewError,
+    MsreviewRunDirMissing,
+    MsreviewTooLarge,
+    for_activity,
+)
 from morning_star_review.core.guard import heartbeat
 from morning_star_review.core.jsonio import read_bytes, write_json_atomic
 from morning_star_review.core.models import price
@@ -97,6 +102,24 @@ def activity_errors() -> Iterator[None]:
         if converted is exc:
             raise
         raise converted from exc
+
+
+# What the snapshot and the prepared plan may take together. Both travel in the inputs
+# of explore, verify and finalize, and Temporal refuses a payload over ~2 MB: then the
+# *workflow task* fails in a loop until the deadline and report_failure never runs.
+# Over this budget, a non-retryable error reaches report_failure instead (PL-2).
+PAYLOAD_BUDGET_BYTES = 1_400_000
+
+
+def check_payload_budget(*models: BaseModel) -> None:
+    """Raise ``MsreviewTooLarge`` when ``models`` serialise to more than the budget."""
+    size = sum(len(m.model_dump_json().encode("utf-8")) for m in models)
+    if size > PAYLOAD_BUDGET_BYTES:
+        raise MsreviewTooLarge(
+            f"the pull request is too large to review here: its file list takes "
+            f"{size / 1e6:.1f} MB, more than the {PAYLOAD_BUDGET_BYTES / 1e6:.1f} MB a "
+            "workflow step can carry (too many changed files or very long paths)"
+        )
 
 
 def progress(line: str) -> None:

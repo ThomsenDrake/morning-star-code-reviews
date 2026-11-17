@@ -10,7 +10,10 @@ Two subcommands:
 ``score``  scores an existing raw directory and writes the Markdown table
            (plus a JSON file with every run score next to it).
 
-The PR numbers come from the JSON that ``scripts/make_test_prs.py`` prints.
+The PR numbers come from the JSON that ``scripts/make_test_prs.py`` prints;
+its ``head_sha`` per case is passed as ``--expected-head-sha`` so every run
+reviews the commit the answer key describes. ``--runs`` applies to every case;
+without it a case's own ``eval.runs`` (E6: 1) or 3 is used.
 The rendered table never contains the repository name; raw outputs do, so
 they are written outside the repository by default.
 
@@ -34,7 +37,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -47,6 +50,7 @@ from msreview_eval.report import render_markdown
 from msreview_eval.scoring import RunScore, score_run
 
 DEFAULT_RAW_ROOT = Path.home() / ".cache" / "morning-star-review" / "eval"
+DEFAULT_RUNS = 3  # per case when neither --runs nor the case's `eval.runs` says otherwise
 
 
 @dataclass(frozen=True)
@@ -101,6 +105,10 @@ def build_command(
 ) -> list[str]:
     cmd = [msreview, "review", spec.pr_url, "--post", "never", "--json"]
     cmd += ["--out", str(report_dir)]
+    if spec.expected_head_sha:
+        # Review exactly the commit the answer key describes; a moved PR head is
+        # refused instead of being scored against the wrong code.
+        cmd += ["--expected-head-sha", spec.expected_head_sha]
     if force:
         cmd.append("--force")
     return [*cmd, *spec.config.args, *extra]
@@ -215,10 +223,18 @@ def load_prs(path: Path) -> tuple[str, dict[str, dict[str, Any]]]:
     return str(data["repo"]), dict(data["cases"])
 
 
+def runs_for(case: CaseKey, runs: int | None) -> int:
+    """Runs of ``case``: an explicit ``--runs`` wins for every case, then the case's
+    own ``eval.runs`` (E6 runs once by default), then ``DEFAULT_RUNS``."""
+    if runs is not None:
+        return runs
+    return case.eval.runs or DEFAULT_RUNS
+
+
 def plan_runs(
     configs: Sequence[Config],
     cases: Sequence[CaseKey],
-    runs: int,
+    runs: int | None,
     repo: str,
     prs: Mapping[str, Mapping[str, Any]],
 ) -> list[RunSpec]:
@@ -229,11 +245,26 @@ def plan_runs(
         if not number:
             raise SystemExit(f"no PR number for case {case.case}; run make_test_prs.py first")
         url = f"https://github.com/{repo}/pull/{int(number)}"
-        sha = entry.get("head_sha")
+        sha = _opt_sha(entry.get("head_sha"))
+        if sha is None:
+            print(
+                f"eval: no head SHA for case {case.case} (give --prs from make_test_prs.py);"
+                " its runs review whatever the PR head is",
+                file=sys.stderr,
+            )
         for config in configs:
-            for run in range(1, (case.eval.runs or runs) + 1):
+            for run in range(1, runs_for(case, runs) + 1):
                 specs.append(RunSpec(config, case, run, url, sha))
     return specs
+
+
+def _opt_sha(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{40}", text):
+        raise SystemExit(f"bad head_sha {text[:50]!r} in --prs: expected 40 hex characters")
+    return text
 
 
 def score_raw_dir(raw_dir: Path, cases: Mapping[str, CaseKey]) -> list[RunScore]:
@@ -264,6 +295,71 @@ def score_raw_dir(raw_dir: Path, cases: Mapping[str, CaseKey]) -> list[RunScore]
             )
         )
     return scores
+
+
+# Flags that change budgets or limits: their presence means "not the shipped budgets".
+_BUDGET_FLAGS = (
+    "--max-cost-usd",
+    "--max-tool-calls",
+    "--explorer-minutes",
+    "--verifier-max-tool-calls",
+    "--verifier-minutes",
+    "--deadline-minutes",
+)
+
+
+def load_metas(raw_dir: Path) -> list[dict[str, Any]]:
+    """Every run's metadata under ``raw_dir`` (sorted by path)."""
+    metas: list[dict[str, Any]] = []
+    for meta_path in sorted(raw_dir.rglob("run-*.meta.json")):
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            metas.append(data)
+    return metas
+
+
+def mode_of(argv: Sequence[str]) -> str:
+    """How one run was made, from its recorded ``msreview review`` argv."""
+    args = [str(a) for a in argv]
+    post = "auto"
+    if "--post" in args and args.index("--post") + 1 < len(args):
+        post = args[args.index("--post") + 1]
+    parts = ["report (`--post never`)" if post == "never" else f"posting (`--post {post}`)"]
+    parts.append("in-process (`--local`)" if "--local" in args else "Workflows worker")
+    budgets = sorted({a.split("=", 1)[0] for a in args} & set(_BUDGET_FLAGS))
+    parts.append(
+        f"custom budgets ({', '.join(f'`{b}`' for b in budgets)})"
+        if budgets
+        else "production prompts, tools and budgets"
+    )
+    return ", ".join(parts)
+
+
+def _unique(values: Iterable[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+def describe_runs(metas: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Header lines saying what was run: configurations, cases with their run
+    counts, and the mode (both ``run`` and ``score`` write them)."""
+    configs = _unique(str(m.get("config")) for m in metas)
+    cases = _unique(str(m.get("case")) for m in metas)
+    per_pair: dict[tuple[str, str], int] = {}
+    for m in metas:
+        key = (str(m.get("case")), str(m.get("config")))
+        per_pair[key] = per_pair.get(key, 0) + 1
+    counts = []
+    for case in cases:
+        ns = sorted({n for (c, _), n in per_pair.items() if c == case})
+        counts.append(f"{case} x{ns[0]}" if len(ns) == 1 else f"{case} x{ns[0]}-{ns[-1]}")
+    modes = _unique(mode_of(m.get("argv") or ()) for m in metas)
+    pinned = sum("--expected-head-sha" in (m.get("argv") or ()) for m in metas)
+    return [
+        f"configs: {', '.join(configs) or '-'}",
+        f"cases (runs per configuration): {', '.join(counts) or '-'}",
+        f"mode: {'; '.join(modes) or '-'}",
+        f"head SHA pinned (`--expected-head-sha`): {pinned}/{len(metas)} runs",
+    ]
 
 
 def repo_from_raw(raw_dir: Path) -> str | None:
@@ -324,7 +420,13 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--presets", help="comma-separated presets, e.g. best,balanced")
     run.add_argument("--config", action="append", help="raw config: model:<id> or preset:<name>")
     run.add_argument("--effort", default="high", help="explorer effort for model configs")
-    run.add_argument("--runs", type=int, default=3)
+    run.add_argument(
+        "--runs",
+        type=int,
+        default=None,
+        help=f"runs per case and config, for every case (default: the case's own "
+        f"`eval.runs`, else {DEFAULT_RUNS})",
+    )
     run.add_argument("--parallel", type=int, default=1, help="concurrent CLI runs")
     run.add_argument("--timeout-minutes", type=float, default=50.0)
     run.add_argument("--msreview", default=shutil.which("msreview") or "msreview")
@@ -355,6 +457,8 @@ def _cmd_run(args: argparse.Namespace, cases: dict[str, CaseKey]) -> int:
     repo = args.repo or repo_from_file
     selected = select_cases(cases, _split(args.cases))
     configs = configs_from_args(args)
+    if args.runs is not None and args.runs < 1:
+        raise SystemExit("--runs must be at least 1")
     specs = plan_runs(configs, selected, args.runs, repo, prs)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     raw_dir = args.raw_dir or DEFAULT_RAW_ROOT / stamp
@@ -384,10 +488,7 @@ def _cmd_run(args: argparse.Namespace, cases: dict[str, CaseKey]) -> int:
     header = [
         f"date: {datetime.now(UTC).date().isoformat()}",
         f"msreview: {_version(args.msreview)}",
-        f"configs: {', '.join(c.label for c in configs)}",
-        f"cases: {', '.join(c.case for c in selected)}; runs per case: {args.runs}"
-        " (E6-style cases may override)",
-        "mode: report (`--post never`), production prompts, tools and budgets",
+        *describe_runs(load_metas(raw_dir)),
     ]
     write_results(scores, cases, out, header, repo)
     return 0
@@ -399,7 +500,16 @@ def _cmd_score(args: argparse.Namespace, cases: dict[str, CaseKey]) -> int:
     wanted = set(_split(args.cases))
     scores = [s for s in score_raw_dir(args.raw_dir, cases) if not wanted or s.case in wanted]
     out = args.out or args.raw_dir / "results.md"
-    header = [f"scored: {datetime.now(UTC).date().isoformat()}", f"runs: {len(scores)}"]
+    metas = [
+        m
+        for m in load_metas(args.raw_dir)
+        if str(m.get("case")) in cases and (not wanted or m.get("case") in wanted)
+    ]
+    header = [
+        f"scored: {datetime.now(UTC).date().isoformat()}",
+        f"runs: {len(scores)}",
+        *describe_runs(metas),
+    ]
     write_results(scores, cases, out, header, args.repo or repo_from_raw(args.raw_dir))
     return 0
 
