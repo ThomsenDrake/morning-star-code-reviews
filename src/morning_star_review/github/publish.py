@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -18,15 +19,17 @@ from urllib.parse import quote
 from morning_star_review.core.contract import (
     FinalFinding,
     FinalReview,
+    PriorFinding,
     PriorState,
     PrSnapshot,
+    ResolvedPrior,
     ReviewOutcome,
     ReviewRequest,
     Stage,
 )
 from morning_star_review.core.jsonio import write_json_atomic, write_text_atomic
 from morning_star_review.core.runctx import RunContext
-from morning_star_review.core.sanitize import sanitize_inline
+from morning_star_review.core.sanitize import code_span, sanitize_inline, strip_markers
 from morning_star_review.github import graphql
 from morning_star_review.github.http import GitHubGraphQLError, GitHubHttp, GitHubLasting
 from morning_star_review.github.labels import set_verdict_label
@@ -264,6 +267,55 @@ def reply_body(finding_id: str, action: str, head_sha: str) -> str:
     return f"{text}\n{reply_marker(finding_id)}"
 
 
+RESOLVED_HEADING = "#### Resolved since the last review"
+UNCLOSED_SUFFIX = "; the thread could not be closed automatically"
+UNCLOSED_NOTE = (
+    "<sub>GitHub did not let this app resolve the threads marked above, so it replied to "
+    "each and hid the comment as resolved instead. You can resolve them by hand.</sub>"
+)
+_FOOTER_START = "<sub>Automated review"
+
+
+def _resolved_line(rp: ResolvedPrior) -> str:
+    """The line ``review.render`` writes for ``rp`` under ``RESOLVED_HEADING``."""
+    why = "file deleted" if rp.action == "file_deleted" else "code changed"
+    return f"- {sanitize_inline(rp.title, 200)} ({code_span(strip_markers(rp.path))}): {why}"
+
+
+def with_unclosed_notes(summary_md: str, unclosed: Sequence[ResolvedPrior]) -> str:
+    """``summary_md`` noting, under "Resolved since the last review", each fixed prior
+    whose thread could not be resolved (closed by reply + minimize instead).
+
+    The rendered line of each prior gets ``UNCLOSED_SUFFIX``; a prior without a line
+    (a shortened summary) gets one; ``UNCLOSED_NOTE`` closes the section.
+    """
+    if not unclosed:
+        return summary_md
+    lines = summary_md.split("\n")
+    missing: list[str] = []
+    for rp in unclosed:
+        want = _resolved_line(rp)
+        for i, line in enumerate(lines):
+            if line == want:
+                lines[i] = want + UNCLOSED_SUFFIX
+                break
+        else:
+            missing.append(want + UNCLOSED_SUFFIX)
+    addition = [*missing, "", UNCLOSED_NOTE]
+    if RESOLVED_HEADING in lines:
+        end = lines.index(RESOLVED_HEADING) + 2
+        while end < len(lines) and lines[end].strip():
+            end += 1
+        lines[end:end] = addition
+        return "\n".join(lines)
+    section = [RESOLVED_HEADING, "", *addition, ""]
+    footer = next((i for i, ln in enumerate(lines) if ln.startswith(_FOOTER_START)), None)
+    if footer is None:
+        return "\n".join([*lines, "", *section]).rstrip()
+    lines[footer:footer] = section
+    return "\n".join(lines)
+
+
 def _comment_payload(finding: FinalFinding, body: str) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "path": finding.path,
@@ -296,23 +348,38 @@ def replied_ids(comments: list[Any], bot_login: str | None) -> set[str]:
     return out
 
 
+_MAX_STATE_FINDINGS = 60  # PriorState.findings holds at most 60 entries
+_LIVE_FIELDS = {"thread_resolved": False, "resolved_by": None, "resolver_can_dismiss": False}
+
+
 def _updated_state(
     state: PriorState,
     comment_ids: dict[str, int],
     unplaced: set[str],
-    kept_open: set[str],
+    fixed: dict[str, PriorFinding],
     refused: list[str],
 ) -> PriorState:
-    findings = []
+    """``state`` with posted comment ids, unplaced findings and fallback-closed priors.
+
+    Priors in ``fixed`` (closed by reply + minimize because the thread could not be
+    resolved) are recorded with state ``fixed``, so a later run never touches them
+    again. Open findings keep priority for the 60 entries the state holds.
+    """
+    findings: list[dict[str, Any]] = []
     for f in state.findings:
         data = f.model_dump(mode="json")
         if f.id in comment_ids:
             data["comment_id"] = comment_ids[f.id]
         if f.id in unplaced:
             data.update(state="summary_only", comment_id=None)
-        if f.id in kept_open:
-            data["state"] = "open"
         findings.append(data)
+    listed = {d["id"]: d for d in findings}
+    for fid, pf in fixed.items():
+        if fid in listed:
+            if listed[fid]["state"] != "open":
+                listed[fid].update(state="fixed", comment_id=pf.comment_id, thread_id=pf.thread_id)
+        elif len(findings) < _MAX_STATE_FINDINGS:
+            findings.append({**pf.model_dump(mode="json"), **_LIVE_FIELDS, "state": "fixed"})
     data = state.model_dump(mode="json")
     # summary_comment_id stays as finalize set it: a new summary's id is only known
     # after it is posted, and fetch finds the summary by its marker anyway.
@@ -361,34 +428,53 @@ async def _post_inline(
     return url, unplaced
 
 
+@dataclass
+class _Closed:
+    """What ``_close_priors`` did to the threads of fixed priors."""
+
+    # Priors closed without resolving the thread (reply + minimize), recorded as
+    # ``fixed`` in the state so later runs leave them alone.
+    fallback: dict[str, PriorFinding] = field(default_factory=dict)
+    # Their summary lines get the "could not be closed automatically" note.
+    unclosed: list[ResolvedPrior] = field(default_factory=list)
+    refused: list[str] = field(default_factory=list)  # thread ids GitHub refused to resolve
+    notes: list[str] = field(default_factory=list)
+
+
 async def _close_priors(
     gh: GitHubHttp,
     snap: PrSnapshot,
     final: FinalReview,
     comments: list[Any],
-) -> tuple[set[str], list[str], list[str]]:
+) -> _Closed:
     """Reply to and resolve the threads of fixed priors (DESIGN 9.4 step 6).
 
-    GitHub refuses ``resolveReviewThread`` to Apps ("Resource not accessible by
-    integration"); then our comment is minimized as RESOLVED instead, and the
-    thread id is recorded in ``refused_resolves``. Returns (ids kept open, refused
-    thread ids, notes).
+    GitHub refuses ``resolveReviewThread`` unless the token has Contents: write
+    ("Resource not accessible by integration"). Then the fallback runs once: one
+    "looks addressed" reply (found again by its marker) and our comment minimized as
+    RESOLVED. The prior is recorded as ``fixed`` (and its thread id in
+    ``refused_resolves``), so later runs neither reply again nor retry the resolve or
+    the minimize.
     """
+    out = _Closed()
     prior = snap.prior
     if prior is None:
-        return set(), [], []
+        return out
     by_id = {f.id: f for f in prior.findings}
+    earlier_refused = set(prior.refused_resolves)
     node_ids = {int(c["id"]): str(c.get("node_id") or "") for c in comments if c.get("id")}
     replied = replied_ids(comments, snap.bot_login)
     path = f"{_repo_path(snap)}/pulls/{snap.number}/comments"
-    kept_open: set[str] = set()
-    refused: list[str] = []
-    notes: list[str] = []
     for rp in final.priors:
         pf = by_id.get(rp.id)
         if rp.action not in ("resolve", "file_deleted") or pf is None or pf.comment_id is None:
             continue
-        if pf.thread_resolved:
+        if pf.state == "fixed" or pf.thread_resolved:
+            continue
+        if pf.thread_id and pf.thread_id in earlier_refused:
+            # An earlier run already replied and minimized: nothing more to write.
+            out.fallback[rp.id] = pf
+            out.unclosed.append(rp)
             continue
         if rp.id not in replied:
             try:
@@ -400,26 +486,32 @@ async def _close_priors(
                 if exc.status != 404:
                     raise
                 continue  # our comment was deleted; nothing left to close
-        resolved = False
         if pf.thread_id:
             try:
-                resolved = await graphql.resolve_thread(gh, pf.thread_id)
+                if await graphql.resolve_thread(gh, pf.thread_id):
+                    continue
+                out.refused.append(pf.thread_id)
             except GitHubGraphQLError as exc:
-                notes.append(f"could not resolve a thread ({exc})"[:300])
-            if not resolved:
-                refused.append(pf.thread_id)
-        if resolved:
-            continue
+                out.notes.append(f"could not resolve a thread ({exc})"[:300])
         node_id = node_ids.get(pf.comment_id, "")
-        minimized = False
-        if node_id:
-            try:
-                minimized = await graphql.minimize_comment(gh, node_id, "RESOLVED")
-            except GitHubGraphQLError as exc:
-                notes.append(f"could not minimize a fixed finding ({exc})"[:300])
-        if not minimized:
-            kept_open.add(rp.id)
-    return kept_open, refused, notes
+        try:
+            if not (node_id and await graphql.minimize_comment(gh, node_id, "RESOLVED")):
+                out.notes.append(f"could not minimize fixed finding {rp.id}")
+        except GitHubGraphQLError as exc:
+            out.notes.append(f"could not minimize fixed finding {rp.id} ({exc})"[:300])
+        out.fallback[rp.id] = pf
+        out.unclosed.append(rp)
+    if out.unclosed:
+        out.notes.append(
+            f"{len(out.unclosed)} thread(s) of fixed findings could not be resolved "
+            "automatically; replied and hid the comment as resolved instead"
+        )
+    if out.refused:
+        out.notes.append(
+            "GitHub refused resolveReviewThread: the token needs Contents: write "
+            "(Pull requests: write alone is not enough)"
+        )
+    return out
 
 
 async def publish(
@@ -480,7 +572,8 @@ async def publish(
 
     comments = await gh.paginate(comments_path)
     posted = posted_inline(comments, snap.bot_login)
-    kept_open, refused, notes = await _close_priors(gh, snap, final, comments)
+    closed = await _close_priors(gh, snap, final, comments)
+    notes = closed.notes
 
     issue_comments = await gh.paginate(f"{base}/issues/{snap.number}/comments")
     existing = find_summary_comment(issue_comments, snap.bot_login)
@@ -489,10 +582,10 @@ async def publish(
         final.state,
         {fid: int(c["id"]) for fid, c in posted.items()},
         {f.id for f in unplaced},
-        kept_open,
-        [*prior_refused, *refused],
+        closed.fallback,
+        [*prior_refused, *closed.refused],
     )
-    body = summary_body(final.summary_md, unplaced, state)
+    body = summary_body(with_unclosed_notes(final.summary_md, closed.unclosed), unplaced, state)
     if existing is not None:
         summary_url = existing.get("html_url")
         if existing.get("body") != body:

@@ -1,22 +1,33 @@
 """Payload sizes: what the activities produce stays bounded, whatever the agents write.
 
 Temporal payloads are limited to about 2 MB. The run-directory design keeps big data on
-disk, but ``FinalizeInput`` carries the snapshot, the prepared plan, every explorer's
-result and draft, the merge and the verification. These tests build large, hostile
-inputs, pass them through the activities' own bounding functions, and check the sizes.
+disk, but the activity inputs still carry the snapshot and the prepared plan, and
+``FinalizeInput`` also the merge and the verification (every explorer's result and draft
+only by seal). These tests build large, hostile inputs, pass them through the
+activities' own bounding functions, and check the sizes stay under 1.9 MB.
 """
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from morning_star_review.activities.explore import explore_result
-from morning_star_review.activities.structure import draft_budget, fit_draft
+from morning_star_review.activities.structure import (
+    DRAFT_MIN_BYTES,
+    DRAFTS_TOTAL_BYTES,
+    draft_budget,
+    fit_draft,
+)
 from morning_star_review.activities.verify import verify_result
 from morning_star_review.core import contract as c
-from morning_star_review.core.config import resolve
+from morning_star_review.core.config import MAX_EXPLORERS, resolve
 from morning_star_review.core.notes import parse_verdicts
 
-TWO_MB = 2_000_000
+LIMIT = 1_900_000  # Temporal payloads are limited to ~2 MB; keep a margin
 EXPLORE_BUDGET = 160_000
+# The largest ensemble: the known models plus one with a maximal-length id.
+ENSEMBLE = [*c.DEFAULT_ALLOWED_MODELS, "custom-" + "m" * 93]
 VERIFY_BUDGET = 160_000
 
 
@@ -212,48 +223,65 @@ def test_agent_outputs_are_bounded_whatever_the_agent_writes() -> None:
     assert size(verify) < VERIFY_BUDGET
 
 
-def test_finalize_input_for_a_3000_file_ensemble_run_fits() -> None:
-    cfg = _cfg("best")
-    paths = _paths(3000)
-    models = [r.model for r in cfg.roles.explorers]
+def _cfg_with(models: list[str]) -> c.ResolvedConfig:
+    """The ``best`` preset with exactly ``models`` as explorers (unknown ids allowed)."""
+    policy = c.OperatorPolicy(
+        trust_repo_config_models=True, allow_unknown_models=True, allowed_models=models
+    )
+    cfg, _ = resolve(None, c.RunOverrides(preset="best", explorers=models), policy)
+    assert [r.model for r in cfg.roles.explorers] == models
+    return cfg
+
+
+@pytest.mark.parametrize("explorers", [1, 3, MAX_EXPLORERS])
+def test_worst_case_activity_inputs_stay_under_the_limit(explorers: int) -> None:
+    """MAX_FILES changed files, every explorer at its bounds, 60 maximal candidates.
+
+    ``FinalizeInput`` names the explorers' results and drafts by seal (they stay in
+    the run directory), so its size does not grow with the number of explorers.
+    """
+    models = ENSEMBLE[:explorers]
+    cfg = _cfg_with(models)
+    paths = _paths(c.MAX_FILES)
     explores = [_hostile_explore(m, paths) for m in models]
-    drafts = [_hostile_draft(m, len(models)) for m in models]
-    merge = _merge(models, 1200)  # findings of ordinary length
-    inp = c.FinalizeInput(
-        req=_req(),
-        snap=_snap(paths, cfg),
-        prep=_prep(paths, cfg),
-        explore=None,  # the workflow sets only the lists in pipeline mode
-        draft=None,
-        explores=explores,
-        drafts=drafts,
-        merge=merge,
-        verify=_hostile_verify(merge),
-    )
-    assert size(inp) < TWO_MB
-    for model in (
-        c.VerifyInput(req=_req(), snap=inp.snap, prep=inp.prep, merge=merge),
-        c.MergeInput(req=_req(), prep=inp.prep, drafts=drafts),
-        c.StructureInput(req=_req(), prep=inp.prep, explore=explores[0]),
-        c.ExploreInput(req=_req(), snap=inp.snap, prep=inp.prep),
-    ):
-        assert size(model) < TWO_MB, type(model).__name__
+    drafts = [_hostile_draft(m, explorers) for m in models]
+    merge = _merge(models, 4000)  # more text than trimmed drafts can even produce
+    verify = _hostile_verify(merge)
+    snap, prep = _snap(paths, cfg), _prep(paths, cfg)
+    inputs: list[c.Contract] = [
+        c.FinalizeInput(
+            req=_req(),
+            snap=snap,
+            prep=prep,
+            explore_seals=[e.seal for e in explores],
+            draft_seals=[d.seal for d in drafts],
+            merge=merge,
+            verify=verify,
+        ),
+        c.VerifyInput(req=_req(), snap=snap, prep=prep, merge=merge),
+        c.MergeInput(req=_req(), prep=prep, drafts=drafts),
+        c.StructureInput(req=_req(), prep=prep, explore=explores[0]),
+        c.ExploreInput(req=_req(), snap=snap, prep=prep, explorer=cfg.roles.explorers[-1]),
+    ]
+    for model in inputs:
+        assert size(model) < LIMIT, type(model).__name__
+    assert sum(size(d) for d in drafts) <= max(DRAFTS_TOTAL_BYTES, explorers * DRAFT_MIN_BYTES)
 
 
-def test_finalize_input_with_maximal_candidates_fits_for_a_large_pr() -> None:
-    cfg = _cfg("best")
-    paths = _paths(1000)
-    models = [r.model for r in cfg.roles.explorers]
-    merge = _merge(models, 2000)  # every candidate at its maximal text length
-    inp = c.FinalizeInput(
-        req=_req(),
-        snap=_snap(paths, cfg),
-        prep=_prep(paths, cfg),
-        explore=None,
-        draft=None,
-        explores=[_hostile_explore(m, paths) for m in models],
-        drafts=[_hostile_draft(m, len(models)) for m in models],
-        merge=merge,
-        verify=_hostile_verify(merge),
-    )
-    assert size(inp) < TWO_MB
+def test_finalize_input_does_not_grow_with_the_explorers() -> None:
+    paths = _paths(100)
+
+    def finalize_input(n: int) -> c.FinalizeInput:
+        cfg = _cfg_with(ENSEMBLE[:n])
+        return c.FinalizeInput(
+            req=_req(),
+            snap=_snap(paths, cfg),
+            prep=_prep(paths, cfg),
+            explore_seals=["f" * 64] * n,
+            draft_seals=["e" * 64] * n,
+        )
+
+    one, five = finalize_input(1), finalize_input(MAX_EXPLORERS)
+    assert size(five) - size(one) < 3_000  # the seals and the role lists only
+    with pytest.raises(ValidationError):
+        c.FinalizeInput(req=_req(), snap=one.snap, prep=one.prep, explore_seals=["../x"])

@@ -432,18 +432,49 @@ def test_sanitizers_are_fast_on_adversarial_input(text: str) -> None:
         ("List<String> xs = new ArrayList<>();", []),
         ("x = y  # see issue 12", []),
         ("email = 'a@b.example'", []),
-        ("@property\ndef name(self):", ["contains an @mention"]),
+        # Inside a fenced block GitHub links no mention, reference or URL.
+        ("@property\ndef name(self):", []),
+        ("x = 1  # thanks @octocat, see #12 and GH-3", []),
+        ("url = 'https://evil.example/x'", []),
+        ("host = 'www.example.org'", []),
+        ('doc = """\n```\n"""', []),  # the renderer picks a longer fence
         ("# <!-- morning-star-review:state -->", ["contains a marker"]),
-        ("url = 'https://evil.example/x'", ["contains a URL"]),
-        ("host = 'www.example.org'", ["contains a URL"]),
-        (
-            "@x https://e.example -->",
-            ["contains a marker", "contains an @mention", "contains a URL"],
-        ),
+        ("x = 1  # morning-star-review : y", ["contains a marker"]),
+        ("i --> 0", ["contains a marker"]),
+        ("@x https://e.example -->", ["contains a marker"]),
     ],
 )
 def test_suggestion_hazards(code: str, reasons: list[str]) -> None:
     assert suggestion_hazards(code) == reasons
+
+
+CLOSES = ["contains a line that would close the suggestion fence"]
+
+
+@pytest.mark.parametrize(
+    ("code", "fence", "reasons"),
+    [
+        ("x\n```", "```", CLOSES),
+        ("x\n   ````  \t", "```", CLOSES),  # up to 3 spaces, a longer run, trailing blanks
+        ("x\r```\ry", "```", CLOSES),  # CR is a line ending too
+        ("x\n```", "````", []),
+        ("x\n    ```", "```", []),  # 4 spaces: code content, not a fence
+        ("x\n\t```", "```", []),
+        ("x\n```py", "```", []),  # an info string: an opening fence, not a closer
+        ("s = '```'", "```", []),  # not alone on its line
+        ("x\n~~~", "```", []),  # the other fence character
+        ("x\n~~~~", "~~~", CLOSES),
+        ("<!--\n```", "```", ["contains a marker", *CLOSES]),
+    ],
+)
+def test_suggestion_hazards_fence(code: str, fence: str, reasons: list[str]) -> None:
+    assert suggestion_hazards(code, fence=fence) == reasons
+
+
+@pytest.mark.parametrize("fence", ["", "``", "`~`", "'''"])
+def test_suggestion_hazards_rejects_a_bad_fence(fence: str) -> None:
+    with pytest.raises(ValueError, match="not a code fence"):
+        suggestion_hazards("x", fence=fence)
 
 
 # --------------------------------------------------------------------------------------

@@ -161,6 +161,9 @@ runs:
         python-version: "3.12"
         enable-cache: auto
         cache-dependency-glob: ${{ github.action_path }}/uv.lock
+        # Look for uv settings in this action, not in the caller's workspace (which is
+        # usually empty: the workflow needs no checkout).
+        working-directory: ${{ github.action_path }}
 
     - name: Install morning-star-code-reviews (two environments, one lock)
       shell: bash

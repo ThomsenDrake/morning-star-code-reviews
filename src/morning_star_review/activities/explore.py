@@ -35,6 +35,7 @@ from morning_star_review.activities.common import (
     require_dir,
     usage_for,
 )
+from morning_star_review.activities.finalize import keep_for_finalize
 from morning_star_review.activities.prepare import PROMPT_TXT
 from morning_star_review.core.contract import (
     AgentJob,
@@ -171,4 +172,6 @@ async def explore(inp: ExploreInput) -> ExploreResult:
                 stop_reason=result.stop_reason,
             )
         )
-        return seal(result, ctx)
+        sealed = seal(result, ctx)
+        keep_for_finalize(run_dir, sealed)
+        return sealed

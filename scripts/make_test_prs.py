@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from msreview_eval.build import build_repo, git, git_env
+from msreview_eval.build import BuildError, build_repo, git, git_env
 from msreview_eval.cases import CaseKey, load_cases
 
 REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
@@ -280,7 +280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         result = run(args)
-    except PlanError as exc:
+    except (PlanError, BuildError) as exc:  # BuildError: a git command failed (auth, push)
         print(f"make_test_prs: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2))

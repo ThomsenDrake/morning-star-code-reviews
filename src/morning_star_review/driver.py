@@ -80,6 +80,15 @@ EXIT_USAGE = 2  # usage, configuration or preflight error
 EXIT_FAIL_ON = 3
 EXIT_CANCELLED = 130
 
+# Shown after terminating an execution while our worker still runs one of its activities.
+TERMINATED_ACTIVITY_NOTE = (
+    "msreview: a Temporal 'Activity not found on completion' warning may follow; it is "
+    "expected after a termination and harmless"
+)
+
+# Wait multiplier of the Workflows SDK's client-side activity retry in --local mode.
+LOCAL_RETRY_BACKOFF_COEFFICIENT = 0.0
+
 FailOn = Literal["never", "findings", "high", "critical"]
 FAIL_ON_VALUES: tuple[str, ...] = ("never", "findings", "high", "critical")
 
@@ -378,9 +387,12 @@ def _configure_workflows_sdk(deployment: str | None, api_key: str, *, local: boo
     if deployment:
         wf_config.worker.deployment_name = deployment
     if local:
-        # Outside a worker the SDK retries every activity error client-side, even
-        # non-retryable ones; keep those waits short.
-        wf_config.worker.local_retry_backoff_coefficient = 0.1
+        # Outside a worker the SDK retries every activity error client-side (tenacity,
+        # up to the activity's max attempts), even non-retryable ones, and waits
+        # coefficient * 2**n between attempts. Our own layers already wait where waiting
+        # helps (GitHub reads back off in-process, the agent SDK retries 429s), so the
+        # SDK wait only delays a fatal error: drop it.
+        wf_config.worker.local_retry_backoff_coefficient = LOCAL_RETRY_BACKOFF_COEFFICIENT
 
 
 class _Run:
@@ -434,6 +446,7 @@ class _Run:
             mistral_api_key=self.secrets.mistral_api_key,
             agent_python=self.cfg.agent_python,
             cannot_post_reason=self.secrets.cannot_post_reason,
+            telemetry=self.cfg.telemetry,
         )
 
     def remaining(self) -> float:
@@ -644,6 +657,11 @@ class _Run:
                     self.platform.terminate(self.eid), self.timing.terminate_timeout_s
                 )
                 _say(f"msreview: terminated execution {self.eid}")
+                if self.worker is not None and not self.worker.done():
+                    # The Temporal core (Rust) prints its own WARN when an activity that
+                    # was still running reports back to the terminated execution. It
+                    # writes to stderr directly, so it cannot be filtered here; say why.
+                    _say(TERMINATED_ACTIVITY_NOTE)
             except (PlatformError, TimeoutError) as exc:
                 _say(f"msreview: could not terminate execution {self.eid} ({exc or 'timeout'})")
             self.terminal = True

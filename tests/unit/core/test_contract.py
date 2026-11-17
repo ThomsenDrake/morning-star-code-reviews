@@ -482,7 +482,8 @@ def test_agent_job_and_result_accept_verify_phase() -> None:
 def test_explore_input_explorer_is_optional() -> None:
     assert "explorer" in c.ExploreInput.model_fields
     assert c.ExploreInput.model_fields["explorer"].default is None
-    assert c.FinalizeInput.model_fields["explores"].default_factory is not None
+    assert c.FinalizeInput.model_fields["explore_seals"].default_factory is not None
+    assert c.FinalizeInput.model_fields["draft_seals"].default_factory is not None
 
 
 # --------------------------------------------------------------------------------------

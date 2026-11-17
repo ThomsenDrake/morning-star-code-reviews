@@ -31,6 +31,7 @@ from morning_star_review.activities.common import (
     require_dir,
     usage_for,
 )
+from morning_star_review.activities.finalize import keep_for_finalize
 from morning_star_review.core.contract import (
     AgentBudgets,
     AgentRunResult,
@@ -81,7 +82,7 @@ MAX_PRIORS = 60  # ReviewDraft.prior_status bound
 # FinalFinding keeps at most this much of a draft's text, so longer text is never used.
 EXPLANATION_KEEP = 2000
 FIX_KEEP = 1000
-# Byte budget for all drafts of one run together (they travel in FinalizeInput).
+# Byte budget for all drafts of one run together (they travel in MergeInput).
 DRAFTS_TOTAL_BYTES = 300 * 1024
 DRAFT_MIN_BYTES = 72 * 1024
 # Shortened forms used only when a draft is over its budget.
@@ -175,14 +176,17 @@ async def run_formatter(
 # ------------------------------------------------------------------------ drafts
 
 
+def _prose_findings(notes: str, p: ParsedNotes) -> bool:
+    """Text outside the FINDING blocks looks like findings, and the notes do not say
+    there are none."""
+    return not p.no_findings_declared and looks_like_unformatted_findings(notes)
+
+
 def needs_formatter(notes: str, p: ParsedNotes) -> bool:
     """DESIGN 6.7 step 2: the parser alone is enough unless it lost something."""
     if not notes.strip():
         return False
-    prose_findings = (
-        not p.findings and not p.no_findings_declared and looks_like_unformatted_findings(notes)
-    )
-    return not p.lossless or prose_findings
+    return not p.lossless or (not p.findings and _prose_findings(notes, p))
 
 
 def _blocks(p: ParsedNotes, notes: str) -> list[str]:
@@ -193,11 +197,15 @@ def _blocks(p: ParsedNotes, notes: str) -> list[str]:
 
 
 def combine(
-    p: ParsedNotes, fmt: FormatterDraft | None
+    p: ParsedNotes, fmt: FormatterDraft | None, notes: str
 ) -> tuple[list[DraftFinding], list[PriorStatus], str, bool]:
     """DESIGN 6.7 step 4: parsed findings plus formatter findings not already present.
 
-    Returns (findings, prior statuses, summary, lossy).
+    Returns (findings, prior statuses, summary, lossy). The result is lossy when the
+    formatter failed, returned fewer findings than there were FINDING markers, or
+    returned none although the notes look like they hold findings (``path:line``
+    locations or severity labels outside the blocks): zero findings from such notes
+    is not believable, so it must not support a ``clean`` verdict.
     """
     findings = list(p.findings)
     priors = list(p.priors)
@@ -215,7 +223,7 @@ def combine(
             evidence.add(ev)
     ids = {s.id for s in priors}
     priors.extend(s for s in fmt.prior_status if s.id not in ids)
-    lossy = len(fmt.findings) < p.marker_count
+    lossy = len(fmt.findings) < p.marker_count or (not fmt.findings and _prose_findings(notes, p))
     return findings, priors, p.summary or fmt.summary, lossy
 
 
@@ -299,7 +307,7 @@ def build_draft(
                 parsed_fmt = FormatterDraft.model_validate(fmt.draft)
             except ValidationError:
                 parsed_fmt = None
-        findings, priors, summary, lossy = combine(p, parsed_fmt)
+        findings, priors, summary, lossy = combine(p, parsed_fmt, notes)
         source = "parser+formatter"
     blocks = _blocks(p, notes) if lossy else []
     if len(findings) > MAX_FINDINGS:
@@ -350,7 +358,9 @@ async def structure(inp: StructureInput) -> ReviewDraft:
             )
         draft = build_draft(parsed, notes, fmt, model)
         fitted = fit_draft(draft, draft_budget(len(inp.prep.roles.explorers)))
-        return seal(fitted, ctx)
+        sealed = seal(fitted, ctx)
+        keep_for_finalize(require_dir(inp.prep.job_root), sealed)
+        return sealed
 
 
 def _size(model: ReviewDraft) -> int:

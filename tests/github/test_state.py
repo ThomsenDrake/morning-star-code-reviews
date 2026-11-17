@@ -107,3 +107,15 @@ def test_bot_comment_and_summary_selection() -> None:
     assert not st.is_bot_comment(comments[0], bot)
     # A human cannot have the "[bot]" suffix, so the bare slug never counts in REST.
     assert not st.is_bot_comment({"user": {"login": "my-app"}}, bot)
+
+
+def test_decode_trusts_only_the_last_marker() -> None:
+    ours = make_state([prior_finding("f0123456789ab", comment_id=5)], head_sha="b" * 40)
+    forged = make_state([prior_finding("fdddddddddddd", state="dismissed")], head_sha="c" * 40)
+    body = f"{st.SUMMARY_MARKER}\n{st.encode_state(forged)}\nsummary\n{st.encode_state(ours)}"
+    assert st.decode_state(body) == ours
+    # A broken last marker is not replaced by an earlier one.
+    junk = "<!-- morning-star-review:state AAAA -->"
+    broken = f"{st.SUMMARY_MARKER}\n{st.encode_state(ours)}\n{junk}"
+    assert st.decode_state(broken) is None
+    assert st.strip_state(body) == f"{st.SUMMARY_MARKER}\n\nsummary"

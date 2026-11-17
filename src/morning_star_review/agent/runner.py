@@ -35,6 +35,7 @@ from morning_star_review.core.contract import (
     AgentJob,
     AgentRunResult,
     FormatterDraft,
+    Usage,
     VerifyDraft,
 )
 from morning_star_review.core.notes import (
@@ -53,6 +54,7 @@ __all__ = [
     "build_formatter",
     "build_verifier",
     "explore_complete",
+    "normalize_finish_reason",
     "run_job",
     "verify_complete",
 ]
@@ -234,8 +236,44 @@ async def _run_turn(session: Any, content: str, timeout: float) -> _Turn:
     return reduced
 
 
+# Usage.finish_reasons caps each entry at 20 characters and the list at 200 entries.
+FINISH_REASON_MAX_CHARS = 20
+MAX_FINISH_REASONS = 200
+_ENUM_STYLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.([A-Za-z_][A-Za-z0-9_]*)$")
+_NOT_REASON_CHARS = re.compile(r"[^a-z0-9_]+")
+
+
+def normalize_finish_reason(value: object) -> str:
+    """A model call's finish reason as the contract stores it.
+
+    The SDK reports ``stop``, ``tool_call``, ``length``, ``content_filter`` or
+    ``other``. An enum member, or its ``FinishReason.STOP`` string form, becomes the
+    lower-case value; other characters collapse to ``_``; an empty value becomes
+    ``unknown``; anything longer than the contract's 20-character cap is cut, so an
+    unexpected reason can never make a finished run fail validation.
+    """
+    raw = getattr(value, "value", value)
+    text = "" if raw is None else str(raw).strip()
+    enum_style = _ENUM_STYLE.match(text)
+    if enum_style:
+        text = enum_style.group(1)
+    text = _NOT_REASON_CHARS.sub("_", text.lower()).strip("_")
+    return text[:FINISH_REASON_MAX_CHARS].rstrip("_") or "unknown"
+
+
+def _finish_reasons(m: hooks.Meter) -> list[str]:
+    return [normalize_finish_reason(r) for r in m.state.finish_reasons][-MAX_FINISH_REASONS:]
+
+
+def _usage(m: hooks.Meter) -> Usage:
+    """The meter's usage with normalised finish reasons (see ``normalize_finish_reason``)."""
+    data = m.usage().model_dump(mode="json")
+    data["finish_reasons"] = _finish_reasons(m)
+    return Usage.model_validate(data)
+
+
 def _last_finish(m: hooks.Meter) -> str | None:
-    reasons = m.state.finish_reasons
+    reasons = _finish_reasons(m)
     return reasons[-1] if reasons else None
 
 
@@ -404,7 +442,7 @@ async def _explore(
         budget_exhausted=budget_exhausted,
         exhausted_by=exhausted,
         opened_paths=list(ctx.opened),
-        usage=m.usage(),
+        usage=_usage(m),
         error=_clean_error(out.final.error),
     )
 
@@ -493,7 +531,7 @@ async def _verify(
             stop_reason=None,
             notes="VERIFY COMPLETE",
             complete=True,
-            usage=m.usage(),
+            usage=_usage(m),
         )
     agent = build_verifier(job)
     m.reset_context(len(prompt) + len(agent.instructions or ""))
@@ -519,7 +557,7 @@ async def _verify(
         budget_exhausted=bool(exhausted) or out.rescue_attempted,
         exhausted_by=exhausted,
         opened_paths=list(ctx.opened),
-        usage=m.usage(),
+        usage=_usage(m),
         error=_clean_error(out.final.error),
     )
 
@@ -674,7 +712,7 @@ async def _format(
         complete=draft is not None,
         budget_exhausted=bool(m.state.exhausted_by),
         exhausted_by=list(m.state.exhausted_by),
-        usage=m.usage(),
+        usage=_usage(m),
         error=_clean_error(error),
     )
 
@@ -695,7 +733,7 @@ def _error_result(phase: Phase, m: hooks.Meter, exc: BaseException) -> AgentRunR
         phase=phase,
         state="Error",
         stop_reason="error",
-        usage=m.usage(),
+        usage=_usage(m),
         exhausted_by=list(m.state.exhausted_by),
         error=_clean_error(f"{type(exc).__name__}: {exc}"),
     )

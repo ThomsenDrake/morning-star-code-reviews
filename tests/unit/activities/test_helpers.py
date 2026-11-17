@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from pathlib import Path
@@ -9,7 +10,14 @@ from pathlib import Path
 import pytest
 
 from morning_star_review.activities import common
+from morning_star_review.activities.agent_launcher import AgentCrashed, AgentJobInvalid
 from morning_star_review.activities.explore import explore_result, explorer_role
+from morning_star_review.activities.finalize import (
+    KEPT_DIR,
+    keep_for_finalize,
+    load_kept,
+    primary_prior_claims_win,
+)
 from morning_star_review.activities.structure import (
     FormatterRun,
     build_draft,
@@ -23,9 +31,14 @@ from morning_star_review.activities.verify import (
 )
 from morning_star_review.core import contract as c
 from morning_star_review.core.config import resolve
-from morning_star_review.core.errors import MsreviewBadRequest, MsreviewSealInvalid
+from morning_star_review.core.errors import (
+    MsreviewBadRequest,
+    MsreviewRunDirMissing,
+    MsreviewSealInvalid,
+    non_retryable,
+)
 from morning_star_review.core.notes import parse_notes, parse_verdicts
-from morning_star_review.workflow import _keep_going, is_fatal
+from morning_star_review.workflow import _keep_going, _settled, is_fatal
 
 
 def _roles(preset: str) -> c.ResolvedRoles:
@@ -176,12 +189,35 @@ def test_combine_adds_only_new_formatter_findings() -> None:
         prior_status=[c.PriorStatus(id="f0123456789ab", status="fixed")],
         summary="s",
     )
-    findings, priors, _summary, lossy = combine(p, fmt)
+    findings, priors, _summary, lossy = combine(p, fmt, notes)
     assert [(f.path, f.line) for f in findings] == [("a.py", 3), ("b.py", 9)]
     assert [s.id for s in priors] == ["f0123456789ab"]
     assert not lossy
-    _, _, _, lossy_none = combine(p, None)
+    _, _, _, lossy_none = combine(p, None, notes)
     assert lossy_none
+
+
+def test_zero_formatter_findings_from_notes_that_look_like_findings_is_lossy() -> None:
+    empty = c.FormatterDraft(findings=[], prior_status=[], summary="nothing")
+    prose = "In a.py:3 there is a high severity bug.\nREVIEW COMPLETE\n"
+    p = parse_notes(prose)
+    assert needs_formatter(prose, p)
+    assert combine(p, empty, prose)[3]
+    draft = build_draft(p, prose, FormatterRun(empty.model_dump(), None, None), "m")
+    assert draft.source == "parser_lossy" and draft.unparsed_blocks
+    # A formatter that does find the prose finding is believed.
+    found = c.FormatterDraft(
+        findings=[_draft_finding("a.py", 3, "x = 1")], prior_status=[], summary="s"
+    )
+    assert not combine(p, found, prose)[3]
+    # Notes that say there are no findings: zero findings is consistent.
+    none = "NO FINDINGS\nSome high level remarks.\nFINDING\nfile: a.py\nbroken\n"
+    p_none = parse_notes(none)
+    assert p_none.no_findings_declared
+    assert combine(p_none, empty, none)[3]  # still lossy: a FINDING marker was lost
+    plain = "NO FINDINGS\nThe high level design is fine (see a.py:3).\nREVIEW COMPLETE\n"
+    p_plain = parse_notes(plain)
+    assert not combine(p_plain, empty, plain)[3]
 
 
 def test_build_draft_sources() -> None:
@@ -282,6 +318,57 @@ def test_verify_formatter_trigger() -> None:
     assert not needs_verify_formatter(good, parse_verdicts(good, ids), ids)
 
 
+# ------------------------------------------------------------------------ finalize
+
+
+def _claims(model: str, **claims: str) -> c.ReviewDraft:
+    return c.ReviewDraft(
+        findings=[],
+        prior_status=[c.PriorStatus(id=i, status=st) for i, st in claims.items()],  # type: ignore[arg-type]
+        summary="s",
+        source="parser",
+        marker_count=0,
+        explorer_model=model,
+    )
+
+
+def test_primary_prior_claims_win_conflicts() -> None:
+    primary = _claims("p", f1="fixed", f2="unsure", f3="still_open")
+    other = _claims("o", f1="still_open", f2="still_open", f3="fixed", f4="fixed")
+    out = primary_prior_claims_win([other, primary], "p")
+    assert out[1] is primary
+    # f1/f3: the primary's definite claims win; f2: its "unsure" is no claim; f4: only
+    # the other explorer said something.
+    assert {(s.id, s.status) for s in out[0].prior_status} == {
+        ("f2", "still_open"),
+        ("f4", "fixed"),
+    }
+    assert other.prior_status[0].id == "f1"  # the input drafts are not changed
+    # Without a primary draft (its explorer failed), every claim stays.
+    assert primary_prior_claims_win([other], "p") == [other]
+
+
+def test_kept_payloads_are_found_by_seal_only(tmp_path: Path) -> None:
+    draft = _claims("p").model_copy(update={"seal": "a" * 64})
+    keep_for_finalize(tmp_path, draft)
+    assert (tmp_path / KEPT_DIR / f"ReviewDraft-{'a' * 64}.json").is_file()
+    assert load_kept(tmp_path, c.ReviewDraft, "a" * 64) == draft
+    with pytest.raises(MsreviewRunDirMissing):
+        load_kept(tmp_path, c.ReviewDraft, "b" * 64)
+    with pytest.raises(MsreviewSealInvalid):
+        load_kept(tmp_path, c.ReviewDraft, "../" + "a" * 61)
+    with pytest.raises(MsreviewSealInvalid):  # unsealed payloads are never kept
+        keep_for_finalize(tmp_path, _claims("p"))
+    # A file whose content carries another seal than its name says.
+    other = draft.model_copy(update={"seal": "c" * 64})
+    (tmp_path / KEPT_DIR / f"ReviewDraft-{'d' * 64}.json").write_text(other.model_dump_json())
+    with pytest.raises(MsreviewSealInvalid):
+        load_kept(tmp_path, c.ReviewDraft, "d" * 64)
+    (tmp_path / KEPT_DIR / f"ReviewDraft-{'e' * 64}.json").write_text("{not json")
+    with pytest.raises(MsreviewSealInvalid):
+        load_kept(tmp_path, c.ReviewDraft, "e" * 64)
+
+
 # ------------------------------------------------------------------------ workflow policy
 
 
@@ -293,6 +380,53 @@ def test_fatal_failures_are_never_tolerated() -> None:
     with pytest.raises(RuntimeError):
         _keep_going([], [RuntimeError("x")])
     _keep_going([1], [RuntimeError("tolerated")])
+    # Any non-retryable error in the cause chain is fatal, as Temporal wraps it.
+    wrapped = RuntimeError("activity failed")
+    wrapped.__cause__ = non_retryable("SomethingNew", "no retry can fix this")
+    assert is_fatal(wrapped)
+    assert is_fatal(AgentJobInvalid("x"))
+    assert not is_fatal(AgentCrashed("x"))
+
+
+async def test_settled_waits_for_everyone_after_a_non_fatal_failure() -> None:
+    finished: list[str] = []
+
+    async def member(name: str, delay: float, error: Exception | None = None) -> str:
+        await asyncio.sleep(delay)
+        if error is not None:
+            raise error
+        finished.append(name)
+        return name
+
+    ok, failed = await _settled(
+        [member("a", 0.05), member("b", 0, AgentCrashed("x")), member("c", 0.02)]
+    )
+    assert ok == ["a", "c"]  # in input order, not completion order
+    assert [type(e) for e in failed] == [AgentCrashed]
+    assert sorted(finished) == ["a", "c"]
+
+
+async def test_settled_cancels_the_others_on_a_fatal_failure() -> None:
+    cancelled: list[str] = []
+
+    async def slow(name: str) -> str:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.append(name)
+            raise
+        return name
+
+    async def fatal() -> str:
+        await asyncio.sleep(0.01)
+        raise AgentJobInvalid("refused")
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with pytest.raises(AgentJobInvalid):
+        await _settled([slow("a"), fatal(), slow("b")])
+    assert loop.time() - started < 5
+    assert sorted(cancelled) == ["a", "b"]  # cancelled, and the cancellation was awaited
 
 
 # ------------------------------------------------------------------------ time limits

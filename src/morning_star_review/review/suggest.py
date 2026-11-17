@@ -12,7 +12,12 @@ is recorded in the finding's internal ``notes``:
 3. its first non-blank line keeps the indentation style of the original line;
 4. the head file still parses with the replacement applied (Python, JSON, YAML,
    TOML), or for other files the bracket balance does not change;
-5. it contains no marker, ``@mention`` or URL.
+5. it contains no marker (``<!--``, ``-->``, ``morning-star-review:``) and no line
+   that would close the fence it is posted in. ``@decorators``, ``#`` comments and
+   URLs are allowed: GitHub links no mention, reference or URL inside a fenced block,
+   and ``render_block`` picks a fence longer than any backtick run in the text.
+
+The explanation and the prose fix are sanitised as usual; only the code goes verbatim.
 """
 
 from __future__ import annotations
@@ -241,7 +246,8 @@ def check(
     )
     if problem:
         return _drop(problem)
-    hazards = suggestion_hazards(raw)
+    # Checked on the text that is posted, against the fence render_block will use.
+    hazards = suggestion_hazards(text, fence=fence_for(text))
     if hazards:
         return _drop(", ".join(hazards))
     return SuggestionCheck(suggestion=Suggestion(start_line=start, end_line=end, text=text))

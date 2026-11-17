@@ -153,8 +153,12 @@ def test_large_pr_bug_file_falls_outside_the_inline_budget(
     assert bug_path not in plan.inlined
     excluded = {e.path: e.reason for e in plan.excluded}
     assert excluded["uv.lock"] == "lock_file"
-    generated = [p for p, reason in excluded.items() if p.startswith("ledger/generated/")]
-    assert generated and all(excluded[p] == "generated" for p in generated)
+    # E6 adds its generated tables, so no merge-base version vouches for their
+    # markers: they stay reviewable (on demand), never excluded as "generated".
+    generated = [p for p in plan.line_counts if p.startswith("ledger/generated/")]
+    assert generated
+    assert not any(p in excluded for p in generated)
+    assert set(generated) <= set(plan.inlined) | set(plan.on_demand)
     assert plan.partial_reason is None  # in scope: the file is reviewable on demand
 
 

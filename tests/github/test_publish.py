@@ -259,7 +259,7 @@ async def test_resolve_allowed(fake: FakeGitHub, tmp_path: Path) -> None:
     assert state is not None and state.refused_resolves == []
 
 
-async def test_unresolvable_prior_stays_open(fake: FakeGitHub, tmp_path: Path) -> None:
+async def test_minimize_failure_is_recorded_once(fake: FakeGitHub, tmp_path: Path) -> None:
     snap, final, _ = priors_setup(fake, tmp_path)
 
     def minimize_fails(request: httpx.Request) -> httpx.Response | None:
@@ -271,10 +271,11 @@ async def test_unresolvable_prior_stays_open(fake: FakeGitHub, tmp_path: Path) -
     outcome = await run(fake, tmp_path, snap, final)
     state = summary_state(fake)
     assert state is not None
+    # Replied once and recorded as fixed: a later run does not try again.
     states = {f.id: f.state for f in state.findings}
-    assert states["f0000000000f1"] == "open" and states["f0000000000f2"] == "open"
-    assert states["f0000000000f3"] == "fixed"
+    assert states == dict.fromkeys(("f0000000000f1", "f0000000000f2", "f0000000000f3"), "fixed")
     assert any("minimize" in n for n in outcome.notes)
+    assert len([c for c in fake.review_comments if c["in_reply_to_id"]]) == 2
 
 
 async def test_label_hygiene(fake: FakeGitHub, tmp_path: Path) -> None:
