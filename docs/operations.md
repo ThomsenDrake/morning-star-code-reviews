@@ -108,6 +108,17 @@ Start with `msreview doctor`, which checks the key, Workflows access, the agent
 environment and the App settings. In Actions, the step summary and the `::error` or
 `::warning` annotation give the reason for a failure or a report.
 
+### `msreview setup` fails with a network timeout
+
+The first `setup` downloads the agent environment, which includes a large compiled
+wheel. On a slow connection uv's default 30-second HTTP timeout can expire; run it
+again with a longer one, for example `UV_HTTP_TIMEOUT=180 msreview setup`.
+
+### `msreview doctor` reports HTTP 429 for a model
+
+The model is rate-limited at that moment. Reviews retry rate-limited calls with
+backoff, so this is usually transient; run `doctor --models` again later.
+
 ### "the Mistral API key was refused by the Workflows API (… HTTP 401)"
 
 The review stops with exit code 2 before it starts a worker. The preflight call
