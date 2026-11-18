@@ -2,11 +2,11 @@
 
 Settings come from four places:
 
-| Source | Who controls it | Trusted for models and budgets? |
+| Source | Who controls it | Trusted for models, budgets, exclusions and instructions? |
 |---|---|---|
 | **Action inputs** (`with:` in your workflow) | The repository's maintainers | Yes |
 | **CLI flags** and the CLI user config (`~/.config/morning-star-review/config.toml`) | You, on your machine | Yes |
-| **Repository file** `.morning-star-review.yml`, read at the PR's **base** commit | Whoever can merge to the base branch | In the Action: yes. In the CLI: only with `--trust-repo-config` |
+| **Repository file** `.morning-star-review.yml`, read at the PR's **base** commit | Whoever can merge to the base branch | In the Action: yes. In the CLI: only with `--trust-repo-config`, for every repository (see [Untrusted repository files](#untrusted-repository-files-cli)) |
 | **Built-in defaults** (the `best` preset and the default budgets) | This project | n/a |
 
 The repository file is always read from the base commit of the pull request, never
@@ -47,9 +47,12 @@ Budgets do not follow the model order:
   ignored, and the summary shows a warning.
 - **Run overrides** (flags, Action inputs, and the CLI `[defaults] max_cost_usd`) set
   the budget directly. A value above the default cap raises the cap, up to the hard
-  limits below.
-- If no one sets a tool-call budget, the preset or model default applies (see
-  [models.md](models.md#budgets)).
+  limits below. A value above a hard limit is a usage error (exit code 2).
+- A tool-call budget that someone sets (a flag, an Action input or a trusted
+  repository file) applies as set, also above a model's own default. If no one sets
+  it, every explorer in the `best` preset gets 60, and otherwise the default budget
+  applies, except that a flash model gets 25 (as an explorer outside `best`, or as the
+  verifier). See [models.md](models.md#budgets).
 
 | Budget | Default | Hard limit for overrides |
 |---|---:|---:|
@@ -70,7 +73,8 @@ Budgets do not follow the model order:
 
 ### Untrusted repository files (CLI)
 
-When you run `msreview review` without `--trust-repo-config`, the repository file's
+The CLI does not check who owns the repository: this applies to your own repositories
+too. When you run `msreview review` without `--trust-repo-config`, the repository file's
 `preset`, `models`, `reasoning_effort`, `ensemble`, `verify` and `budgets` are
 **ignored**, and the summary lists them. A repository that you do not control cannot
 choose your models or spend your money. The settings that could steer or empty the
@@ -151,7 +155,7 @@ context:
 | `ensemble.explorers` | list of 1-5 model ids | from the preset | Two or more entries make an ensemble |
 | `verify.enabled` | bool | from the preset | |
 | `reasoning_effort.explorer` / `.verifier` / `.formatter` | effort | from the preset | An effort that the model does not accept falls back to the preset value |
-| `budgets.*` | numbers > 0 | see [Budgets](#budgets) | Can only lower |
+| `budgets.*` | whole numbers ≥ 1 (`max_cost_usd`: a number > 0; `inline_diff_chars`: ≥ 0) | see [Budgets](#budgets) | Can only lower |
 | `review.drafts` | bool | `false` | |
 | `review.incremental` | bool | `true` | When `false`, every push is reviewed in full |
 | `review.inline_min_severity` | `critical` \| `high` \| `medium` \| `low` | `medium` | Findings below this severity are listed only in the summary |
@@ -197,16 +201,16 @@ All inputs are strings. Boolean inputs accept `true`/`false` (also `1`/`0`, `yes
 | `verifier-model` | empty | Verifier model |
 | `verifier-effort` | empty | Verifier effort |
 | `max-cost-usd` | empty (10.00) | Cost limit for the whole run, in USD |
-| `max-tool-calls` | empty (60) | Tool calls per explorer |
+| `max-tool-calls` | empty (60; 25 for a flash model outside `best`) | Tool calls per explorer |
 | `explorer-minutes` | empty (15) | Minutes per explorer |
-| `verifier-max-tool-calls` | empty (30) | Tool calls for the verifier |
+| `verifier-max-tool-calls` | empty (30; 25 for a flash model) | Tool calls for the verifier |
 | `verifier-minutes` | empty (8) | Minutes for the verifier |
 | `allowed-models` | the four supported models | Comma-separated models that the run may use |
 | `review-drafts` | `false` | Review draft pull requests |
 | `labels` | `true` | Keep one verdict label on the PR. Needs Issues: write on the App; set `"false"` if the App does not have it |
 | `suggestions` | `true` | Add validated suggestion blocks to inline comments |
-| `fail-on` | `never` | `never`, `findings`, `high` or `critical`: fail the step (exit code 3) when open findings reach this level |
-| `deadline-minutes` | `40` | Overall time limit for the review. Keep it below the job's `timeout-minutes` (45 in the examples) |
+| `fail-on` | `never` | `never`, `findings`, `high` or `critical`: fail the step (exit code 3) when open findings reach this level. Possible issues (not confirmed) do not count |
+| `deadline-minutes` | `40` | Overall time limit for the review, at most 55 (the App token that the run posts with expires after 60 minutes). Keep it below the job's `timeout-minutes` (45 in the examples) |
 | `telemetry` | `false` | Turn on the Workflows and Agents SDK telemetry (see [operations.md](operations.md#telemetry)) |
 | `pr-url` | empty | The pull request to review. Empty means the PR that triggered the run |
 | `expected-head-sha` | empty | Review only this head commit, and skip if the PR has moved on. Empty means the event's head SHA, when the run reviews the triggering PR |
@@ -218,7 +222,7 @@ All inputs are strings. Boolean inputs accept `true`/`false` (also `1`/`0`, `yes
 |---|---|
 | `status` | `posted`, `report`, `skipped`, `superseded` or `failed` |
 | `verdict` | `clean`, `findings` or `incomplete` (empty when skipped before a review) |
-| `findings` | Number of open findings |
+| `findings` | Number of open findings. Possible issues that the verifier could not confirm do not count |
 | `execution-id` | The Mistral Workflows execution id |
 | `report-path` | Path of `report.md` on the runner |
 
@@ -242,9 +246,9 @@ Each flag matches an Action input. The complete command reference is in [cli.md]
 | `--verifier-model ID` | `verifier-model` | |
 | `--verifier-effort LEVEL` | `verifier-effort` | |
 | `--max-cost-usd X` | `max-cost-usd` | user config `[defaults] max_cost_usd`, else 10.00 |
-| `--max-tool-calls N` | `max-tool-calls` | 60 |
+| `--max-tool-calls N` | `max-tool-calls` | 60 (25 for a flash model outside `best`) |
 | `--explorer-minutes N` | `explorer-minutes` | 15 |
-| `--verifier-max-tool-calls N` | `verifier-max-tool-calls` | 30 |
+| `--verifier-max-tool-calls N` | `verifier-max-tool-calls` | 30 (25 for a flash model) |
 | `--verifier-minutes N` | `verifier-minutes` | 8 |
 | `--deadline-minutes N` | `deadline-minutes` | 45 (CLI), 40 (Action) |
 | `--expected-head-sha SHA` | `expected-head-sha` | |

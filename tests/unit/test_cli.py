@@ -247,6 +247,43 @@ def test_cmd_ci_usage_error_exit_code(
     assert capsys.readouterr().out.count("::error title=Morning Star Code Review::") == 1
 
 
+def test_cmd_ci_empty_key_names_the_action_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Live: an empty `mistral-api-key` input gave the CLI's remedies (variables, config
+    # file), which do not apply to the Action.
+    output, summary = tmp_path / "gh-output", tmp_path / "gh-summary"
+    env = ci_env(
+        tmp_path, MISTRAL_API_KEY="  ", GITHUB_OUTPUT=str(output), GITHUB_STEP_SUMMARY=str(summary)
+    )
+    monkeypatch.delenv("MSREVIEW_MISTRAL_API_KEY_COMMAND", raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert cli.main(["ci"]) == 2
+    out = capsys.readouterr().out
+    assert out.count("::error title=Morning Star Code Review::") == 1
+    assert "the Action input `mistral-api-key` is empty" in out
+    assert "MISTRAL_API_KEY secret is missing" in out
+    assert "api_key_command" not in out
+    text = summary.read_text(encoding="utf-8")
+    assert "`mistral-api-key` is empty" in text and "status=failed" in output.read_text()
+
+
+def test_cli_empty_key_keeps_the_cli_remedies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("MISTRAL_API_KEY", "")
+    monkeypatch.delenv("MSREVIEW_MISTRAL_API_KEY_COMMAND", raising=False)
+    agent = tmp_path / "py"
+    agent.write_text("")
+    monkeypatch.setenv("MSREVIEW_AGENT_PYTHON", str(agent))
+    assert cli.main(["review", "octo-org/widgets#7", "--post", "never"]) == 2
+    err = capsys.readouterr().err
+    assert "set MISTRAL_API_KEY, MSREVIEW_MISTRAL_API_KEY_COMMAND" in err
+    assert "mistral-api-key" not in err
+
+
 def test_cmd_ci_reports_a_driver_error_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -295,7 +332,10 @@ def test_cmd_review_json_stdout(
     )
     assert code == 0
     out = capfd.readouterr().out
-    assert json.loads(out)["status"] == "posted"
+    data = json.loads(out)
+    assert data["status"] == "posted"
+    # Why the verdict is what it is, and how many unconfirmed possible issues were listed.
+    assert data["verdict_reasons"] == [] and data["possible_issues"] == 0
     assert out.count("\n") == 1
     cfg, sec = captured["cfg"], captured["sec"]
     assert cfg.mode == "cli" and cfg.pr_url == PR and cfg.overrides.preset == "balanced"

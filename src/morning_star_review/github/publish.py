@@ -164,6 +164,7 @@ def report_outcome(
             "usage": {k: u.model_dump(mode="json") for k, u in final.usage.items()},
             "cost_usd": final.cost_usd,
             "refuted": [r.model_dump(mode="json") for r in final.refuted],
+            "verdict_reasons": list(final.verdict_reasons),
         }
     )
 
@@ -207,6 +208,7 @@ def write_report_files(
             "head_sha": outcome.head_sha,
             "verdict": outcome.verdict,
             "verdict_reasons": list(final.verdict_reasons) if final else [],
+            "possible_issues": outcome.possible_issues,
             "coverage": dict(final.coverage) if final else {},
             "usage": {k: u.model_dump(mode="json") for k, u in outcome.usage.items()},
             "cost_usd": outcome.cost_usd,
@@ -776,6 +778,7 @@ async def publish(
             "cost_usd": final.cost_usd,
             "refuted": [r.model_dump(mode="json") for r in final.refuted],
             "notes": [n[:300] for n in notes][:50],
+            "verdict_reasons": list(final.verdict_reasons),
         }
     )
     write_report_files(snap.run_dir, snap, final, outcome)

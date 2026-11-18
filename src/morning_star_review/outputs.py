@@ -46,7 +46,8 @@ def _say(line: str) -> None:
 
 
 def open_findings(outcome: ReviewOutcome) -> int:
-    return sum(1 for f in outcome.findings if f.state in ("open", "summary_only"))
+    """Open findings, as the verdict counts them (possible issues do not count)."""
+    return len(outcome.counted_findings())
 
 
 def usage_line(outcome: ReviewOutcome) -> str:

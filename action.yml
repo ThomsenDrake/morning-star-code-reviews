@@ -62,7 +62,7 @@ inputs:
     required: false
     default: ""
   max-tool-calls:
-    description: Tool calls per explorer. Empty = 60.
+    description: Tool calls per explorer, used as set. Empty = 60 (25 for a flash model outside the best preset).
     required: false
     default: ""
   explorer-minutes:
@@ -70,7 +70,7 @@ inputs:
     required: false
     default: ""
   verifier-max-tool-calls:
-    description: Tool calls for the verifier. Empty = 30.
+    description: Tool calls for the verifier, used as set. Empty = 30 (25 for a flash model).
     required: false
     default: ""
   verifier-minutes:
@@ -131,7 +131,7 @@ outputs:
     description: "clean | findings | incomplete"
     value: ${{ steps.review.outputs.verdict }}
   findings:
-    description: Number of open findings.
+    description: Number of open findings (possible issues, which the verifier could not confirm, do not count).
     value: ${{ steps.review.outputs.findings }}
   execution-id:
     description: The Mistral Workflows execution id.

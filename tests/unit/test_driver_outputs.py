@@ -62,6 +62,41 @@ def test_usage_and_result_lines() -> None:
     )
 
 
+def _finding(state: str, verify_status: str | None) -> dict[str, Any]:
+    return {
+        "id": f"f{state[:4]}{verify_status or 'none'}"[:13].ljust(13, "0"),
+        "path": "a.py",
+        "line": 1,
+        "anchor": "inline",
+        "severity": "high",
+        "category": "correctness",
+        "title": "t",
+        "evidence": "x",
+        "explanation": "e",
+        "state": state,
+        "verify_status": verify_status,
+    }
+
+
+def test_open_findings_leave_out_possible_issues() -> None:
+    # Possible issues (uncertain, summary-only) do not count, as for the verdict.
+    o = outcome(
+        verdict="clean",
+        findings=[_finding("summary_only", "uncertain"), _finding("fixed", "confirmed")],
+    )
+    assert o.possible_issues == 1
+    assert outputs.open_findings(o) == 0
+    assert "findings=0 " in outputs.result_line(o)
+    o = outcome(
+        findings=[
+            _finding("summary_only", "uncertain"),
+            _finding("open", "uncertain"),  # posted inline as "(unconfirmed)"
+            _finding("summary_only", "confirmed"),
+        ]
+    )
+    assert outputs.open_findings(o) == 2
+
+
 def test_ci_outputs(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

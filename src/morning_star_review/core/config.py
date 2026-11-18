@@ -503,7 +503,15 @@ def _resolve_budgets(
     policy: OperatorPolicy,
     warnings: list[str],
 ) -> ResolvedBudgets:
+    """Budgets for the run, and which of them were set explicitly.
+
+    ``repo_budgets`` is the trusted repository file's section (all ``None`` when the
+    file is not trusted). A value it sets, or a run override (CLI flag, Action input,
+    operator config), counts as explicit: an explicit tool-call budget applies as set
+    instead of the preset or per-model default (``models.tool_call_limit``).
+    """
     values: dict[str, Any] = ResolvedBudgets().model_dump()
+    explicit: set[str] = set()
     for name in _REPO_BUDGETS:
         value = getattr(repo_budgets, name)
         if value is None:
@@ -515,12 +523,14 @@ def _resolve_budgets(
             )
             continue
         values[name] = value
-    explicit: set[str] = set()
+        explicit.add(name)
+    overridden: set[str] = set()
     for name in _OVERRIDE_BUDGETS:
         value = getattr(overrides, name)
         if value is not None:
             values[name] = value
-            explicit.add(name)
+            overridden.add(name)
+    explicit |= overridden
     caps: dict[str, int | float] = {
         "max_tool_calls": policy.max_tool_calls_cap,
         "explorer_minutes": policy.explorer_minutes_cap,
@@ -530,11 +540,12 @@ def _resolve_budgets(
     }
     for name, cap in caps.items():
         if values[name] > cap:
-            if name in explicit:
+            if name in overridden:
                 warnings.append(f"{name} {values[name]} is above the operator cap; using {cap}")
             values[name] = cap
     # The LLM-call limit is only a backstop; keep it proportional to the tool budget.
     values["max_llm_calls"] = max(10, values["max_tool_calls"] * 3 // 2)
+    values["explicit"] = tuple(sorted(explicit))
     return ResolvedBudgets.model_validate(values)
 
 

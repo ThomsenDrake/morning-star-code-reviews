@@ -133,6 +133,9 @@ calls, tool calls, time, context size and estimated cost before each call:
   write them.
 - The cost cap is hard: no call starts if the run's share of the budget cannot pay for
   it.
+- A turn that fails with a temporary model error (HTTP 429, an unavailable provider) is
+  run again in the same session, up to three times with growing waits, while the
+  deadline, the cost share and the model-call limit allow.
 
 The explorer writes plain-text **notes**, not JSON. Models follow a simple line format
 far more reliably than a schema while they are still using tools:
@@ -186,7 +189,7 @@ most 60 candidates go on, ordered by severity, then votes.
 ### `verify`
 
 One agent with the same five tools, its own budget (30 tool calls, 8 minutes by
-default) and no schema. It receives the candidates inside an untrusted block and
+default; a flash model gets 25 tool calls unless a budget is set) and no schema. It receives the candidates inside an untrusted block and
 writes one `VERDICT <id> … END VERDICT` block for each: `confirmed`, `refuted` or
 `uncertain`, with optional corrections to line, evidence or severity, and a short
 reason. It must not add candidates. A candidate that it does not address counts as
@@ -243,7 +246,8 @@ Deterministic: no model, no clock, no network.
    longer than any backtick run in the code.
 6. **Verdict:**
    - `findings` if any finding is open: new, carried, inline or summary-only, or
-     resolved without a fix.
+     resolved without a fix. A *possible issue* (a new finding that the verifier left
+     `uncertain` and that is listed only in the summary) does not count here.
    - Otherwise `incomplete` if the review was not complete.
    - Otherwise `clean`.
 

@@ -530,7 +530,11 @@ def cmd_ci(env: dict[str, str] | os._Environ[str] | None = None) -> int:
     """``msreview ci``: the Action's entry point (environment contract of DESIGN 10.2)."""
     from morning_star_review import driver, outputs
     from morning_star_review.core.errors import MsreviewError
-    from morning_star_review.usersettings import load_mistral_key, load_user_settings
+    from morning_star_review.usersettings import (
+        SettingsError,
+        load_mistral_key,
+        load_user_settings,
+    )
 
     src = os.environ if env is None else env
     stop = outputs.StopCommands()
@@ -539,7 +543,12 @@ def cmd_ci(env: dict[str, str] | os._Environ[str] | None = None) -> int:
     try:
         s = _ci_settings(src)
         settings = load_user_settings(src)
-        key = load_mistral_key(src, settings)
+        try:
+            key = load_mistral_key(src, settings)
+        except SettingsError:
+            # No key at all: the CLI's remedies (variables, config file) do not apply to
+            # the Action, whose key comes from its `mistral-api-key` input.
+            raise SettingsError(driver.CI_NO_KEY) from None
         sec = ci_secrets(src, key, s["post"], s["app_slug"], s["token_step"])
         # The token is needed again after the run (label removal); keep it in memory only.
         write_token = sec.github_token

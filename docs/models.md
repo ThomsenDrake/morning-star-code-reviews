@@ -4,10 +4,10 @@
 
 All models are hosted by Mistral and called through your Mistral API key.
 
-| Model id | Accepted efforts | List price, USD per 1M tokens (in / out) | Status | Default tool calls when no budget is set |
+| Model id | Accepted efforts | List price, USD per 1M tokens (in / out) | Status | Tool calls when nobody sets a budget |
 |---|---|---|---|---|
-| `zai-glm-5-3` | low, high, max | 1.40 / 4.40 | GA, third-party (about one month's deprecation notice), text only | run budget (60) |
-| `mistral-large-4` | low, medium, high | 0.70 / 2.10 | GA | run budget (60) |
+| `zai-glm-5-3` | low, high, max | 1.40 / 4.40 | GA, third-party (about one month's deprecation notice), text only | the run's budget (60 per explorer, 30 for the verifier) |
+| `mistral-large-4` | low, medium, high | 0.70 / 2.10 | GA | the run's budget |
 | `zai-glm-5-3-flash` | low, high, max | 0.15 / 0.50 | GA, third-party | 25 |
 | `deepseek-v4-1-flash-1017` | low, high, max | 0.30 / 1.20 | Public Preview, third-party | 25 |
 
@@ -69,6 +69,19 @@ When a run has two or more explorers, or the verifier is on:
      lists the dropped items.
    - A candidate that the verifier did not address is treated as `uncertain`.
 
+**Possible issues do not decide the verdict.** A new finding that the verifier left
+`uncertain` and that is listed only in the summary is a *possible issue*. It is not an
+open finding for the verdict. When a review has only possible issues, the verdict
+follows coverage: `clean` when the review is complete (the headline then says "No
+confirmed findings" and counts the possible issues), otherwise `incomplete`. These
+still count as open findings: an `uncertain` finding posted inline with the
+"(unconfirmed)" tag, a finding carried over from an earlier review, and every finding
+of a run without the verifier. The `--json` outcome and `run.json` give the number of
+possible issues in `possible_issues`. The count of open findings (the Action output
+`findings` and the `msreview result` line) and the `fail-on` check leave out possible
+issues too. Possible issues are not kept in the review state on the PR: a later
+incremental review lists one again only if an explorer reports it again.
+
 If an explorer fails with a temporary error, the run continues with the others, but
 the verdict cannot be `clean`. A fatal error fails the run immediately.
 
@@ -82,10 +95,19 @@ the verdict cannot be `clean`. A fatal error fails the run immediately.
 | Minutes | 8 | The verifier |
 | Cost | $10.00 | The whole run (formatter 5%, verifier 20% when on, the rest split equally between the explorers) |
 
-When nobody sets the tool-call budget explicitly, the two flash models get 25 tool calls
-as single explorers, because fast models keep exploring for a long time when they are
-allowed many tool calls. In the `best` preset every explorer gets 60. An explicit
-budget (flag, Action input or repository file) always applies as set.
+When nobody sets a tool-call budget, the two flash models get 25 tool calls, because
+fast models keep exploring for a long time when they are allowed many tool calls. This
+applies to a flash explorer outside the `best` preset and to a flash verifier. In the
+`best` preset every explorer gets 60.
+
+A tool-call budget that someone sets applies as set, also above these per-model
+defaults. It can come from a CLI flag, an Action input, or a trusted repository file.
+For example, `--preset fast --max-tool-calls 60` gives the flash explorer 60 tool
+calls, and a flash verifier with `--verifier-max-tool-calls 30` gets 30. Flags and
+Action inputs can raise a budget up to the hard limit of 200 tool calls (see
+[configuration.md](configuration.md#budgets)). The repository file can only lower
+the default budget (60 per explorer, 30 for the verifier), but a value that it sets
+also applies as set: `max_tool_calls: 40` with the `fast` preset gives 40.
 
 The time budget is the real guard. When an agent reaches a limit, it gets a short grace
 period to write up what it found. The verdict then explains what was not finished.

@@ -151,9 +151,25 @@ def test_verdict_headlines(make) -> None:
     assert render.verdict_headline(inc) == (
         "**Verdict: 2 open findings (1 high, 1 low)** · `aaaaaaa` · incremental since `bbbbbbb`"
     )
-    possible = view(make, findings=[ff(verify_status="uncertain", state="summary_only")])
-    assert render.verdict_headline(possible).startswith(
-        "**Verdict: 1 possible issue, not confirmed**"
+    maybe = ff(id="f9", verify_status="uncertain", state="summary_only")
+    # Possible issues alone never make "findings": the verdict follows completeness.
+    assert render.verdict_headline(view(make, verdict="clean", findings=[maybe])) == (
+        "**Verdict: clean** · No confirmed findings · 1 possible issue (not confirmed)"
+        " · `aaaaaaa` · full review"
+    )
+    assert render.verdict_headline(view(make, verdict="incomplete", findings=[maybe, maybe])) == (
+        "**Verdict: incomplete** · 2 possible issues (not confirmed) · `aaaaaaa` · full review"
+    )
+    both = view(make, findings=[ff(), maybe])
+    assert render.verdict_headline(both) == (
+        "**Verdict: 1 open finding (1 high)** · 1 possible issue (not confirmed)"
+        " · `aaaaaaa` · full review"
+    )
+    # Unconfirmed but posted inline (2+ votes, high) and carried priors are open findings.
+    inline = ff(verify_status="uncertain", votes=["a", "b"])
+    carried = ff(id="f8", verify_status="uncertain", state="summary_only", carried=True)
+    assert render.verdict_headline(view(make, findings=[inline, carried])).startswith(
+        "**Verdict: 2 open findings (2 high)** · `aaaaaaa`"
     )
 
 

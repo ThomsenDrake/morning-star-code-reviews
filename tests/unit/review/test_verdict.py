@@ -11,26 +11,34 @@ from morning_star_review.review.verdict import (
     MAX_REASONS,
     Assessment,
     assess,
+    counts_as_finding,
     decide,
     incomplete_reasons,
+    is_possible,
 )
 
 GLM, LARGE, DEEP = "zai-glm-5-3", "mistral-large-4", "deepseek-v4-1-flash-1017"
 
 
-def finding(state: FindingState = "open") -> FinalFinding:
-    return FinalFinding(
-        id="f111111111111",
-        path="a.py",
-        line=3,
-        anchor="inline",
-        severity="medium",
-        category="correctness",
-        title="t",
-        evidence="e",
-        explanation="x",
-        state=state,
-    )
+def finding(state: FindingState = "open", **kw: Any) -> FinalFinding:
+    base: dict[str, Any] = {
+        "id": "f111111111111",
+        "path": "a.py",
+        "line": 3,
+        "anchor": "inline",
+        "severity": "medium",
+        "category": "correctness",
+        "title": "t",
+        "evidence": "e",
+        "explanation": "x",
+        "state": state,
+    }
+    return FinalFinding(**{**base, **kw})
+
+
+def possible(**kw: Any) -> FinalFinding:
+    """A possible issue: the verifier left it uncertain and it stayed summary-only."""
+    return finding("summary_only", verify_status="uncertain", **kw)
 
 
 def kwargs(make, **kw: Any) -> dict[str, Any]:
@@ -170,6 +178,45 @@ def test_findings_win_over_incomplete(make) -> None:
         "the zai-glm-5-3 explorer did not finish its review",
         "only part of the change was reviewed: more than 3000 files",
     ]
+
+
+def test_possible_issues_alone_do_not_make_findings(make) -> None:
+    # Live: an unconfirmed, summary-only, one-vote finding labelled a PR "findings".
+    a = check(
+        make,
+        findings=[possible(), possible(id="f222222222222")],
+        verify_needed=True,
+        verify=make.verify([]),
+    )
+    assert (a.verdict, a.complete, a.reasons) == ("clean", True, [])
+    # Then the verdict follows completeness.
+    a = check(make, findings=[possible()], coverage={"reviewable": 2, "covered": 1})
+    assert (a.verdict, a.complete) == ("incomplete", False)
+    assert a.reasons == ["1 of 2 reviewable changed files was not opened"]
+    a = check(make, findings=[possible()], verify_needed=True, verify=None)
+    assert (a.verdict, a.reasons) == ("incomplete", ["the verifier did not run"])
+
+
+@pytest.mark.parametrize(
+    "f",
+    [
+        finding("summary_only", verify_status="confirmed"),  # e.g. below the inline threshold
+        finding("summary_only"),  # not verified (verification off)
+        finding("open", verify_status="uncertain", votes=["a", "b"], severity="high"),
+        possible(carried=True),  # a carried prior stays open
+    ],
+    ids=["confirmed-summary-only", "unverified", "unconfirmed-inline", "carried"],
+)
+def test_open_findings_other_than_possible_issues_count(make, f: FinalFinding) -> None:
+    assert is_possible(f) is False and counts_as_finding(f)
+    assert run(make, findings=[f, possible(id="f222222222222")])[0] == "findings"
+
+
+def test_possible_issue_with_a_resolved_without_fix_prior_is_findings(make) -> None:
+    p = ResolvedPrior(
+        id="f1", title="t", path="a.py", action="keep_open", note="resolved without a fix by x"
+    )
+    assert run(make, findings=[possible()], priors=[p])[0] == "findings"
 
 
 def test_resolved_without_a_fix_wins_over_incomplete(make) -> None:
@@ -428,3 +475,26 @@ def test_nothing_reviewed_with_unreviewed_code_is_incomplete(make) -> None:
         f"nothing was reviewed: {NOTHING}, and the excluded files (2 lock files) can "
         "change what runs",
     )
+
+
+def test_outcome_counts_possible_issues_like_the_verdict() -> None:
+    from morning_star_review.core.contract import ReviewOutcome
+
+    findings = [
+        possible(),
+        possible(carried=True),
+        finding("open", verify_status="uncertain", votes=["a", "b"], severity="high"),
+        finding("summary_only", verify_status="confirmed"),
+        finding("summary_only"),
+        possible(id="f333333333333", anchor="outside", line=None),
+    ]
+    expected = sum(1 for f in findings if is_possible(f))
+    assert expected == 2
+    base = {"status": "posted", "pr_url": "u", "execution_id": "e"}
+    assert ReviewOutcome(**base, findings=findings).possible_issues == expected
+    raw = [f.model_dump(mode="json") for f in findings]
+    outcome = ReviewOutcome.model_validate({**base, "findings": raw})
+    assert outcome.possible_issues == expected
+    # Round trip (outcome.json) and an explicit count are kept as they are.
+    assert ReviewOutcome.model_validate_json(outcome.model_dump_json()) == outcome
+    assert ReviewOutcome(**base, findings=findings, possible_issues=7).possible_issues == 7

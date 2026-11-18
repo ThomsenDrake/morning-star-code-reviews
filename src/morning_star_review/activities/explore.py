@@ -3,7 +3,9 @@
 One activity per explorer model, each with its own job directory
 (``<run_dir>/explore-<model>/``). With an ensemble the workflow runs them in parallel;
 each later explorer starts ``STAGGER_SECONDS`` after the previous one so the first model
-calls do not all hit the API at the same moment (the SDK retries on 429).
+calls do not all hit the API at the same moment. A model call refused with HTTP 429 is
+retried by the SDK, and a turn that still fails is retried by the runner with a longer
+backoff while the explorer's deadline and cost share allow (``agent.runner``).
 """
 
 from __future__ import annotations
@@ -43,6 +45,8 @@ from morning_star_review.core.contract import (
     ExploreInput,
     ExploreResult,
     ModelRole,
+    PresetName,
+    ResolvedBudgets,
     ResolvedRoles,
 )
 from morning_star_review.core.errors import MsreviewBadRequest
@@ -60,6 +64,7 @@ __all__ = [
     "explore_job",
     "explore_result",
     "explorer_role",
+    "explorer_tool_calls",
 ]
 
 # The longest explorer budget (25 min cap) plus grace, rescue and process overhead.
@@ -83,6 +88,16 @@ def explorer_role(roles: ResolvedRoles, explorer: ModelRole | None) -> tuple[int
     raise MsreviewBadRequest(f"explorer {explorer.model!r} is not configured for this run")
 
 
+def explorer_tool_calls(b: ResolvedBudgets, model: str, preset: PresetName | None) -> int:
+    """Tool-call budget of one explorer on ``model``.
+
+    An explicit budget (flag, Action input, operator config or trusted repository file)
+    applies as set. Otherwise the preset's explorer budget, else the per-model default.
+    """
+    explicit = "max_tool_calls" in b.explicit
+    return tool_call_limit(model, b.max_tool_calls, explicit=explicit, preset=preset)
+
+
 def explore_job(
     inp: ExploreInput, ctx: RunContext, role: ModelRole, run_dir: Path, job_dir: Path
 ) -> AgentJob:
@@ -92,8 +107,7 @@ def explore_job(
     link_diffs(run_dir, job_dir, refs)
     budgets = agent_budgets(
         b,
-        # Explorers only: the preset's explorer budget replaces the per-model default.
-        max_tool_calls=tool_call_limit(role.model, b.max_tool_calls, preset=snap.config.preset),
+        max_tool_calls=explorer_tool_calls(b, role.model, snap.config.preset),
         seconds=b.explorer_minutes * 60,
         max_cost_usd=cost_share(prep.roles, b.max_cost_usd, "explorer"),
     )

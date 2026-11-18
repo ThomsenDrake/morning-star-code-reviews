@@ -33,6 +33,15 @@ VerifyStatus = Literal["confirmed", "refuted", "uncertain"]
 PresetName = Literal["best", "balanced", "single", "fast", "mistral"]
 Role = Literal["explorer", "verifier", "formatter"]
 ExhaustReason = Literal["tool_calls", "deadline", "context", "cost", "iterations", "length"]
+# Budgets that a run override, the operator or a trusted repository file can set.
+BudgetName = Literal[
+    "max_tool_calls",
+    "explorer_minutes",
+    "inline_diff_chars",
+    "max_cost_usd",
+    "verifier_max_tool_calls",
+    "verifier_minutes",
+]
 AgentPhase = Literal["explore", "format", "verify"]
 CompareStatus = Literal["ahead", "diverged", "behind", "identical", "unknown"]
 Stage = Literal[
@@ -214,6 +223,10 @@ class ResolvedBudgets(Contract):
     grace_llm_calls: int = Field(default=2, ge=0, le=10)
     verifier_max_tool_calls: int = Field(default=30, ge=1, le=200)
     verifier_minutes: int = Field(default=8, ge=1, le=25)
+    # The budgets that someone set (a CLI flag, an Action input, the operator's config or
+    # a trusted repository file), in sorted order. An explicit tool-call budget applies
+    # as set; without it the preset or per-model default applies (models.tool_call_limit).
+    explicit: tuple[BudgetName, ...] = ()
 
 
 PathInstruction = tuple[Glob, Annotated[str, StringConstraints(max_length=1024)]]  # (glob, text)
@@ -782,6 +795,46 @@ class ReviewOutcome(Contract):
     refuted: list[DroppedCandidate] = Field(default_factory=list, max_length=60)
     # Non-fatal problems worth reporting (e.g. a label update that failed).
     notes: list[Note] = Field(default_factory=list, max_length=50)
+    # FinalReview.verdict_reasons: why the review is incomplete, or notes about it.
+    verdict_reasons: list[Note] = Field(default_factory=list, max_length=20)
+    # Possible issues: findings the verifier left uncertain that were not posted inline
+    # (review.verdict.is_possible). They never make the verdict "findings". Counted from
+    # ``findings`` when the caller does not set it.
+    possible_issues: int = Field(default=0, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _count_possible_issues(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or "possible_issues" in data:
+            return data
+        findings = data.get("findings") or []
+        count = sum(1 for f in findings if ReviewOutcome._is_possible_issue(f))
+        return {**data, "possible_issues": count}
+
+    @staticmethod
+    def _is_possible_issue(f: Any) -> bool:
+        """``review.verdict.is_possible`` for a finding or its raw data."""
+        data = f if isinstance(f, dict) else {k: getattr(f, k, None) for k in _POSSIBLE_KEYS}
+        return (
+            data.get("verify_status") == "uncertain"
+            and data.get("state") == "summary_only"
+            and not data.get("carried")
+        )
+
+    def counted_findings(self) -> list[FinalFinding]:
+        """Open findings other than possible issues (``review.verdict.counts_as_finding``).
+
+        These make the verdict ``findings``; ``fail-on``, the Action's ``findings``
+        output and the result line count them too.
+        """
+        return [
+            f
+            for f in self.findings
+            if f.state in ("open", "summary_only") and not self._is_possible_issue(f)
+        ]
+
+
+_POSSIBLE_KEYS = ("verify_status", "state", "carried")
 
 
 # --------------------------------------------------------------------------------------

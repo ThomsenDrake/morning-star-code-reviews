@@ -150,6 +150,10 @@ first line of the report says why it was not posted:
 - **superseded:** the PR head moved on after the run was triggered.
 - **The job shows as skipped for a fork PR:** this is expected with the standard
   workflow. See [Pull requests from forks](security.md#pull-requests-from-forks).
+- **The fork review fails at "Check that the label was added by someone with write
+  access":** the person who added `msreview: safe-to-review` has less than write access
+  (for example the triage role), or the permission could not be read. Remove the label;
+  someone with write, maintain or admin access can add it again.
 
 ### The verdict is `incomplete`
 
@@ -158,13 +162,19 @@ files were not opened, an agent reached its tool, time or cost budget, or an age
 notes ended early. Options: raise `max-tool-calls`, `explorer-minutes` or
 `max-cost-usd`; exclude generated or vendored paths with `exclude`; or split very large
 PRs. Open findings always give the verdict `findings`, even when coverage is
-incomplete.
+incomplete. Possible issues (findings that the verifier could not confirm, listed only
+in the summary) do not count as open findings: with only those, the verdict follows
+coverage. See [models.md](models.md#how-ensemble-results-are-published).
 
 If a run fails after it has started, the existing summary comment gets a notice that
 the latest run did not finish. The label becomes `msreview: incomplete`.
 
 ### Other messages
 
+- **"no Mistral API key: the Action input `mistral-api-key` is empty"**: the
+  `MISTRAL_API_KEY` secret is missing (or not available to this workflow), or the
+  workflow does not pass it to the action. GitHub does not enforce `required: true` for
+  the inputs of a composite action, so msreview checks it itself.
 - **"the agent environment is not installed; run `msreview setup`"**, or doctor
   reports a version mismatch: run `msreview setup`. It rebuilds the environment when the
   version differs. In the Action, both environments are built in each job.
@@ -178,6 +188,11 @@ the latest run did not finish. The label becomes `msreview: incomplete`.
   [setup-github-app.md](setup-github-app.md#why-not-contents-write).
 - **No labels appear:** the App needs Issues: write, and `labels` must be on in both
   the input and the repository file.
-- **HTTP 429 from the models:** the SDK retries automatically. With the `best` preset,
-  three explorers run at the same time, so a workspace with low rate limits may want
-  `single` or `balanced`.
+- **HTTP 429 from the models:** the SDK retries the model call a few times. If the
+  agent's turn still fails with a temporary error (a rate limit, an unavailable or
+  overloaded provider, a timeout), msreview runs the turn again in the same session,
+  up to three times, after about 15, 30 and 60 seconds, as long as the agent's
+  deadline, its cost share and its model-call limit leave room. If it still fails,
+  its error says why the retries stopped. With the `best`
+  preset, three explorers run at the same time, so a workspace with low rate limits may
+  want `single` or `balanced`.
