@@ -51,6 +51,7 @@ __all__ = [
     "REPORT_REASONS",
     "SKIP_REASONS",
     "InlineRenderer",
+    "fresh_write_client",
     "publish",
     "report_outcome",
     "report_reason",
@@ -82,6 +83,14 @@ REPORT_REASONS: dict[str, str] = {
         "Not posted: the App installation on {owner}/{repo} lacks Pull requests: write."
     ),
     "post_never": "Not posted: posting was disabled (post: never).",
+    "token_expired": (
+        "Not posted: the GitHub App token expired before the review was ready and a new "
+        "one could not be minted."
+    ),
+    "bot_mismatch": (
+        "Not posted: the publish step's GitHub App ({bot}) is not the App this review "
+        "was prepared for ({expected})."
+    ),
 }
 
 SKIP_REASONS: dict[str, str] = {
@@ -108,7 +117,26 @@ def report_reason(kind: str, **fields: str) -> str:
 
 def write_client(ctx: RunContext) -> GitHubHttp | None:
     """Client for writes: the App installation token only (never the read token)."""
-    return GitHubHttp(ctx.github_token) if ctx.github_token else None
+    token = ctx.current_github_token()
+    return GitHubHttp(token) if token else None
+
+
+# Re-mint when less than this is left of the token's one-hour life: publishing (with
+# GitHub rate-limit waits) must finish before it expires.
+TOKEN_MIN_VALID_S = 900.0
+
+
+async def fresh_write_client(ctx: RunContext) -> GitHubHttp | None:
+    """``write_client`` after re-minting a token that is close to its expiry (CLI).
+
+    Returns None when the token can no longer be used (expired and the re-mint
+    failed), so the caller reports instead of posting with a dead token.
+    """
+    box = ctx.token_box
+    if box is not None and not await box.ensure_fresh(TOKEN_MIN_VALID_S):
+        log.warning("the GitHub App token expired and could not be re-minted")
+        return None
+    return write_client(ctx)
 
 
 def _repo_path(snap: PrSnapshot) -> str:
@@ -674,10 +702,13 @@ async def publish(
     gh: GitHubHttp | None,
     *,
     render_inline: InlineRenderer | None = None,
+    no_post_reason: str | None = None,
 ) -> ReviewOutcome:
     """Post the review (idempotent) or return a report outcome (DESIGN 9.4 / 9.6).
 
     ``gh`` must carry the App installation token when ``snap.can_post``.
+    ``no_post_reason`` is the report reason when ``gh`` is None although the snapshot
+    could post (for example an expired token).
     """
     execution_id = ctx.execution_id
     if snap.skip is not None:
@@ -685,7 +716,11 @@ async def publish(
     if final is None:
         raise ValueError("final review missing for a snapshot that is not skipped")
     if not snap.can_post or gh is None or not gh.has_token or not snap.bot_login:
-        reason = snap.cannot_post_reason or report_reason("no_credentials")
+        reason = (
+            snap.cannot_post_reason
+            or (no_post_reason if snap.can_post else None)
+            or report_reason("no_credentials")
+        )
         outcome = report_outcome(req, snap, final, reason, execution_id=execution_id)
         write_report_files(snap.run_dir, snap, final, outcome)
         return outcome

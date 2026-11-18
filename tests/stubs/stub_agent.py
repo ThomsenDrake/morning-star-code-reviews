@@ -21,7 +21,10 @@ Spec keys are tried in this order: ``format:<target>:<model>``, ``format:<target
 ``draft``, ``state``, ``stop_reason``, ``complete``, ``rescued``,
 ``budget_exhausted``, ``exhausted_by``, ``opened_paths``, ``usage`` (Usage fields),
 ``error``, ``exit_code`` (exit without a result), ``crash_runs`` (exit 1 on the first N
-runs of this job directory) and ``sleep`` (seconds before finishing).
+runs of this job directory) and ``sleep`` (seconds before finishing). Before sleeping,
+``meter`` (a dict) is written as the job's ``meter.json`` (``phase`` and ``model`` are
+filled in; rate-limit keys such as ``rl_wait_seconds`` simulate waits) and
+``partial_notes`` as ``notes.partial.txt``.
 """
 
 from __future__ import annotations
@@ -111,6 +114,8 @@ def main(argv: list[str]) -> int:
         "diffs_present": all(
             (job_dir / ref.diff_file).is_file() for ref in job.changed_files if ref.diff_file
         ),
+        "run_limits": job.run_limits.model_dump(mode="json") if job.run_limits else None,
+        "cooldown_path": job.cooldown_path,
     }
     with Path(scenario["log"]).open("a", encoding="utf-8") as log:
         log.write(json.dumps(entry) + "\n")
@@ -119,6 +124,11 @@ def main(argv: list[str]) -> int:
         dump.write_text(json.dumps({**os.environ, "__cwd__": os.getcwd()}), encoding="utf-8")
 
     spec = _spec(scenario.get("specs", {}), phase, job.model, job.format_target)
+    if spec.get("meter") is not None:
+        meter = {"phase": phase, "model": job.model, **spec["meter"]}
+        (job_dir / "meter.json").write_text(json.dumps(meter), encoding="utf-8")
+    if spec.get("partial_notes") is not None:
+        (job_dir / "notes.partial.txt").write_text(spec["partial_notes"], encoding="utf-8")
     if spec.get("sleep"):
         time.sleep(float(spec["sleep"]))
     if runs <= int(spec.get("crash_runs", 0)):

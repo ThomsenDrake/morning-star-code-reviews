@@ -14,22 +14,41 @@ Budget rules:
   deadline) and when the projected cost of the next call would pass the cap.
 - Model calls that the SDK makes without a ``post_llm_call`` (its own retries after
   an output-limit stop) are charged at the projected cost, so the cap stays a cap.
+
+Run limits and rate limits:
+- A job may carry ``RunLimits``: tools close at the latest at ``wind_down_epoch`` and no
+  model call starts after ``stop_epoch``. Run limits are never paused; the grace window
+  for the notes after the wind-down moves with the waits after it, up to the stop.
+- Time spent waiting on rate limits (the runner's backoff, the SDK's own retries of a
+  refused call, and waits for the run's shared per-model cooldown) pauses the phase
+  clocks: ``pause`` moves the deadline and the rescue deadline and adds to
+  ``rl_wait_seconds``. ``begin_wait`` pauses for the whole planned wait at once, so a
+  reader of ``meter.json`` never sees a live wait eat into the phase time;
+  ``end_wait`` corrects the pause to the time actually waited. While a wait runs,
+  ``rl_wait_planned`` holds its planned seconds, so ``rl_wait_seconds`` minus it is the
+  time waited before it.
+- ``pre_llm_call`` first waits out the shared cooldown file of the job's model (written
+  by any agent process of the run that was rate-limited), then applies the gates.
 """
 
 from __future__ import annotations
 
+import asyncio
+import math
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Literal
 
 import mistralai.agents as agents
 from pydantic import BaseModel, ConfigDict, Field
 
-from morning_star_review.core.contract import AgentBudgets, ExhaustReason, Usage
+from morning_star_review.agent import ratelimit
+from morning_star_review.core.contract import AgentBudgets, ExhaustReason, RunLimits, Usage
 from morning_star_review.core.jsonio import write_text_atomic
+from morning_star_review.core.runclock import RL_FALLBACK_MAX_WAIT_S, format_wait
 
 __all__ = [
     "CONTEXT_WITHHELD",
@@ -42,10 +61,13 @@ __all__ = [
     "install_meter",
     "log",
     "meter",
+    "wait_for_cooldown",
 ]
 
 OUTPUT_ALLOWANCE_TOKENS = 8_000  # output tokens assumed for the next call when projecting cost
 CHARS_PER_TOKEN = 3  # deliberately low, so the context estimate errs high
+MIN_CALL_WINDOW_S = 30.0  # a rescue needs this much time before the run's stop
+MAX_REFUSED_SECONDS = 600.0  # cap on the SDK retry time of one refused call that is paused
 
 TOOLS_CLOSED = (
     "Exploration budget is used up. Do not call any more tools. "
@@ -86,6 +108,18 @@ class MeterState(BaseModel):
     seconds: float = 0.0  # active seconds of earlier processes
     pending_call: bool = False  # a model call started and has not reported back
     runs: int = 0  # processes that loaded this meter
+    # Rate-limit waits (runclock module docstring). Paused time is not phase time.
+    rl_wait_seconds: float = 0.0  # total pause of the phase clocks
+    rl_waits: int = 0  # waits started (runner backoff and shared cooldown)
+    rl_until_epoch: float | None = None  # end of the wait in progress
+    rl_last_code: str | None = None  # error code of the last temporary failure
+    rl_streak: int = 0  # temporary failures in a row without a model reply
+    pending_since: float | None = None  # start of the model call in flight
+    transient_streak: int = 0  # lost streams and the like in a row (bounded retries)
+    refused_calls: int = 0  # model calls the provider refused (not billed, not counted)
+    rl_wait_after_wind_down: float = 0.0  # the part of rl_wait_seconds after the wind-down
+    rl_wait_planned: float = 0.0  # planned seconds of the wait in progress (in rl_wait_seconds)
+    rl_final_wait: bool = False  # the one shortened retry wait before the run's stop was made
 
 
 class Meter:
@@ -100,6 +134,8 @@ class Meter:
         price_out_per_m: float,
         path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        limits: RunLimits | None = None,
+        cooldown_path: Path | None = None,
     ) -> None:
         self.state = state
         self.budgets = budgets
@@ -107,9 +143,14 @@ class Meter:
         self.price_out = price_out_per_m
         self.path = path
         self.clock = clock
+        self.limits = limits  # from job.json on every start; never persisted or paused
+        self.cooldown_path = cooldown_path  # the run's shared cooldown file of this model
         self.lock = threading.RLock()
         self.process_started = clock()
         self.on_text: Callable[[str], None] | None = None  # partial-notes sink
+        self._wait_started: float | None = None  # the wait in progress (this process)
+        self._wait_planned = 0.0
+        self._wait_planned_after = 0.0  # the planned part after the wind-down
 
     # ---------------------------------------------------------------- construction
 
@@ -124,8 +165,13 @@ class Meter:
         price_out_per_m: float,
         path: Path | None,
         clock: Callable[[], float] = time.time,
+        limits: RunLimits | None = None,
+        cooldown_path: Path | None = None,
     ) -> Meter:
-        """Load ``meter.json`` if a previous process left one, else start a new meter."""
+        """Load ``meter.json`` if a previous process left one, else start a new meter.
+
+        ``limits`` and ``cooldown_path`` come from ``job.json`` on every start.
+        """
         state: MeterState | None = None
         if path is not None and path.exists():
             try:
@@ -150,11 +196,15 @@ class Meter:
             price_out_per_m=price_out_per_m,
             path=path,
             clock=clock,
+            limits=limits,
+            cooldown_path=cooldown_path,
         )
         with meter.lock:
             state.runs += 1
             if state.pending_call:  # the last process died during a model call
                 meter._charge_estimate()
+            state.rl_until_epoch = None  # a wait of a dead process ended with it
+            state.rl_wait_planned = 0.0
             meter.save()
         return meter
 
@@ -189,7 +239,167 @@ class Meter:
         b = self.budgets
         with self.lock:
             affordable = self.state.cost_usd + self.projected_next_call_cost() <= b.max_cost_usd
-        return affordable and b.grace_llm_calls >= 1 and b.rescue_seconds > 0
+            stop = self.stop_epoch()
+            in_time = stop is None or self.clock() + MIN_CALL_WINDOW_S <= stop
+        return affordable and in_time and b.grace_llm_calls >= 1 and b.rescue_seconds > 0
+
+    # ---------------------------------------------------------------- time limits
+
+    def stop_epoch(self) -> float | None:
+        """The run's stop (no model call starts, no wait ends after it), or ``None``."""
+        return self.limits.stop_epoch if self.limits is not None else None
+
+    def tool_deadline(self) -> float:
+        """When tools close: the (paused) phase deadline or the run's wind-down."""
+        d = self.state.deadline_epoch
+        return d if self.limits is None else min(d, self.limits.wind_down_epoch)
+
+    def _grace_start(self) -> float:
+        """Where the grace window starts: the tool deadline, with the wind-down moved by
+        the waits after it (tools still close at the wind-down itself)."""
+        d = self.state.deadline_epoch
+        if self.limits is None:
+            return d
+        return min(d, self.limits.wind_down_epoch + self.state.rl_wait_after_wind_down)
+
+    def call_end(self) -> float:
+        """When the meter stops admitting model calls.
+
+        The rescue deadline, else the tool deadline plus ``grace_seconds`` (both paused
+        by rate-limit waits); never after the run's stop.
+        """
+        with self.lock:
+            s = self.state
+            if s.rescue_deadline_epoch is not None:
+                end = s.rescue_deadline_epoch
+            else:
+                end = self._grace_start() + self.budgets.grace_seconds
+            stop = self.stop_epoch()
+            return end if stop is None else min(end, stop)
+
+    def wait_limit(self) -> float:
+        """The latest end of a rate-limit wait that starts now.
+
+        The run's stop; without run limits, what is left of ``RL_FALLBACK_MAX_WAIT_S``.
+        """
+        stop = self.stop_epoch()
+        if stop is not None:
+            return stop
+        return self.clock() + max(0.0, RL_FALLBACK_MAX_WAIT_S - self.state.rl_wait_seconds)
+
+    # ---------------------------------------------------------------- rate-limit waits
+
+    def _shift(self, seconds: float, after_wind_down: float = 0.0) -> None:
+        s = self.state
+        s.deadline_epoch += seconds
+        if s.rescue_deadline_epoch is not None:
+            s.rescue_deadline_epoch += seconds
+        s.rl_wait_seconds = max(0.0, s.rl_wait_seconds + seconds)
+        s.rl_wait_after_wind_down = max(0.0, s.rl_wait_after_wind_down + after_wind_down)
+
+    def _after_wind_down(self, start: float, end: float) -> float:
+        """Seconds of the interval [start, end] after the run's wind-down."""
+        if self.limits is None:
+            return 0.0
+        return max(0.0, end - max(start, self.limits.wind_down_epoch))
+
+    def pause(self, seconds: float) -> None:
+        """Pause the phase clocks by ``seconds`` of rate-limit time that just ended.
+
+        The run limits stay; only the grace window after the wind-down moves with them.
+        """
+        if not math.isfinite(seconds) or seconds <= 0:
+            return
+        with self.lock:
+            now = self.clock()
+            self._shift(seconds, self._after_wind_down(now - seconds, now))
+            self.save()
+
+    def begin_wait(self, until: float, code: str | None = None) -> float:
+        """Start a rate-limit wait that ends at ``until``; returns its planned seconds.
+
+        The phase clocks pause for the whole planned wait now; ``end_wait`` corrects
+        the pause to the time actually waited.
+        """
+        with self.lock:
+            s = self.state
+            now = self.clock()
+            if self._wait_started is not None:  # defensive: close a wait left open
+                self._end_wait_locked(now)
+            planned = max(0.0, until - now)
+            s.rl_waits += 1
+            s.rl_until_epoch = until
+            s.rl_wait_planned = planned
+            if code is not None:
+                s.rl_last_code = code
+            self._wait_started = now
+            self._wait_planned = planned
+            self._wait_planned_after = self._after_wind_down(now, now + planned)
+            self._shift(planned, self._wait_planned_after)
+            self.save()
+            return planned
+
+    def end_wait(self) -> float:
+        """End the wait in progress; returns the seconds actually waited."""
+        with self.lock:
+            waited = self._end_wait_locked(self.clock())
+            self.save()
+            return waited
+
+    def _end_wait_locked(self, now: float) -> float:
+        s = self.state
+        s.rl_until_epoch = None
+        s.rl_wait_planned = 0.0
+        if self._wait_started is None:
+            return 0.0
+        started = self._wait_started
+        waited = max(0.0, now - started)
+        after = self._after_wind_down(started, started + waited)
+        self._shift(waited - self._wait_planned, after - self._wait_planned_after)
+        self._wait_started = None
+        self._wait_planned = 0.0
+        self._wait_planned_after = 0.0
+        return waited
+
+    def note_temporary_failure(self, code: str | None) -> int:
+        """Count a model call that failed with a temporary error; returns the streak."""
+        with self.lock:
+            s = self.state
+            s.rl_streak += 1
+            s.rl_last_code = code
+            if code in ratelimit.TRANSIENT_CODES:
+                s.transient_streak += 1
+            self.save()
+            return s.rl_streak
+
+    def note_final_wait(self) -> None:
+        """Record that the one shortened retry wait before the run's stop was made."""
+        with self.lock:
+            self.state.rl_final_wait = True
+            self.save()
+
+    def forget_refused_call(self) -> float:
+        """Drop the pending call that the provider refused: not billed, not counted.
+
+        Returns the seconds the call was in flight (the SDK's own retries), capped.
+        """
+        with self.lock:
+            s = self.state
+            if not s.pending_call:
+                return 0.0
+            refused = 0.0
+            if s.pending_since is not None:
+                refused = min(MAX_REFUSED_SECONDS, max(0.0, self.clock() - s.pending_since))
+            s.pending_call = False
+            s.pending_since = None
+            s.llm_calls = max(0, s.llm_calls - 1)
+            s.refused_calls += 1
+            self.save()
+            return refused
+
+    def calls_attempted(self) -> int:
+        """Model calls admitted so far, refused ones included."""
+        return self.state.llm_calls + self.state.refused_calls
 
     # ---------------------------------------------------------------- state changes
 
@@ -237,6 +447,7 @@ class Meter:
         s.cost_usd += self.call_cost(tokens_in, OUTPUT_ALLOWANCE_TOKENS)
         s.estimated_calls += 1
         s.pending_call = False
+        s.pending_since = None
 
     # ---------------------------------------------------------------- gates
 
@@ -249,8 +460,8 @@ class Meter:
                 return "closed"
             if s.tool_calls >= b.max_tool_calls:
                 reason = "tool_calls"
-            elif self.clock() >= s.deadline_epoch:
-                reason = "deadline"
+            elif self.clock() >= self.tool_deadline():
+                reason = "deadline"  # the phase deadline or the run's wind-down
             elif (
                 s.cost_usd + (b.grace_llm_calls + 1) * self.projected_next_call_cost()
                 > b.max_cost_usd
@@ -274,12 +485,7 @@ class Meter:
                 if not s.tools_closed:
                     self.note_exhausted("iterations")
                 return "budget: llm calls"
-            limit = (
-                s.rescue_deadline_epoch
-                if s.rescue_deadline_epoch is not None
-                else s.deadline_epoch + b.grace_seconds
-            )
-            if now >= limit:
+            if now >= self.call_end():
                 self.note_exhausted("deadline")
                 self.save()
                 return "budget: time"
@@ -289,6 +495,7 @@ class Meter:
                 return "budget: cost"
             s.llm_calls += 1
             s.pending_call = True
+            s.pending_since = now
             self.save()
             return None
 
@@ -324,6 +531,9 @@ class Meter:
         with self.lock:
             s = self.state
             s.pending_call = False
+            s.pending_since = None
+            s.rl_streak = 0  # progress: the next temporary failure starts a new streak
+            s.transient_streak = 0
             s.finish_reasons = [*s.finish_reasons, finish_reason][-200:]
             s.assistant_chars += len(text) + extra_chars
             if usage is None:
@@ -358,6 +568,8 @@ class Meter:
             cost_usd=round(s.cost_usd, 6),
             seconds=round(s.seconds + self.elapsed_this_process(), 3),
             finish_reasons=[r[:20] for r in s.finish_reasons][-200:],
+            rate_limit_waits=s.rl_waits,
+            rate_limit_wait_seconds=round(max(0.0, s.rl_wait_seconds), 3),
         )
 
 
@@ -382,6 +594,42 @@ def log(message: str) -> None:
     print(f"msreview-agent: {message}", file=sys.stderr, flush=True)
 
 
+# Replaced in tests; the meter's clock decides the limits, this only waits.
+_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+
+
+async def wait_for_cooldown(m: Meter) -> float:
+    """Wait out the run's shared cooldown of the meter's model before a model call.
+
+    Another agent process of the run (or this one) was rate-limited on the model and
+    wrote when to try again. The wait ends at the meter's ``wait_limit`` at the latest
+    and is skipped when the gates would refuse the call anyway. It pauses the phase
+    clocks. Returns the seconds waited.
+    """
+    if m.cooldown_path is None:
+        return 0.0
+    now = m.clock()
+    until = ratelimit.read_cooldown(m.cooldown_path, m.state.model, now=now)
+    if until is None or until <= now + 1.0:
+        return 0.0
+    with m.lock:
+        s = m.state
+        end = min(until, m.wait_limit())
+        if end <= now + 1.0 or now >= m.call_end() or s.llm_calls >= s.llm_call_limit:
+            return 0.0
+        total = s.rl_wait_seconds
+        planned = m.begin_wait(end)
+    log(
+        f"waiting {planned:.0f}s for the shared {s.model} cooldown "
+        f"(total waited {format_wait(total)})"
+    )
+    try:
+        await _sleep(planned)
+    finally:
+        waited = m.end_wait()
+    return waited
+
+
 class BudgetHook(agents.Hook):
     """Enforces the job's budgets through the module-level ``METER`` (no fields: no state)."""
 
@@ -394,7 +642,9 @@ class BudgetHook(agents.Hook):
         return None
 
     async def pre_llm_call(self, ctx: Any, invocation: Any) -> Any:
-        reason = meter().llm_gate()
+        m = meter()
+        await wait_for_cooldown(m)  # the run's shared rate-limit cooldown first
+        reason = m.llm_gate()
         if reason is not None:
             log(f"model call refused ({reason})")
             return agents.skip(reason)

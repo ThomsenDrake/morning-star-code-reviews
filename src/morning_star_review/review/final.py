@@ -68,6 +68,11 @@ class RunInfo:
     tool_version: str
     reviewed_at: str  # ISO-8601 UTC, read by the activity (finalize has no clock)
     duration_seconds: float | None = None
+    # The run's wind-down had started when finalize ran (the run was finished early).
+    run_limit_reached: bool = False
+    deadline_minutes: int | None = None  # the run's overall time limit, when known
+    # Time the models' rate limits paused the agents, summed over every agent job.
+    rate_limit_wait_seconds: float = 0.0
 
 
 def _inside_repo(path: str) -> bool:
@@ -303,6 +308,9 @@ def finalize(
         structured=len(merge.explorer_models) if merge is not None else len(all_drafts),
         nothing_to_review=idle,
         unreviewed_code=unreviewed,
+        run_limit_reached=info.run_limit_reached,
+        deadline_minutes=info.deadline_minutes,
+        rate_limit_wait_seconds=info.rate_limit_wait_seconds,
     )
     verdict, reasons = assessment.verdict, assessment.reasons
     usage = collect_usage(all_explores, all_drafts, verify)
@@ -314,6 +322,9 @@ def finalize(
             "uncertain": sum(1 for s in sources if s.verify_status == "uncertain"),
             "refuted": len(refuted),
         }
+        if verify is not None and verify.state == "NotRun" and not verify.complete:
+            # Skipped (the run reached its time limit): not "nothing to verify".
+            verify_counts["not_run"] = 1
     details = render.RunDetails(
         execution_id=info.execution_id,
         run_label=info.run_label,

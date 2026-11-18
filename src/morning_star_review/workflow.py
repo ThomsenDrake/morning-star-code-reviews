@@ -42,6 +42,7 @@ with workflows.workflow.unsafe.imports_passed_through():
     from morning_star_review.activities import report_failure as _report_failure
     from morning_star_review.activities import structure as _structure
     from morning_star_review.activities import verify as _verify
+    from morning_star_review.core import runclock as _runclock
     from morning_star_review.core.contract import (
         ExploreInput,
         ExploreResult,
@@ -79,9 +80,10 @@ WF_DISPLAY_NAME = "Morning Star Code Review"
 WF_DESCRIPTION = (
     "Review one GitHub pull request; post as the user's GitHub App or return a Markdown report."
 )
-# Explorers and then the verifier may each run up to their 25-minute caps (plus grace,
-# rescue and formatter time); the driver's own deadline normally ends a run much sooner.
-EXECUTION_TIMEOUT = timedelta(minutes=90)
+# Above the longest allowed run deadline (rate-limit waits may make a run slow): the
+# driver's deadline and the run's wind-down (decided by the activities from the run
+# context, never by this code) end a run long before this backstop.
+EXECUTION_TIMEOUT: timedelta = _runclock.EXECUTION_TIMEOUT
 SEARCH_KEYS = ["pr_url", "repo"]
 
 # Failure types that mean "this run must not continue" (never tolerated in an ensemble).

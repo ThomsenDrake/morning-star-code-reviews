@@ -29,10 +29,11 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Model rate limits slow a review down; keep this about 20 above deadline-minutes.
+    timeout-minutes: 110
     steps:
       # Pin to the full commit SHA of the release you reviewed.
-      - uses: ThomsenDrake/morning-star-code-reviews@v0.1.0
+      - uses: ThomsenDrake/morning-star-code-reviews@v0.1.1
         with:
           mistral-api-key: ${{ secrets.MISTRAL_API_KEY }}
           client-id: ${{ vars.MSREVIEW_APP_CLIENT_ID }}
@@ -42,4 +43,4 @@ jobs:
           # verify: "true"
           # max-cost-usd: "10.00"
           # fail-on: never            # never | findings | high | critical
-          # deadline-minutes: "40"    # keep below timeout-minutes
+          # deadline-minutes: "90"   # keep about 20 below timeout-minutes

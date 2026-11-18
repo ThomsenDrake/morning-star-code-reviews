@@ -63,6 +63,13 @@ Budgets do not follow the model order:
 | `verifier_minutes` | 8 | 25 |
 | `inline_diff_chars`: diff text put directly in the prompt (repository file only) | 80,000 | n/a |
 
+The time budgets count working time only. While an agent waits on a model's rate
+limit, its clock is paused, so a rate-limited explorer still gets its full
+`explorer_minutes` of work. The whole run is limited by `deadline-minutes` (an Action
+input and a CLI flag, not a repository setting). With verification on, explorers stop
+earlier than without it, so that the verifier always gets its window: see
+[operations.md](operations.md#rate-limits-and-the-time-limit).
+
 ### On/off switches
 
 - `labels` and `suggestions` are on only when **both** the operator (Action input or
@@ -190,7 +197,7 @@ All inputs are strings. Boolean inputs accept `true`/`false` (also `1`/`0`, `yes
 |---|---|---|
 | `mistral-api-key` | (required) | Mistral API key of a workspace with Workflows access |
 | `client-id` | empty | GitHub App client ID. Without the App credentials the review is a report |
-| `app-private-key` | empty | GitHub App private key (PEM). Only the token step uses it |
+| `app-private-key` | empty | GitHub App private key (PEM). Only the two token steps use it |
 | `post` | `auto` | `auto` posts when possible. `never` always produces a report |
 | `preset` | empty | `best`, `balanced`, `single`, `fast` or `mistral`. Empty means the repository file's preset, else `best` |
 | `explorers` | empty | Comma-separated explorer models (an ensemble). Overrides the preset |
@@ -210,11 +217,11 @@ All inputs are strings. Boolean inputs accept `true`/`false` (also `1`/`0`, `yes
 | `labels` | `true` | Keep one verdict label on the PR. Needs Issues: write on the App; set `"false"` if the App does not have it |
 | `suggestions` | `true` | Add validated suggestion blocks to inline comments |
 | `fail-on` | `never` | `never`, `findings`, `high` or `critical`: fail the step (exit code 3) when open findings reach this level. Possible issues (not confirmed) do not count |
-| `deadline-minutes` | `40` | Overall time limit for the review, at most 55 (the App token that the run posts with expires after 60 minutes). Keep it below the job's `timeout-minutes` (45 in the examples) |
+| `deadline-minutes` | `90` | Overall time limit in minutes (20 to 300). The run winds down 15 minutes before it and still posts what it has. With verification, the verifier may start until then, and the explorers stop earlier (25.5 minutes before it) so that it can. Keep the job's `timeout-minutes` about 20 above it (110 in the examples). See [operations.md](operations.md#rate-limits-and-the-time-limit) |
 | `telemetry` | `false` | Turn on the Workflows and Agents SDK telemetry (see [operations.md](operations.md#telemetry)) |
 | `pr-url` | empty | The pull request to review. Empty means the PR that triggered the run |
 | `expected-head-sha` | empty | Review only this head commit, and skip if the PR has moved on. Empty means the event's head SHA, when the run reviews the triggering PR |
-| `remove-label` | empty | A label to remove after the run. The fork template passes `msreview: safe-to-review` |
+| `remove-label` | empty | A label to remove after the run (the publish step removes it). The fork template passes `msreview: safe-to-review` |
 
 ### Outputs
 
@@ -250,7 +257,7 @@ Each flag matches an Action input. The complete command reference is in [cli.md]
 | `--explorer-minutes N` | `explorer-minutes` | 15 |
 | `--verifier-max-tool-calls N` | `verifier-max-tool-calls` | 30 (25 for a flash model) |
 | `--verifier-minutes N` | `verifier-minutes` | 8 |
-| `--deadline-minutes N` | `deadline-minutes` | 45 (CLI), 40 (Action) |
+| `--deadline-minutes N` | `deadline-minutes` | 90 (allowed 20 to 300) |
 | `--expected-head-sha SHA` | `expected-head-sha` | |
 | `--fail-on LEVEL` | `fail-on` | user config `[defaults] fail_on`, else `never` |
 | `--no-labels` | `labels: "false"` | labels on |
@@ -290,6 +297,8 @@ its output is kept in memory only. It is never logged or written to disk.
 example, `MSREVIEW_PRESET`, `MSREVIEW_EXPLORERS`, `MSREVIEW_MAX_COST_USD`,
 `MSREVIEW_FAIL_ON`, `MSREVIEW_LABELS` and `MSREVIEW_REMOVE_LABEL`. It also sets the
 App token (`MSREVIEW_GITHUB_TOKEN`), the workflow token (`MSREVIEW_READ_TOKEN`), the
-PR URL and head SHA, and the runner paths. `msreview ci` removes both tokens from its
+PR URL and head SHA, and the runner paths. With App credentials, `msreview ci` gets a
+read-only App token, and the publish step (`msreview ci-publish`) gets the write token
+that is minted after the review. Both commands remove the tokens from their
 environment at start-up, so child processes never inherit them. You do not set these
 yourself. They are listed here so that you can read `action.yml` more easily.

@@ -4,7 +4,10 @@ Reads (GET and GraphQL queries) retry on 5xx and connection errors. Writes and
 mutations are never retried here on such errors, because GitHub may have applied
 them; the whole ``publish`` is idempotent and is retried by the activity instead.
 A rate-limited request was rejected by GitHub before it did anything, so every
-method waits and repeats it when the wait is short (<= 60 s).
+method waits and repeats it: a rate limit makes a run slower, it does not fail it.
+The waits for one request may add up to ``MAX_RATE_WAIT_TOTAL_S``, and never end
+after ``wait_until_epoch`` (in a run: shortly before the run's hard deadline). A wait
+past either bound raises ``GitHubRateLimited`` at once.
 
 The token is only ever placed in the ``Authorization`` header. Errors name the
 method and path, never headers.
@@ -41,8 +44,9 @@ log = logging.getLogger(__name__)
 
 API_BASE = "https://api.github.com"
 USER_AGENT = f"morning-star-code-reviews/{__version__}"
-MAX_RATE_WAIT_S = 60.0
-MAX_RATE_WAITS = 3  # short rate-limit waits per request before giving up
+MAX_RATE_WAIT_S = 60.0  # assumed wait for an exhausted limit without a reset time
+MAX_RATE_WAIT_TOTAL_S = 900.0  # rate-limit waits of one request, in total
+MIN_RATE_WAIT_S = 1.0  # a "Retry-After: 0" still waits (and counts) this long
 READ_RETRY_DELAYS_S = (1.0, 4.0, 10.0)  # 3 retries over ~15 s
 _TRANSIENT_4XX = frozenset({408, 409, 425})
 _SECONDARY = re.compile(r"secondary rate limit|abuse detection", re.IGNORECASE)
@@ -174,6 +178,19 @@ def rate_limit_wait(resp: httpx.Response, now: float | None = None) -> float | N
     return None
 
 
+def _run_wait_until() -> float | None:
+    """``RunClock.github_wait_until()`` of the current run context, if it has a clock."""
+    try:
+        # Lazy: the client is also used outside a run (CLI helpers, ci-publish).
+        from morning_star_review.core import runclock
+        from morning_star_review.core.runctx import run_context
+
+        clock = runclock.from_context(run_context())
+    except Exception:  # no run context in this process
+        return None
+    return clock.github_wait_until() if clock is not None else None
+
+
 _NEXT_LINK = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
 
 
@@ -194,8 +211,16 @@ class GitHubHttp:
         transport: httpx.AsyncBaseTransport | None = None,
         sleep: Sleep | None = None,
         timeout_s: float = 30.0,
+        wait_until_epoch: float | None = None,
     ) -> None:
+        """``wait_until_epoch``: no rate-limit wait ends after this wall-clock time.
+
+        ``None`` takes it from the run context when one with a run clock is set
+        (``RunClock.github_wait_until``), else rate-limit waits are only bounded by
+        ``MAX_RATE_WAIT_TOTAL_S`` per request.
+        """
         self._token = token
+        self._wait_until = wait_until_epoch if wait_until_epoch is not None else _run_wait_until()
         self._base = base_url.rstrip("/")
         self._host = urlsplit(self._base).netloc
         self._scheme = urlsplit(self._base).scheme
@@ -258,7 +283,7 @@ class GitHubHttp:
         self._check_url(url)
         label = f"{method} {urlsplit(url).path or url}"
         attempt = 0
-        rate_waits = 0
+        waited = 0.0
         while True:
             try:
                 resp = await self._client.request(method, url, params=params, json=body)
@@ -270,13 +295,11 @@ class GitHubHttp:
                 raise GitHubTransient(f"{label}: {type(exc).__name__}") from None
             wait = rate_limit_wait(resp)
             if wait is not None:
-                if wait > MAX_RATE_WAIT_S or rate_waits >= MAX_RATE_WAITS:
-                    raise GitHubRateLimited(
-                        f"{label}: rate limited for {wait:.0f}s", retry_after_s=wait
-                    )
+                wait = max(wait, MIN_RATE_WAIT_S)
+                self._check_rate_wait(label, wait, waited)
                 log.warning("GitHub rate limit on %s; waiting %.0fs", label, wait)
                 await self._sleep(wait)
-                rate_waits += 1
+                waited += wait
                 continue
             status = resp.status_code
             if status >= 500 or status in _TRANSIENT_4XX:
@@ -297,6 +320,16 @@ class GitHubHttp:
             if 300 <= status < 400:
                 raise GitHubLasting(f"{label}: unexpected redirect {status}", status=status)
             return resp
+
+    def _check_rate_wait(self, label: str, wait: float, waited: float) -> None:
+        """Raise ``GitHubRateLimited`` when waiting ``wait`` more seconds is not allowed."""
+        if waited + wait > MAX_RATE_WAIT_TOTAL_S:
+            raise GitHubRateLimited(f"{label}: rate limited for {wait:.0f}s", retry_after_s=wait)
+        if self._wait_until is not None and time.time() + wait > self._wait_until:
+            raise GitHubRateLimited(
+                f"{label}: rate limited for {wait:.0f}s, past the run's time limit",
+                retry_after_s=wait,
+            )
 
     async def get_json(
         self, path: str, params: dict[str, Any] | None = None, *, allow_404: bool = False

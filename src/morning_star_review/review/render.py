@@ -29,6 +29,7 @@ from morning_star_review.core.contract import (
     Usage,
     Verdict,
 )
+from morning_star_review.core.runclock import format_wait
 from morning_star_review.core.sanitize import (
     code_span,
     sanitize_inline,
@@ -460,24 +461,39 @@ def _usage_order(d: RunDetails, key: str) -> tuple[int, int, str]:
     return _ROLE_ORDER.get(role, 9), position, key
 
 
+def _rate_limited(d: RunDetails) -> bool:
+    """Any model was rate-limited: then the run details show the waits."""
+    return any(u.rate_limit_wait_seconds > 0 for u in d.usage.values())
+
+
+def _rate_limit_wait(u: Usage) -> str:
+    """``7m 10s (5x)``: time the agent waited on rate limits, and how many waits."""
+    if u.rate_limit_wait_seconds <= 0:
+        return "-"
+    count = f" ({u.rate_limit_waits}x)" if u.rate_limit_waits else ""
+    return format_wait(u.rate_limit_wait_seconds) + count
+
+
 def _usage_rows(d: RunDetails) -> list[list[str]]:
     rows: list[list[str]] = []
+    waits = _rate_limited(d)
     for key in sorted(d.usage, key=lambda k: _usage_order(d, k)):
         role, _, model = key.partition(":")
         u = d.usage[key]
-        rows.append(
-            [
-                _cell(role, 40),
-                _cell(model or u.model, 120),
-                _cell(_effort(d.roles, role, model or u.model) or "-", 20),
-                str(u.llm_calls),
-                str(u.tool_calls),
-                f"{u.input_tokens:,} ({u.cached_input_tokens:,})",
-                f"{u.output_tokens:,} ({u.reasoning_tokens:,})",
-                f"${u.cost_usd:.2f}",
-                f"{u.seconds:.0f} s",
-            ]
-        )
+        row = [
+            _cell(role, 40),
+            _cell(model or u.model, 120),
+            _cell(_effort(d.roles, role, model or u.model) or "-", 20),
+            str(u.llm_calls),
+            str(u.tool_calls),
+            f"{u.input_tokens:,} ({u.cached_input_tokens:,})",
+            f"{u.output_tokens:,} ({u.reasoning_tokens:,})",
+            f"${u.cost_usd:.2f}",
+            f"{u.seconds:.0f} s",
+        ]
+        if waits:
+            row.append(_rate_limit_wait(u))
+        rows.append(row)
     return rows
 
 
@@ -503,14 +519,22 @@ def _details_section(d: RunDetails) -> str:
             "Est. cost",
             "Time",
         ]
+        if _rate_limited(d):
+            header.append("Rate-limit wait")
         lines.append(_table(header, rows))
     total = f"Estimated cost: ${d.cost_usd:.2f} (list prices)"
     if d.duration_seconds is not None:
         total += f" · duration {d.duration_seconds:.0f} s"
+    waited = sum(u.rate_limit_wait_seconds for u in d.usage.values())
+    if waited > 0:
+        total += f" · rate-limit waits {format_wait(waited)}"
     lines.append(total)
     if d.merge_note:
         lines.append(_cell(d.merge_note, 300))
-    if d.verify_counts:
+    if d.verify_counts and d.verify_counts.get("not_run"):
+        # Skipped (the run reached its time limit): not "nothing to verify".
+        lines.append(f"Verifier: did not run; {d.verify_counts.get('uncertain', 0)} not confirmed")
+    elif d.verify_counts:
         vc = d.verify_counts
         lines.append(
             f"Verifier: {vc.get('confirmed', 0)} confirmed, "

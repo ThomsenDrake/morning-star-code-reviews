@@ -4,10 +4,15 @@ Parse first. Only when the parser loses something (unparsed blocks, fewer findin
 than FINDING markers, or prose findings without markers) does the formatter agent run
 (phase ``format``, no tools, strict schema). The formatter is best effort: when it
 fails, the parsed findings are kept and the draft is marked ``parser_lossy``.
+
+Rate limits only slow the formatter down: its clocks pause while it waits, and the
+launcher extends its allowance by the same time, up to the run's limits
+(``RunClock.limits("structure")``). Too close to them, it is not started at all.
 """
 
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -28,10 +33,12 @@ from morning_star_review.activities.common import (
     cost_share,
     job_dir_name,
     launch_timeout,
+    meter_usage,
     require_dir,
     usage_for,
 )
 from morning_star_review.activities.finalize import keep_for_finalize
+from morning_star_review.core import runclock
 from morning_star_review.core.contract import (
     AgentBudgets,
     AgentRunResult,
@@ -42,6 +49,7 @@ from morning_star_review.core.contract import (
     Prepared,
     PriorStatus,
     ReviewDraft,
+    RunLimits,
     StructureInput,
     Usage,
 )
@@ -70,7 +78,9 @@ __all__ = [
     "structure",
 ]
 
-STRUCTURE_TIMEOUT = timedelta(minutes=8)
+# Above any allowed run deadline (rate-limit waits may stretch a formatter run); the
+# 60 s heartbeat timeout is the liveness check, the run's limits end the waiting.
+STRUCTURE_TIMEOUT: timedelta = runclock.ACTIVITY_CEILING
 FORMAT_SECONDS = 240  # the runner's formatter turn timeout
 MIN_FORMAT_SECONDS = 60.0  # below this, a formatter run cannot finish: skip it
 NOTES_TXT = "notes.txt"
@@ -131,12 +141,19 @@ async def run_formatter(
     target: Literal["review", "verify"],
     candidates: list[dict[str, Any]] | None = None,
     time_left: float | None = None,
+    limits: RunLimits | None = None,
 ) -> FormatterRun:
     """Run the formatter agent on ``notes``; never raises for agent failures.
 
-    ``time_left`` is what remains of the calling activity's own limit (seconds); the
-    formatter is stopped before it, or not started when too little remains.
+    ``limits`` are the run's limits for this formatter (``RunClock.limits``): it is
+    not started when less than ``MIN_FORMAT_SECONDS`` remain before ``stop_epoch``, and
+    the agent process is stopped shortly after it. ``time_left`` (seconds left in the
+    calling activity) is the fallback for runs without a run clock.
     """
+    if limits is not None and limits.stop_epoch - time.time() < MIN_FORMAT_SECONDS:
+        return FormatterRun(
+            None, None, "no time left before the run's time limit for the formatter"
+        )
     if time_left is not None and time_left < MIN_FORMAT_SECONDS:
         return FormatterRun(None, None, "no time left in the activity for the formatter")
     job_dir.mkdir(mode=0o700, exist_ok=True)
@@ -157,15 +174,29 @@ async def run_formatter(
         budgets=_format_budgets(prep),
         changed_files=[],
         format_target=target,
+        run_limits=limits,
+        # The job directory sits in the run directory, next to the shared cooldown files.
+        cooldown_path=runclock.cooldown_path(job_dir.parent, role.model) if limits else None,
     )
     write_model(job_dir / JOB_JSON, job)
-    timeout = launch_timeout(job.budgets, STRUCTURE_TIMEOUT)
+    timeout = launch_timeout(job.budgets)
     if time_left is not None:
         timeout = min(timeout, time_left)
     try:
-        res: AgentRunResult = await run_agent("format", job_dir, ctx, timeout)
+        res: AgentRunResult = await run_agent(
+            "format",
+            job_dir,
+            ctx,
+            timeout,
+            latest_epoch=limits.stop_epoch if limits is not None else None,
+            model=role.model,
+        )
     except (AgentCrashed, AgentTimedOut, AgentJobInvalid) as exc:
-        return FormatterRun(None, None, redact(f"{type(exc).__name__}: {exc}", ctx.secrets()))
+        # The meter still counts the calls made and the rate-limit time waited.
+        metered = meter_usage(job_dir, role.model)
+        if metered is not None and not (metered.llm_calls or metered.rate_limit_waits):
+            metered = None
+        return FormatterRun(None, metered, redact(f"{type(exc).__name__}: {exc}", ctx.secrets()))
     usage = usage_for(res.usage, role.model)
     if res.state != "Completed" or res.draft is None:
         error = res.error or f"formatter state {res.state}"
@@ -346,6 +377,7 @@ async def structure(inp: StructureInput) -> ReviewDraft:
         fmt: FormatterRun | None = None
         if needs_formatter(notes, parsed):
             run_dir = require_dir(inp.prep.job_root)
+            clock = runclock.from_context(ctx)
             fmt = await run_formatter(
                 ctx,
                 inp.prep,
@@ -355,6 +387,11 @@ async def structure(inp: StructureInput) -> ReviewDraft:
                 job_dir=run_dir / job_dir_name("format", model),
                 notes=notes,
                 target="review",
+                limits=(
+                    clock.limits("structure", verify=inp.prep.roles.verify_enabled)
+                    if clock is not None
+                    else None
+                ),
             )
         draft = build_draft(parsed, notes, fmt, model)
         fitted = fit_draft(draft, draft_budget(len(inp.prep.roles.explorers)))
@@ -363,5 +400,10 @@ async def structure(inp: StructureInput) -> ReviewDraft:
         return sealed
 
 
+_SEAL_CHARS = 64  # hex HMAC-SHA256 added by ``seal`` after fitting
+
+
 def _size(model: ReviewDraft) -> int:
-    return len(model.model_dump_json().encode("utf-8", "surrogatepass"))
+    """JSON bytes of ``model`` once sealed (an unsealed draft gets its seal later)."""
+    size = len(model.model_dump_json().encode("utf-8", "surrogatepass"))
+    return size + max(0, _SEAL_CHARS - len(model.seal))

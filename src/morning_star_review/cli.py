@@ -1,7 +1,8 @@
 """Command-line interface ``msreview`` (argparse; heavy modules are imported lazily).
 
-Commands: ``review <PR URL>``, ``ci`` (used by the Action), ``doctor``, ``setup``,
-``app-check <owner>/<repo>`` and the hidden ``_mint`` (the token-minting child).
+Commands: ``review <PR URL>``, ``ci`` and ``ci-publish`` (used by the Action),
+``doctor``, ``setup``, ``app-check <owner>/<repo>`` and the hidden ``_mint`` (the
+token-minting child).
 """
 
 from __future__ import annotations
@@ -15,11 +16,13 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from morning_star_review._version import __version__
+from morning_star_review.core import runclock
 
 if TYPE_CHECKING:
     from morning_star_review.core.contract import OperatorPolicy, RunOverrides
@@ -31,12 +34,16 @@ __all__ = ["build_parser", "main"]
 PRESETS = ("best", "balanced", "single", "fast", "mistral")
 EFFORTS = ("default", "low", "medium", "high", "max")
 FAIL_ON = ("never", "findings", "high", "critical")
-CLI_DEADLINE_MINUTES = 45
-CI_DEADLINE_MINUTES = 40
-# A GitHub App installation token is minted once, before the run, and expires after 60
-# minutes; publish (and report_failure) must still be able to use it (SEC-CI-7).
-MAX_DEADLINE_MINUTES = 55
+# Rate limits make a run slower, not failed: the deadline is the run's overall ceiling
+# (it winds down 15 minutes before it). The GitHub App token no longer bounds it: the
+# CLI re-mints it before posting, and the Action mints its write token after the review.
+CLI_DEADLINE_MINUTES = runclock.DEFAULT_DEADLINE_MINUTES
+CI_DEADLINE_MINUTES = runclock.DEFAULT_DEADLINE_MINUTES
+MIN_DEADLINE_MINUTES = runclock.MIN_DEADLINE_MINUTES
+MAX_DEADLINE_MINUTES = runclock.MAX_DEADLINE_MINUTES
 DEFAULT_OUT = "msreview-reports"
+# Hidden test knob: start the wind-down this many minutes after the start.
+ENV_WIND_DOWN = "MSREVIEW_WIND_DOWN_AFTER_MINUTES"
 
 
 class UsageError(Exception):
@@ -70,7 +77,13 @@ def _add_review_options(p: argparse.ArgumentParser) -> None:
     p.add_argument("--explorer-minutes", type=int, default=None)
     p.add_argument("--verifier-max-tool-calls", type=int, default=None)
     p.add_argument("--verifier-minutes", type=int, default=None)
-    p.add_argument("--deadline-minutes", type=int, default=CLI_DEADLINE_MINUTES)
+    p.add_argument(
+        "--deadline-minutes",
+        type=int,
+        default=CLI_DEADLINE_MINUTES,
+        help=f"overall time limit ({MIN_DEADLINE_MINUTES}-{MAX_DEADLINE_MINUTES}; "
+        "the run winds down 15 minutes before it and still reports)",
+    )
     p.add_argument("--expected-head-sha", default=None, help="skip if the PR head moved")
     p.add_argument("--out", default=DEFAULT_OUT, help="report directory")
     p.add_argument("--json", action="store_true", help="print the outcome as JSON")
@@ -89,6 +102,7 @@ def _add_review_options(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-suggestions", action="store_true", help="no suggestion blocks")
     p.add_argument("--keep-run-dir", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--agent-python", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--wind-down-after-minutes", type=int, default=None, help=argparse.SUPPRESS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -101,6 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     review = sub.add_parser("review", help="review one pull request")
     _add_review_options(review)
     sub.add_parser("ci", help="run inside the GitHub Action (reads MSREVIEW_* variables)")
+    sub.add_parser("ci-publish", help="the Action's publish step: post the review step's plan")
     doctor = sub.add_parser("doctor", help="check the key, Workflows access and the setup")
     doctor.add_argument("--models", action="store_true", help="one tiny call per model")
     doctor.add_argument("--deployments", action="store_true", help="list msreview deployments")
@@ -156,6 +171,24 @@ def _opt_float(value: str, name: str) -> float | None:
 
 def _opt_str(value: str | None) -> str | None:
     return value.strip() if value and value.strip() else None
+
+
+def check_deadline(minutes: int, name: str = "deadline-minutes") -> int:
+    """``minutes`` when it is an allowed deadline, else ``UsageError``."""
+    if not MIN_DEADLINE_MINUTES <= minutes <= MAX_DEADLINE_MINUTES:
+        raise UsageError(
+            f"{name} must be between {MIN_DEADLINE_MINUTES} and {MAX_DEADLINE_MINUTES}"
+        )
+    return minutes
+
+
+def wind_down_after_s(minutes: int | None, deadline_minutes: int, name: str) -> float | None:
+    """The hidden wind-down knob in seconds (1 <= minutes < deadline), or None."""
+    if minutes is None:
+        return None
+    if not 1 <= minutes < deadline_minutes:
+        raise UsageError(f"{name} must be at least 1 and below the deadline ({deadline_minutes})")
+    return minutes * 60.0
 
 
 def build_overrides(**values: Any) -> RunOverrides:
@@ -317,14 +350,38 @@ async def _mint_secrets(
     owner, repo = repo_full.split("/", 1)
     if post == "never":
         return DriverSecrets(mistral_api_key=key, read_token=read_token)
+    minted = time.time()  # the token's life counts from before the mint (the safe side)
     res = await mint_via_child(repo_full)
     reason = mint_reason(res, owner, repo)
     if reason is not None:
         print(f"msreview: report mode: {reason}", file=sys.stderr, flush=True)
         return DriverSecrets(mistral_api_key=key, read_token=read_token, cannot_post_reason=reason)
     print(f"msreview: posting as {res.bot_login}", file=sys.stderr, flush=True)
+
+    async def refresh() -> str | None:
+        """Mint a new installation token (the key stays in the mint child)."""
+        again = await mint_via_child(repo_full)
+        problem = mint_reason(again, owner, repo)
+        if problem is None and again.bot_login != res.bot_login:
+            problem = f"the App changed from {res.bot_login} to {again.bot_login}"
+        if problem is not None or not again.token:
+            note = problem or "no token"
+            print(
+                f"msreview: could not refresh the GitHub App token: {note}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+        print("msreview: refreshed the GitHub App token", file=sys.stderr, flush=True)
+        return again.token
+
     return DriverSecrets(
-        mistral_api_key=key, github_token=res.token, read_token=read_token, bot_login=res.bot_login
+        mistral_api_key=key,
+        github_token=res.token,
+        read_token=read_token,
+        bot_login=res.bot_login,
+        github_token_refresh=refresh,
+        github_token_minted_epoch=minted,
     )
 
 
@@ -379,10 +436,14 @@ def cmd_review(args: argparse.Namespace, env: Mapping[str, str] | None = None) -
         default_preset=settings.preset,
     )
     agent_python = resolve_agent_python(args.agent_python, src, settings.agent_python)
-    if not 0 < args.deadline_minutes <= MAX_DEADLINE_MINUTES:
-        raise UsageError(
-            f"--deadline-minutes must be between 1 and {MAX_DEADLINE_MINUTES} (the GitHub "
-            "App token the run posts with expires after 60 minutes)"
+    deadline = check_deadline(args.deadline_minutes, "--deadline-minutes")
+    if args.wind_down_after_minutes is not None:
+        wind_down = wind_down_after_s(
+            args.wind_down_after_minutes, deadline, "--wind-down-after-minutes"
+        )
+    else:
+        wind_down = wind_down_after_s(
+            _opt_int(src.get(ENV_WIND_DOWN, ""), ENV_WIND_DOWN), deadline, ENV_WIND_DOWN
         )
     key = load_mistral_key(src, settings)
     read_token = read_token_from(args.read_token or settings.read_token, src)
@@ -398,13 +459,14 @@ def cmd_review(args: argparse.Namespace, env: Mapping[str, str] | None = None) -
         overrides=overrides,
         policy=policy,
         run_label=f"cli:{secrets.token_hex(4)}",
-        deadline_s=args.deadline_minutes * 60,
+        deadline_s=deadline * 60,
         out_dir=out_dir,
         fail_on=fail_on,  # type: ignore[arg-type]
         verbose=args.verbose,
         telemetry=args.telemetry,
         agent_python=agent_python,
         keep_run_dir=args.keep_run_dir,
+        wind_down_after_s=wind_down,
     )
 
     async def go() -> tuple[Any, int]:
@@ -443,12 +505,12 @@ def _ci_settings(env: Mapping[str, str]) -> dict[str, Any]:
     pr_url = get("PR_URL").strip()
     if not pr_url:
         raise UsageError("MSREVIEW_PR_URL is empty; run the Action on pull_request events")
-    deadline = _opt_int(get("DEADLINE_MINUTES"), "deadline-minutes") or CI_DEADLINE_MINUTES
-    if not 0 < deadline <= MAX_DEADLINE_MINUTES:
-        raise UsageError(
-            f"deadline-minutes must be between 1 and {MAX_DEADLINE_MINUTES} (the GitHub "
-            "App token the run posts with expires after 60 minutes)"
-        )
+    deadline = _opt_int(get("DEADLINE_MINUTES"), "deadline-minutes")
+    deadline = check_deadline(CI_DEADLINE_MINUTES if deadline is None else deadline)
+    wind_down = wind_down_after_s(
+        _opt_int(get("WIND_DOWN_AFTER_MINUTES"), ENV_WIND_DOWN), deadline, ENV_WIND_DOWN
+    )
+    defer_dir = _opt_str(get("DEFER_PUBLISH_DIR"))
     return {
         "post": post,
         "fail_on": fail_on,
@@ -456,6 +518,9 @@ def _ci_settings(env: Mapping[str, str]) -> dict[str, Any]:
         "head_sha": _opt_str(get("HEAD_SHA")),
         "run_label": _opt_str(get("RUN_LABEL")) or f"gha:{secrets.token_hex(4)}",
         "deadline_s": deadline * 60,
+        "wind_down_after_s": wind_down,
+        # Deferred publish (the Action with App credentials): post in the next step.
+        "defer_publish_dir": Path(defer_dir).resolve() if defer_dir and post != "never" else None,
         "telemetry": bool(_opt_bool(get("TELEMETRY"), "telemetry")),
         "verbose": bool(_opt_bool(get("VERBOSE"), "verbose")),
         "labels": _opt_bool(get("LABELS"), "labels") is not False,
@@ -526,6 +591,20 @@ async def remove_pr_label(token: str, pr_url: str, name: str) -> str:
     return f"removed the label {name!r}" if removed else f"the label {name!r} was not set"
 
 
+def _ci_report_dir(value: str | None, env: Mapping[str, str]) -> Path:
+    """``MSREVIEW_REPORT_DIR``, else ``$RUNNER_TEMP/msreview/report``, else ./msreview-reports."""
+    runner_temp = env.get("RUNNER_TEMP", "").strip() or None
+    default = str(Path(runner_temp) / "msreview" / "report") if runner_temp else DEFAULT_OUT
+    return Path(value or default).resolve()
+
+
+def _plan_exported(defer_dir: Path) -> bool:
+    from morning_star_review.deferred import PUBLISH_PLAN_JSON
+
+    path = defer_dir / PUBLISH_PLAN_JSON
+    return path.is_file() and not path.is_symlink()
+
+
 def cmd_ci(env: dict[str, str] | os._Environ[str] | None = None) -> int:
     """``msreview ci``: the Action's entry point (environment contract of DESIGN 10.2)."""
     from morning_star_review import driver, outputs
@@ -550,13 +629,15 @@ def cmd_ci(env: dict[str, str] | os._Environ[str] | None = None) -> int:
             # the Action, whose key comes from its `mistral-api-key` input.
             raise SettingsError(driver.CI_NO_KEY) from None
         sec = ci_secrets(src, key, s["post"], s["app_slug"], s["token_step"])
+        defer_dir: Path | None = s["defer_publish_dir"]
         # The token is needed again after the run (label removal); keep it in memory only.
-        write_token = sec.github_token
-        runner_temp = src.get("RUNNER_TEMP", "").strip() or None
-        report_dir = Path(
-            s["report_dir"]
-            or (str(Path(runner_temp) / "msreview" / "report") if runner_temp else DEFAULT_OUT)
-        ).resolve()
+        # Deferred: it is read-only, and `msreview ci-publish` removes the label.
+        write_token = sec.github_token if defer_dir is None else None
+        if defer_dir is not None:
+            from morning_star_review import deferred
+
+            deferred.remove_plan(defer_dir)  # a plan of an earlier run is never posted
+        report_dir = _ci_report_dir(s["report_dir"], src)
         run_root = Path(s["run_root"]).resolve() if s["run_root"] else None
         driver.prepare_process_env(telemetry=s["telemetry"], verbose=s["verbose"], env=src)
         overrides = build_overrides(**s["overrides"])
@@ -586,14 +667,19 @@ def cmd_ci(env: dict[str, str] | os._Environ[str] | None = None) -> int:
             agent_python=agent_python,
             run_root=run_root,
             stop_commands=stop,
+            wind_down_after_s=s["wind_down_after_s"],
+            defer_publish_dir=defer_dir,
         )
         try:
-            _outcome, code = asyncio.run(driver.run_review(cfg, sec))
+            outcome, code = asyncio.run(driver.run_review(cfg, sec))
         finally:
             # The fork template's approval label goes away after every attempt.
             if s["remove_label"] and write_token:
                 note = asyncio.run(remove_pr_label(write_token, s["pr_url"], s["remove_label"]))
                 print(f"msreview: {note}", file=sys.stderr, flush=True)
+        if defer_dir is not None and _plan_exported(defer_dir):
+            # The publish step posts and applies fail-on; this step only fails a failed run.
+            return driver.EXIT_FAILED if outcome.status == "failed" else driver.EXIT_OK
         return int(code)
     except (UsageError, MsreviewError) as exc:
         # Exit 2 before or around the run: tell Actions why (once; run_review may have).
@@ -606,6 +692,57 @@ def cmd_ci(env: dict[str, str] | os._Environ[str] | None = None) -> int:
         )
         raise
     finally:
+        stop.resume()
+
+
+def cmd_ci_publish(env: dict[str, str] | os._Environ[str] | None = None) -> int:
+    """``msreview ci-publish``: the Action's publish step (deferred publish).
+
+    Posts the plan of the review step (``MSREVIEW_PUBLISH_PLAN``) with the write token
+    minted after the review, writes the report files, outputs, step summary and
+    annotation, removes the fork approval label and exits with the ``fail-on`` code.
+    Without a plan it only removes the label and exits 0: the review step's own exit
+    code already marks the job.
+    """
+    from morning_star_review import deferred, outputs
+    from morning_star_review.core.errors import MsreviewError
+    from morning_star_review.driver import exit_code_for
+
+    src = os.environ if env is None else env
+    token = _opt_str(src.pop("MSREVIEW_GITHUB_TOKEN", None))
+    src.pop("MSREVIEW_READ_TOKEN", None)
+    pr_url = src.get("MSREVIEW_PR_URL", "").strip()
+    remove = _opt_str(src.get("MSREVIEW_REMOVE_LABEL"))
+    app_slug = _opt_str(src.get("MSREVIEW_APP_SLUG"))
+    token_step = _opt_str(src.get("MSREVIEW_TOKEN_STEP")) or "skipped"
+    plan_path = _opt_str(src.get("MSREVIEW_PUBLISH_PLAN"))
+    report_dir = _ci_report_dir(_opt_str(src.get("MSREVIEW_REPORT_DIR")), src)
+    fail_on = src.get("MSREVIEW_FAIL_ON", "").strip() or "never"
+    stop = outputs.StopCommands()
+    stop.start()
+    try:
+        if fail_on not in FAIL_ON:
+            raise UsageError(f"fail-on must be one of {', '.join(FAIL_ON)}")
+        if plan_path is None:
+            print("msreview: no publish plan; nothing to post", file=sys.stderr, flush=True)
+            return 0
+        try:
+            plan = deferred.load_plan(plan_path)
+        except (OSError, ValueError, MsreviewError) as exc:
+            raise UsageError(f"the publish plan could not be read ({type(exc).__name__})") from None
+        plan_dir = Path(plan_path).resolve().parent
+        outcome = asyncio.run(
+            deferred.publish_plan(plan, token, app_slug, token_step, plan_dir=plan_dir)
+        )
+        outputs.emit_published(
+            outcome, report_dir, src, run_dir=plan_dir / plan.execution_id, stop=stop
+        )
+        return exit_code_for(outcome, fail_on)
+    finally:
+        # The fork template's approval label goes away after every attempt.
+        if remove and token and pr_url:
+            note = asyncio.run(remove_pr_label(token, pr_url, remove))
+            print(f"msreview: {note}", file=sys.stderr, flush=True)
         stop.resume()
 
 
@@ -651,6 +788,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_review(args)
         if args.command == "ci":
             return cmd_ci()
+        if args.command == "ci-publish":
+            return cmd_ci_publish()
         if args.command == "doctor":
             from morning_star_review.doctor import run_doctor
 

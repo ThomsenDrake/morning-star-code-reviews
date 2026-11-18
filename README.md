@@ -6,7 +6,7 @@ as **your own GitHub App**, or it writes a report when it cannot post.
 
 - Command: `msreview` (Python package `morning_star_review`, distribution `morning-star-code-reviews`)
 - Runs as: a GitHub Action (composite) or a local CLI
-- Status: 0.1.0, alpha. See [Limitations](#limitations).
+- Status: 0.1.1, alpha. See [Limitations](#limitations).
 - License: Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). The agent
   environment installs a proprietary component; see [Limitations](#limitations).
 
@@ -83,7 +83,7 @@ add labels too. Read [docs/security.md](docs/security.md) before you use it.
 Requires Python 3.12 to 3.14, `git` and [uv](https://docs.astral.sh/uv/), on macOS or Linux.
 
 ```bash
-uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews
+uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.1.1
 msreview setup                 # builds the agent environment (pinned, hash-checked)
 export MISTRAL_API_KEY=...     # or use a key command, see below
 msreview doctor                # checks the key, Workflows access and the installation
@@ -141,6 +141,15 @@ All commands and flags are in [docs/cli.md](docs/cli.md).
 A formatter model (`mistral-large-4`, low effort; `zai-glm-5-3-flash` for `fast`) runs
 only when an agent's notes cannot be parsed. You can override the explorers, verifier
 and efforts for each run. The default per-run cost cap is **$10.00**.
+
+**Rate limits make a review slower, not fail.** When a model answers with a rate limit
+or a temporary error, the agent waits (15 s at first, up to 3 minutes per wait) and
+tries again, and the wait does not count against its own time budget. The whole run
+has one time limit, `deadline-minutes` (default 90). 15 minutes before it, the run
+winds down and still posts what it has, with the verdict `incomplete` (or `findings`)
+and the reason.
+Set the job's `timeout-minutes` about 20 above the deadline (the example workflow uses
+110). See [docs/operations.md](docs/operations.md#rate-limits-and-the-time-limit).
 
 **Measured results** (2026-11-17, pre-release build): 60 report-mode runs on our own
 planted-bug fixture project. There were four cases (planted bugs, clean refactor,

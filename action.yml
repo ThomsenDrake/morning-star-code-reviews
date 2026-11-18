@@ -16,7 +16,9 @@ inputs:
     required: false
     default: ""
   app-private-key:
-    description: GitHub App private key (PEM). Used only by the token step.
+    description: >-
+      GitHub App private key (PEM). Used only by the two token steps: a read-only token
+      for the review, and a write token minted after it for posting.
     required: false
     default: ""
   post:
@@ -100,9 +102,11 @@ inputs:
     required: false
     default: never
   deadline-minutes:
-    description: Driver deadline (at most 55; the App token expires after 60 minutes); keep it below the job's timeout-minutes.
+    description: >-
+      Overall time limit in minutes (20-300). The run winds down 15 minutes before it and
+      still posts. Keep timeout-minutes about 20 above it.
     required: false
-    default: "40"
+    default: "90"
   telemetry:
     description: "true | false: enable Workflows / Agents SDK telemetry."
     required: false
@@ -126,24 +130,27 @@ inputs:
 outputs:
   status:
     description: "posted | report | skipped | superseded | failed"
-    value: ${{ steps.review.outputs.status }}
+    value: ${{ steps.publish.outputs.status || steps.review.outputs.status }}
   verdict:
     description: "clean | findings | incomplete"
-    value: ${{ steps.review.outputs.verdict }}
+    value: ${{ steps.publish.outputs.verdict || steps.review.outputs.verdict }}
   findings:
     description: Number of open findings (possible issues, which the verifier could not confirm, do not count).
-    value: ${{ steps.review.outputs.findings }}
+    value: ${{ steps.publish.outputs.findings || steps.review.outputs.findings }}
   execution-id:
     description: The Mistral Workflows execution id.
-    value: ${{ steps.review.outputs.execution-id }}
+    value: ${{ steps.publish.outputs.execution-id || steps.review.outputs.execution-id }}
   report-path:
     description: Path of report.md on the runner.
-    value: ${{ steps.review.outputs.report-path }}
+    value: ${{ steps.publish.outputs.report-path || steps.review.outputs.report-path }}
 
 runs:
   using: composite
   steps:
-    - id: token
+    # A read-only token for the review. App installation tokens expire after one hour
+    # and a review slowed down by model rate limits can take longer, so the token that
+    # posts is minted after the review (token-write).
+    - id: token-read
       if: ${{ inputs.client-id != '' && inputs.app-private-key != '' && inputs.post != 'never' }}
       continue-on-error: true
       uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -153,8 +160,8 @@ runs:
         owner: ${{ github.repository_owner }}
         repositories: ${{ github.event.repository.name }}
         permission-contents: read
-        permission-pull-requests: write
-        permission-issues: ${{ inputs.labels == 'true' && 'write' || '' }}
+        permission-pull-requests: read
+        permission-issues: ${{ inputs.labels == 'true' && 'read' || '' }}
 
     - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       with:
@@ -181,9 +188,13 @@ runs:
       shell: bash
       env:
         MISTRAL_API_KEY: ${{ inputs.mistral-api-key }}
-        MSREVIEW_GITHUB_TOKEN: ${{ steps.token.outputs.token }}
-        MSREVIEW_APP_SLUG: ${{ steps.token.outputs.app-slug }}
-        MSREVIEW_TOKEN_STEP: ${{ steps.token.outcome || 'skipped' }}
+        MSREVIEW_GITHUB_TOKEN: ${{ steps.token-read.outputs.token }}
+        MSREVIEW_APP_SLUG: ${{ steps.token-read.outputs.app-slug }}
+        MSREVIEW_TOKEN_STEP: ${{ steps.token-read.outcome || 'skipped' }}
+        # With App credentials the review writes a publish plan; the publish step posts it.
+        MSREVIEW_DEFER_PUBLISH_DIR: >-
+          ${{ steps.token-read.conclusion == 'success' &&
+          format('{0}/msreview/publish', runner.temp) || '' }}
         MSREVIEW_READ_TOKEN: ${{ github.token }}
         MSREVIEW_AGENT_PYTHON: ${{ runner.temp }}/msreview/venv-agent/bin/python
         MSREVIEW_REPORT_DIR: ${{ runner.temp }}/msreview/report
@@ -227,6 +238,41 @@ runs:
         wait "$pid"; rc=$?
         while kill -0 "$pid" 2>/dev/null; do wait "$pid"; rc=$?; done
         exit $rc
+
+    # Runs after a failed or cancelled review too: it posts the failure banner of a
+    # failure plan, and removes the fork approval label after every attempt.
+    - id: token-write
+      if: ${{ always() && inputs.client-id != '' && inputs.app-private-key != '' && inputs.post != 'never' }}
+      continue-on-error: true
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      with:
+        client-id: ${{ inputs.client-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ github.repository_owner }}
+        repositories: ${{ github.event.repository.name }}
+        permission-contents: read
+        permission-pull-requests: write
+        permission-issues: ${{ inputs.labels == 'true' && 'write' || '' }}
+
+    - id: publish
+      if: ${{ always() && inputs.client-id != '' && inputs.app-private-key != '' && inputs.post != 'never' }}
+      shell: bash
+      env:
+        MSREVIEW_GITHUB_TOKEN: ${{ steps.token-write.outputs.token }}
+        MSREVIEW_APP_SLUG: ${{ steps.token-write.outputs.app-slug }}
+        MSREVIEW_TOKEN_STEP: ${{ steps.token-write.outcome || 'skipped' }}
+        MSREVIEW_PUBLISH_PLAN: ${{ steps.review.outputs.publish-plan }}
+        MSREVIEW_FAIL_ON: ${{ inputs.fail-on }}
+        MSREVIEW_REMOVE_LABEL: ${{ inputs.remove-label }}
+        MSREVIEW_PR_URL: ${{ inputs.pr-url || github.event.pull_request.html_url }}
+        MSREVIEW_REPORT_DIR: ${{ runner.temp }}/msreview/report
+      run: |
+        msreview="$RUNNER_TEMP/msreview/venv-worker/bin/msreview"
+        if [ ! -x "$msreview" ]; then
+          echo "msreview is not installed (an earlier step failed); nothing to publish."
+          exit 0
+        fi
+        exec "$msreview" ci-publish
 
     - if: ${{ always() }}
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

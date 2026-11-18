@@ -4,6 +4,15 @@ The verifier (phase ``verify``) reads code with the same read-only tools as the
 explorers, under its own budget, and writes one VERDICT block per candidate. Its notes
 are parsed first; if the parse is lossy the formatter turns them into a ``VerifyDraft``.
 Candidates without a verdict are listed as ``unaddressed`` (they count as uncertain).
+
+Run limits: the verifier keeps a reserved window before the hard deadline. It may
+start until the verify cutoff V (``RunClock.verify_may_start``), and the explorers and
+the structure step of a run with a verifier end early enough for that, however long
+they wait on rate limits. At or after V it does not start; it returns a ``NotRun``
+result with stop reason ``run_deadline`` that leaves every candidate unconfirmed (the
+verdict says why). Once started, rate-limit waits only slow it down,
+up to ``RunClock.limits("verify")``; a verifier stopped at that limit keeps its partial
+verdicts. The verify formatter runs under ``RunClock.limits("verify-format")``.
 """
 
 from __future__ import annotations
@@ -17,7 +26,7 @@ from pathlib import Path
 from mistralai import workflows
 from pydantic import ValidationError
 
-from morning_star_review.activities.agent_launcher import run_agent
+from morning_star_review.activities.agent_launcher import AgentTimedOut, run_agent
 from morning_star_review.activities.common import (
     JOB_JSON,
     RELATED_JSON,
@@ -28,6 +37,7 @@ from morning_star_review.activities.common import (
     agent_state,
     cap_paths,
     cost_share,
+    deadline_run_result,
     exhaust_reasons,
     launch_timeout,
     link_diffs,
@@ -38,6 +48,7 @@ from morning_star_review.activities.common import (
     usage_for,
 )
 from morning_star_review.activities.structure import FormatterRun, run_formatter
+from morning_star_review.core import runclock
 from morning_star_review.core.contract import (
     AgentRunResult,
     Candidate,
@@ -68,16 +79,18 @@ __all__ = [
     "needs_verify_formatter",
     "render_candidate",
     "render_verify_prompt",
+    "skipped_verify_result",
     "time_left",
     "verifier_tool_calls",
     "verify",
     "verify_result",
 ]
 
-# The longest verifier budget (25 min cap) plus grace, rescue and process overhead, then
-# a verify formatter run (up to ~6 min) when the verdicts need it.
-VERIFY_TIMEOUT = timedelta(minutes=40)
-ACTIVITY_MARGIN = 60.0  # seconds kept free before the activity's own limit
+# Above any allowed run deadline: rate-limit waits may stretch the verifier and its
+# formatter far beyond their budgets. Liveness is the 60 s heartbeat timeout; the
+# run's limits end the waiting.
+VERIFY_TIMEOUT: timedelta = runclock.ACTIVITY_CEILING
+ACTIVITY_MARGIN = 60.0  # seconds kept free before the activity's own limit (no clock)
 VERIFY_DIR = "verify"
 VERIFY_FORMAT_DIR = "verify-format"
 PROMPT_TXT = "prompt.txt"
@@ -255,6 +268,27 @@ def time_left(started: float, now: float | None = None) -> float:
     return VERIFY_TIMEOUT.total_seconds() - ACTIVITY_MARGIN - elapsed
 
 
+def skipped_verify_result(model: str, ids: Sequence[str]) -> VerifyResult:
+    """The verifier was not started: the run reached the verify cutoff V.
+
+    Not "nothing to verify": every candidate stays unaddressed (unconfirmed), the
+    result is incomplete and its stop reason names the run's time limit.
+    """
+    return VerifyResult(
+        entries=[],
+        unaddressed=list(ids),
+        source="empty",
+        state="NotRun",
+        stop_reason=runclock.RUN_DEADLINE_STOP,
+        rescued=False,
+        complete=False,
+        budget_exhausted=True,
+        exhausted_by=["deadline"],
+        opened_paths=[],
+        usage=Usage(model=model),
+    )
+
+
 def empty_verify_result(model: str) -> VerifyResult:
     """Nothing to verify: no candidates, no model call."""
     return VerifyResult(
@@ -290,6 +324,13 @@ async def verify(inp: VerifyInput) -> VerifyResult:
         candidates = list(inp.merge.candidates)
         if not candidates:
             return seal(empty_verify_result(role.model), ctx)
+        ids = [c.candidate_id for c in candidates]
+        clock = runclock.from_context(ctx)
+        if clock is not None and not clock.verify_may_start(time.time()):
+            # Past the verify cutoff: finish without the verifier, and say so.
+            skipped = skipped_verify_result(role.model, ids)
+            progress(_line(role.model, skipped))
+            return seal(skipped, ctx)
         prep, snap = inp.prep, inp.snap
         run_dir = require_dir(prep.job_root)
         job_dir = run_dir / VERIFY_DIR
@@ -326,11 +367,26 @@ async def verify(inp: VerifyInput) -> VerifyResult:
             role=role,
             budgets=budgets,
             changed_files=refs,
+            run_limits=clock.limits("verify") if clock is not None else None,
+            cooldown_path=runclock.cooldown_path(run_dir, role.model) if clock else None,
         )
         write_model(job_dir / JOB_JSON, job)
-        res = await run_agent("verify", job_dir, ctx, launch_timeout(budgets, VERIFY_TIMEOUT))
+        stop = job.run_limits.stop_epoch if job.run_limits is not None else None
+        try:
+            res = await run_agent(
+                "verify",
+                job_dir,
+                ctx,
+                launch_timeout(budgets),
+                latest_epoch=stop,
+                model=role.model,
+            )
+        except AgentTimedOut:
+            if stop is None or time.time() < stop:
+                raise  # retryable: a retry resumes the meter and the deadline
+            # The run's time limit: keep the verdicts written so far.
+            res = deadline_run_result("verify", job_dir, role.model)
         notes = res.notes or read_partial_notes(job_dir)
-        ids = [c.candidate_id for c in candidates]
         parsed = parse_verdicts(notes, ids)
         fmt: FormatterRun | None = None
         if needs_verify_formatter(notes, parsed, ids):
@@ -343,19 +399,28 @@ async def verify(inp: VerifyInput) -> VerifyResult:
                 notes=notes,
                 target="verify",
                 candidates=candidate_data,
-                time_left=time_left(started),
+                # Without a run clock: the activity's own limit, as before.
+                time_left=time_left(started) if clock is None else None,
+                limits=clock.limits("verify-format") if clock is not None else None,
             )
         result = verify_result(res, notes, parsed, fmt, ids, role.model, ctx.secrets())
-        progress(
-            agent_line(
-                "verify",
-                role.model,
-                state=result.state,
-                complete=result.complete,
-                rescued=result.rescued,
-                budget_exhausted=result.budget_exhausted,
-                exhausted_by=result.exhausted_by,
-                stop_reason=result.stop_reason,
-            )
-        )
+        progress(_line(role.model, result))
         return seal(result, ctx)
+
+
+def _line(model: str, result: VerifyResult) -> str:
+    """The ``msreview agent:`` line of the verifier (rate-limit wait incl. formatter)."""
+    waited = result.usage.rate_limit_wait_seconds
+    if result.formatter_usage is not None:
+        waited += result.formatter_usage.rate_limit_wait_seconds
+    return agent_line(
+        "verify",
+        model,
+        state=result.state,
+        complete=result.complete,
+        rescued=result.rescued,
+        budget_exhausted=result.budget_exhausted,
+        exhausted_by=result.exhausted_by,
+        stop_reason=result.stop_reason,
+        rl_wait=waited,
+    )

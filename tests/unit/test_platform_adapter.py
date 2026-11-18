@@ -15,6 +15,9 @@ from morning_star_review.platform import (
     PlatformAuthError,
     PlatformError,
     _wrap,
+    error_status,
+    transient_status,
+    transient_worker_error,
 )
 
 KEY = "mk-test-not-a-real-key-0123456789"
@@ -132,3 +135,64 @@ async def test_start_maps_duplicate_to_already_started() -> None:
     p._client = _fake_client(execute_workflow_async=execute)
     with pytest.raises(AlreadyStarted):
         await p.start(workflow="wf", deployment="d", execution_id="e", payload={})
+
+
+def test_every_call_marks_errors_that_may_pass() -> None:
+    # The driver waits out exactly these API errors (status None, 408, 429, 5xx).
+    for status in (408, 429, 500, 502, 503, 504):
+        assert _wrap(ApiError(status), "x").retryable, status
+    for status in (400, 404, 409, 422):
+        assert not _wrap(ApiError(status), "x").retryable, status
+    assert not _wrap(ApiError(401), "x").retryable  # auth errors never pass by waiting
+
+
+@pytest.mark.parametrize(
+    ("response", "retryable"),
+    [
+        (httpx.Response(429, json={}), True),
+        (httpx.Response(503, text="busy"), True),
+        (httpx.Response(400, json={}), False),
+        (httpx.Response(200, text="not json"), False),
+        (httpx.Response(200, json={"tls": True}), False),
+    ],
+)
+async def test_whoami_errors_say_whether_they_may_pass(
+    response: httpx.Response, retryable: bool
+) -> None:
+    with pytest.raises(PlatformError) as info:
+        await platform_with(lambda req: response).whoami()
+    assert info.value.retryable is retryable
+
+
+async def test_whoami_network_error_may_pass() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    with pytest.raises(PlatformError) as info:
+        await platform_with(handler).whoami()
+    assert info.value.status is None and info.value.retryable
+
+
+def test_worker_errors_with_a_transient_status() -> None:
+    from http import HTTPStatus
+
+    from mistralai.workflows.exceptions import ErrorCode, WorkflowsException
+
+    def wf(status: HTTPStatus) -> WorkflowsException:
+        return WorkflowsException(
+            message="Failed to register workflow specs",
+            status=status,
+            code=ErrorCode.POST_WORKFLOWS_REGISTER_ERROR,
+        )
+
+    assert error_status(wf(HTTPStatus.TOO_MANY_REQUESTS)) == 429
+    assert transient_worker_error(wf(HTTPStatus.TOO_MANY_REQUESTS))
+    assert transient_worker_error(wf(HTTPStatus.SERVICE_UNAVAILABLE))
+    assert not transient_worker_error(wf(HTTPStatus.BAD_REQUEST))
+    assert not transient_worker_error(wf(HTTPStatus.UNAUTHORIZED))
+    assert transient_worker_error(ApiError(502))  # status_code, as on SDK HTTP errors
+    assert not transient_worker_error(RuntimeError("bug"))  # no status: not transient
+    assert not transient_worker_error(SystemExit(1))
+    assert not transient_worker_error(None)
+    assert error_status(SimpleNamespace(status=True)) is None  # a bool is not a status
+    assert transient_status(429) and transient_status(500) and not transient_status(404)

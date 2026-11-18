@@ -27,6 +27,16 @@ parsed without loss does not block ``clean``: the primary explorer reviewed the 
 and the secondary's findings were kept. It is recorded as a *note* in the reasons. So is the
 reason a full review had nothing to review (every changed file excluded, no model ran).
 
+A run that reached its wind-down before finalize (``run_limit_reached``) was finished
+early on purpose, so it can never be ``clean``: the first blocker says so, with the
+total rate-limit wait when the models were slow. A verifier skipped at the verify cutoff
+(``stop_reason == RUN_DEADLINE_STOP``) left every candidate unconfirmed; that is a
+blocker, never "nothing to verify". An explorer or verifier with that stop reason was
+stopped by the run's time limit (also when its rate-limit retries ran out of time, state
+``Failed``); its blocker says so, with its own rate-limit wait when it was long. A
+review that only reused a previous one (carry over, or nothing to review) ran no model
+and gets no time-limit blocker.
+
 ``Assessment.complete`` (no blockers) does not depend on the verdict. Store it as
 ``PriorState.complete``: a ``findings`` review can still be incomplete, and a later
 incremental review must not rely on it.
@@ -47,6 +57,7 @@ from morning_star_review.core.contract import (
     Verdict,
     VerifyResult,
 )
+from morning_star_review.core.runclock import RUN_DEADLINE_STOP
 
 __all__ = [
     "MAX_REASONS",
@@ -60,11 +71,14 @@ __all__ = [
     "is_open",
     "is_possible",
     "resolved_without_fix",
+    "run_limit_reason",
 ]
 
 MAX_REASON_CHARS = 300
 MAX_REASONS = 20
 RESOLVED_WITHOUT_FIX = "resolved without a fix by"
+# Rate-limit waits shorter than this are not worth a mention in the time-limit reason.
+_RATE_LIMIT_MENTION_S = 60.0
 # Draft sources that hold everything the explorer wrote ("empty" = it wrote nothing).
 _FULL_DRAFT = ("parser", "parser+formatter")
 
@@ -161,6 +175,13 @@ def _explorer_gaps(
                 f"the {e.model} explorer ran out of {out_of}; its findings were kept, and as a "
                 "secondary explorer it does not make the review incomplete"
             )
+        elif not e.complete and e.stop_reason == RUN_DEADLINE_STOP:
+            # Stopped at the run's limits: the launcher stopped it, a turn was cut at the
+            # run's stop, or its rate-limit retries had no time left (state Failed).
+            blockers.append(
+                f"the {e.model} explorer did not finish its review: the run reached its "
+                f"time limit{_rate_limited(e.usage.rate_limit_wait_seconds)}"
+            )
         elif not e.complete:
             detail = f" (out of {out_of})" if e.budget_exhausted else ""
             state = "" if e.state == "Completed" else f"; state {e.state}"
@@ -190,13 +211,36 @@ def _draft_gaps(
     return blockers
 
 
+def _rate_limited(seconds: float) -> str:
+    """``"; it was rate-limited for N min"`` for an agent that waited long enough."""
+    if seconds < _RATE_LIMIT_MENTION_S:
+        return ""
+    return f"; it was rate-limited for {max(1, round(seconds / 60))} min"
+
+
+def run_limit_reason(deadline_minutes: int | None, rate_limit_wait_seconds: float = 0.0) -> str:
+    """The blocker of a run that reached its wind-down before it finished."""
+    limit = f"its {deadline_minutes}-minute time limit" if deadline_minutes else "its time limit"
+    reason = f"the review was finished early to stay within {limit}"
+    if rate_limit_wait_seconds >= _RATE_LIMIT_MENTION_S:
+        minutes = max(1, round(rate_limit_wait_seconds / 60))
+        reason += f"; models were rate-limited for {minutes} min in total"
+    return reason
+
+
 def _verifier_gaps(verify_needed: bool, verify: VerifyResult | None) -> list[str]:
     if not verify_needed:
         return []
     if verify is None:
         return ["the verifier did not run"]
     blockers: list[str] = []
-    if not verify.complete:
+    if verify.stop_reason == RUN_DEADLINE_STOP and not verify.complete:
+        # Skipped at the verify cutoff (or cut short at its limit); an empty result is not
+        # "nothing to verify" here: every candidate stays unconfirmed.
+        what = "did not run" if verify.state == "NotRun" else "did not finish"
+        waited = _rate_limited(verify.usage.rate_limit_wait_seconds)
+        blockers.append(f"the verifier {what}: the run reached its time limit{waited}")
+    elif not verify.complete:
         out = f" (out of {', '.join(verify.exhausted_by)})" if verify.budget_exhausted else ""
         blockers.append(f"the verifier did not finish{out}")
     if verify.source == "parser_lossy":
@@ -230,6 +274,9 @@ def _gaps(
     structured: int | None,
     nothing_to_review: str | None = None,
     unreviewed_code: str | None = None,
+    run_limit_reached: bool = False,
+    deadline_minutes: int | None = None,
+    rate_limit_wait_seconds: float = 0.0,
 ) -> tuple[list[str], list[str]]:
     """(blockers, notes), each in plain language."""
     if scope == "carry_over":
@@ -254,7 +301,12 @@ def _gaps(
             ], []
         # Only inert files (media, snapshots, renames) changed: nothing to miss.
         return [], [f"nothing to review: {nothing_to_review}"]
-    blockers, notes = _explorer_gaps(expected_explorers, explores, drafts)
+    blockers: list[str] = []
+    if run_limit_reached:
+        # Models ran and the run was wound down: say why first, then what is missing.
+        blockers.append(run_limit_reason(deadline_minutes, rate_limit_wait_seconds))
+    explorer_blockers, notes = _explorer_gaps(expected_explorers, explores, drafts)
+    blockers.extend(explorer_blockers)
     blockers.extend(_draft_gaps(expected_explorers, explores, drafts, structured))
     blockers.extend(_verifier_gaps(verify_needed, verify))
     blockers.extend(_coverage_gaps(partial_reason, coverage))
@@ -275,6 +327,9 @@ def incomplete_reasons(
     structured: int | None = None,
     nothing_to_review: str | None = None,
     unreviewed_code: str | None = None,
+    run_limit_reached: bool = False,
+    deadline_minutes: int | None = None,
+    rate_limit_wait_seconds: float = 0.0,
 ) -> list[str]:
     """Plain-language reasons why the review is not complete (empty = complete).
 
@@ -299,6 +354,9 @@ def incomplete_reasons(
         structured=structured,
         nothing_to_review=nothing_to_review,
         unreviewed_code=unreviewed_code,
+        run_limit_reached=run_limit_reached,
+        deadline_minutes=deadline_minutes,
+        rate_limit_wait_seconds=rate_limit_wait_seconds,
     )
     return _bounded(blockers)
 
@@ -319,6 +377,9 @@ def assess(
     structured: int | None = None,
     nothing_to_review: str | None = None,
     unreviewed_code: str | None = None,
+    run_limit_reached: bool = False,
+    deadline_minutes: int | None = None,
+    rate_limit_wait_seconds: float = 0.0,
 ) -> Assessment:
     """The verdict with its blockers and notes (see the module docstring).
 
@@ -326,6 +387,8 @@ def assess(
     candidate to verify. ``findings`` are the final (unrefuted) findings, ``priors`` the
     reconciled prior findings. ``expected_explorers`` lists the configured explorer
     models, primary first. ``nothing_to_review``: see ``incomplete_reasons``.
+    ``run_limit_reached`` (the wind-down had started), ``deadline_minutes`` and
+    ``rate_limit_wait_seconds`` (total, all agents) make the time-limit blocker.
     """
     blockers, notes = _gaps(
         scope=scope,
@@ -340,6 +403,9 @@ def assess(
         structured=structured,
         nothing_to_review=nothing_to_review,
         unreviewed_code=unreviewed_code,
+        run_limit_reached=run_limit_reached,
+        deadline_minutes=deadline_minutes,
+        rate_limit_wait_seconds=rate_limit_wait_seconds,
     )
     verdict: Verdict
     if any(counts_as_finding(f) for f in findings) or resolved_without_fix(priors):
@@ -367,6 +433,9 @@ def decide(
     structured: int | None = None,
     nothing_to_review: str | None = None,
     unreviewed_code: str | None = None,
+    run_limit_reached: bool = False,
+    deadline_minutes: int | None = None,
+    rate_limit_wait_seconds: float = 0.0,
 ) -> tuple[Verdict, list[str]]:
     """``(verdict, verdict_reasons)``; see ``assess``.
 
@@ -388,5 +457,8 @@ def decide(
         structured=structured,
         nothing_to_review=nothing_to_review,
         unreviewed_code=unreviewed_code,
+        run_limit_reached=run_limit_reached,
+        deadline_minutes=deadline_minutes,
+        rate_limit_wait_seconds=rate_limit_wait_seconds,
     )
     return a.verdict, a.reasons

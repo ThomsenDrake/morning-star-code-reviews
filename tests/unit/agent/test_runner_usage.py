@@ -80,3 +80,15 @@ def test_usage_keeps_the_last_200_reasons() -> None:
     assert usage.finish_reasons[-1] == "stop"
     assert runner._last_finish(m) == "stop"
     assert _meter().usage().finish_reasons == []
+
+
+def test_usage_carries_the_rate_limit_waits() -> None:
+    m = _meter()
+    m.state.rl_waits = 3
+    m.state.rl_wait_seconds = 125.12345
+    usage = runner._usage(m)
+    assert usage.rate_limit_waits == 3
+    assert usage.rate_limit_wait_seconds == 125.123
+    result = AgentRunResult(phase="explore", state="Completed", stop_reason=None, usage=usage)
+    assert AgentRunResult.model_validate_json(result.model_dump_json()) == result
+    assert _meter().usage().rate_limit_waits == 0

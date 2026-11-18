@@ -25,6 +25,9 @@ __all__ = [
     "PlatformAuthError",
     "PlatformError",
     "Whoami",
+    "error_status",
+    "transient_status",
+    "transient_worker_error",
 ]
 
 API_BASE = "https://api.mistral.ai"
@@ -33,8 +36,38 @@ TERMINAL_STATUSES = frozenset({"COMPLETED", "FAILED", "CANCELED", "TERMINATED", 
 _DUPLICATE_START = "WF_1101"  # "Workflow execution with the same id already started"
 
 
+def transient_status(status: int) -> bool:
+    """An HTTP status worth retrying: 408, 429 (rate limit) and every 5xx."""
+    return status in (408, 429) or status >= 500
+
+
+def error_status(exc: object) -> int | None:
+    """The HTTP status an exception carries (``status_code``, or an ``int``/``HTTPStatus``
+    ``status`` as on the Workflows SDK's ``WorkflowsException``); None if it has none."""
+    for attr in ("status_code", "status"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return int(value)
+    return None
+
+
+def transient_worker_error(exc: object) -> bool:
+    """True when the worker task failed with a rate limit or a server error.
+
+    Spec registration in the Workflows SDK retries only 502/503/504 and raises a
+    ``WorkflowsException`` whose ``status`` is the HTTP status (429 included); such a
+    worker can be started again. An exception without a status is not transient.
+    """
+    status = error_status(exc)
+    return status is not None and transient_status(status)
+
+
 class PlatformError(Exception):
-    """A Workflows API call failed; ``status`` is the HTTP status when there was one."""
+    """A Workflows API call failed; ``status`` is the HTTP status when there was one.
+
+    Every adapter call raises it (or a subclass) for API failures; ``retryable`` is
+    True for network errors (no status), 408, 429 and 5xx.
+    """
 
     def __init__(self, message: str, status: int | None = None) -> None:
         super().__init__(message)
@@ -42,7 +75,7 @@ class PlatformError(Exception):
 
     @property
     def retryable(self) -> bool:
-        return self.status is None or self.status >= 500 or self.status in (408, 429)
+        return self.status is None or transient_status(self.status)
 
 
 class PlatformAuthError(PlatformError):
@@ -152,13 +185,14 @@ class MistralPlatform:
             raise PlatformAuthError(f"whoami failed (HTTP {resp.status_code})", resp.status_code)
         if resp.status_code != 200:
             raise PlatformError(f"whoami failed (HTTP {resp.status_code})", resp.status_code)
+        # A 200 with an unusable body is not a transient error: not retryable.
         try:
             data = resp.json()
         except ValueError:
-            raise PlatformError("whoami returned invalid JSON") from None
+            raise PlatformError("whoami returned invalid JSON", resp.status_code) from None
         namespace = data.get("namespace") if isinstance(data, dict) else None
         if not isinstance(namespace, str) or not namespace:
-            raise PlatformError("whoami returned no namespace")
+            raise PlatformError("whoami returned no namespace", resp.status_code)
         return Whoami(namespace=namespace, raw=data)
 
     async def deployment(self, name: str) -> DeploymentState | None:

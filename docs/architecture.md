@@ -9,17 +9,23 @@ run.
 ```
 pull_request event (or `msreview review <PR>`)
   │
-  ├─ token step (Action) / mint child (CLI): App key → installation token (1 repo, 1 hour)
+  ├─ token step (Action: read-only token) / mint child (CLI): App key → installation
+  │  token (1 repo, 1 hour)
   │
-  └─ driver process (`msreview ci` / `msreview review`), in an empty working directory
-       1. preflight: whoami with the Mistral key (refused key → exit 2, nothing started)
-       2. cheap GitHub pre-check: closed, draft, superseded, already reviewed → skip
-       3. choose the per-PR deployment name; (CI) terminate orphaned executions of this PR
-       4. start a Workflows worker in-process, registered on that deployment
-       5. wait until the deployment reports the worker, then start the execution
-       6. poll until it ends (deadline, signals and worker crashes terminate it)
-       7. always: terminate the execution if it is still running, then stop the worker
-       8. write the outcome: stdout / step summary / outputs / artifact; exit code
+  ├─ driver process (`msreview ci` / `msreview review`), in an empty working directory
+  │    1. preflight: whoami with the Mistral key (refused key → exit 2, nothing started)
+  │    2. cheap GitHub pre-check: closed, draft, superseded, already reviewed → skip
+  │    3. choose the per-PR deployment name; (CI) terminate orphaned executions of this PR
+  │    4. start a Workflows worker in-process, registered on that deployment
+  │    5. wait until the deployment reports the worker, then start the execution
+  │    6. poll until it ends (signals and worker crashes terminate it; at the deadline
+  │       it is terminated and the PR still gets the failure notice)
+  │    7. always: terminate the execution if it is still running, then stop the worker
+  │    8. write the outcome: stdout / step summary / outputs / artifact; exit code
+  │       (Action with App credentials: a publish plan instead of posting)
+  │
+  └─ (Action) token step: write token, minted after the review; then publish step
+     (`msreview ci-publish`): posts the publish plan
             │
             ▼
    Workflow `morning-star-code-review` (history visible in Studio)
@@ -35,6 +41,65 @@ long-running service exists. The next review starts its own worker.
 
 `--local` (CLI) runs the same workflow code in-process without a Workflows server.
 This mode is used for development and for the evaluation.
+
+## Time limits and rate limits
+
+A rate limit makes a review slower. It never fails the run, drops an agent, or uses
+up a model call. One overall limit keeps a run bounded.
+
+**The run clock.** The driver plans it at the start: the hard deadline H
+(`deadline-minutes` after the start, default 90) and the wind-down W, 15 minutes
+before H. For a deadline under an hour, the margins shrink in proportion, to at most
+half. The driver passes both times to the activities in its in-memory run context
+(the workflow code still reads no clock). Each agent job gets absolute limits from
+them:
+
+| Phase | Tools close at | Last model call, last wait ends |
+|---|---|---|
+| explore | W (or earlier, by its own budget) | W + 5 min, at most H - 10 min |
+| structure (formatter) | (no tools) | H - 6 min |
+| verify | H - 12 min | H - 8 min |
+| verify formatter | (no tools) | H - 4 min |
+
+With verification on, the verifier keeps a reserved window: it may start until the
+verify cutoff V = H - 15 min, and explore and structure end early enough for that
+(`RunClock.limits(phase, verify=True)`): the structure formatter by V - 1.5 min (an
+agent process may run 1 min past its limit, plus the hand-over), the explorers' last
+model call 4 min before that, and their tools close 5 min before their last call (or
+at W when it is earlier). For D = 90: explorer tools close at 64.5, last call 69.5,
+structure 73.5, V = 75. The verifier does not start at or after V: then every
+candidate stays unconfirmed, and the verdict says why. A `finalize` that runs at or
+after W (with verification: at or after the explorers' wind-down) adds the reason "the
+review was finished early to stay within its N-minute time limit", so such a review is never
+`clean`. If the execution still runs at H, the driver terminates it and records the
+failure itself (the failure notice and `msreview: incomplete`), from the sealed
+snapshot that `fetch_pr` left in the run directory.
+
+**A refused model call**, in order:
+
+1. The model SDK tries the call up to 5 times in about 10 seconds; its wait for a
+   `Retry-After` header is capped at 60 seconds.
+2. The agent's runner then waits and runs the turn again in the same session. For
+   rate limits and temporary unavailability (429, 5xx, capacity) the number of retries
+   has no limit; the run's limits and the cost cap end them. Lost streams and
+   timeouts stop after 6 failures in a row. The waits grow 15, 30, 60, 120, then 180 s
+   (plus up to 25 % jitter), at least the API's `Retry-After` (at most 5 minutes), and
+   start again at 15 s after a successful reply.
+3. Before a rate-limit wait, the runner writes the model's cooldown to a small file in
+   the run directory. Every agent of the run that uses the model reads it before its
+   next call and waits too. The file is advisory: the last writer wins.
+4. The agent's meter pauses its own clocks (explore, grace, rescue and formatter
+   time) for these waits and for the SDK's retries of a call that was refused in the
+   end, and records it in `meter.json`. A refused call does not count as a model call.
+   SDK waits inside a call that finally succeeds are part of that call's time.
+
+The process that launches an agent re-reads `meter.json` on every heartbeat and
+extends the agent's time allowance by the waits, up to the job's run limit. An
+explorer stopped at its run limit still returns its partial notes. The timeouts of
+the long activities and of the workflow sit above the largest allowed deadline
+(300 minutes); heartbeats detect a stuck activity. The driver retries Workflows API
+errors (429, 5xx, network) with backoff until the deadline, and GitHub API requests
+wait for a rate limit up to 15 minutes in total, never past H.
 
 ## Two environments
 
@@ -134,8 +199,9 @@ calls, tool calls, time, context size and estimated cost before each call:
 - The cost cap is hard: no call starts if the run's share of the budget cannot pay for
   it.
 - A turn that fails with a temporary model error (HTTP 429, an unavailable provider) is
-  run again in the same session, up to three times with growing waits, while the
-  deadline, the cost share and the model-call limit allow.
+  run again in the same session after a growing wait, until the run's time limit or
+  the cost share stops it. The wait does not count against the explorer's own time
+  (see [Time limits and rate limits](#time-limits-and-rate-limits)).
 
 The explorer writes plain-text **notes**, not JSON. Models follow a simple line format
 far more reliably than a schema while they are still using tools:
@@ -193,12 +259,14 @@ default; a flash model gets 25 tool calls unless a budget is set) and no schema.
 writes one `VERDICT <id> … END VERDICT` block for each: `confirmed`, `refuted` or
 `uncertain`, with optional corrections to line, evidence or severity, and a short
 reason. It must not add candidates. A candidate that it does not address counts as
-`uncertain`. If the verifier fails with a temporary error, every candidate is
-`uncertain`.
+`uncertain`. If the verifier fails, every candidate is `uncertain`. The verifier is
+skipped when the run has reached its verify cutoff; then too every candidate is
+`uncertain`, and the verdict reasons say that the verifier did not run.
 
 ### `finalize`
 
-Deterministic: no model, no clock, no network.
+Deterministic: no model and no network. The activity reads the clock once, for the
+review time, the duration and whether the run had reached its wind-down.
 
 1. **Anchoring.** It normalises each finding's path and checks the line against
    GitHub's own patch. When the quoted evidence is on that line, the finding is
@@ -253,8 +321,9 @@ Deterministic: no model, no clock, no network.
 
    "Complete" requires all of these: the primary explorer finished within its budget;
    the other explorers finished, or their notes parsed in full; every draft parsed
-   without loss; the verifier finished when it had work; nothing was cut short; and
-   every reviewable file was in the prompt or opened.
+   without loss; the verifier finished when it had work; nothing was cut short; the
+   run had not reached its wind-down; and every reviewable file was in the prompt or
+   opened.
 7. **Rendering and sanitising.** The summary, the inline comments and the report are
    built from templates. All model text goes through the sanitiser:
    - hidden markers are removed;
@@ -293,12 +362,23 @@ If posting is possible, it writes to GitHub in an order that makes retries safe:
 missing permission, `post: never`), `publish` writes nothing to GitHub. It returns the
 report with a first line that explains why.
 
+**Deferred publish (Action).** With App credentials, the review step has a read-only
+token only. `publish` then writes a **publish plan** (`publish_plan.json`: the request,
+the snapshot and the final review) instead of posting, and `msreview ci` copies it out
+of the run directory before it removes that directory. After the review, the Action
+mints the write token, and `msreview ci-publish` runs the same steps 1 to 6 from the
+plan. It first checks that the token's bot is the one the review was made for. In the
+CLI, `publish` mints a new token through the mint child when the first is older than
+45 minutes.
+
 ### `report_failure`
 
 If any step fails, this activity runs before the execution ends as FAILED. It does
 two things, both best effort and from fixed templates only: it adds a notice to the
 existing summary comment that the latest run did not finish, and it sets
-`msreview: incomplete`.
+`msreview: incomplete`. With deferred publish it writes a failure plan instead, and
+the publish step posts the notice. At the hard deadline the driver runs the same code
+itself, because the execution was terminated.
 
 ## Guards and seals
 
@@ -318,11 +398,13 @@ Everything that touches the outside world is an activity.
 ```
 src/morning_star_review/
   cli.py, driver.py, doctor.py, setup_agent.py, usersettings.py, outputs.py, platform.py
+  deferred.py            the publish plan of the Action's publish step
   workflow.py            the workflow definition
   activities/            one module per activity, plus the agent launcher
-  agent/                 agent runner, tools, budget hooks, prompts (agent environment only)
+  agent/                 agent runner, tools, budget hooks, rate-limit policy, prompts
+                         (agent environment only)
   core/                  contracts, config, models and presets, notes grammar, sanitiser,
-                         seals, guards, redaction, child-process helpers
+                         seals, guards, redaction, child-process helpers, run clock
   diff/                  patch parsing, rendering, pre-pass, anchors, scope, related definitions
   github/                HTTP client, App auth and mint child, fetch, publish, labels, state marker
   review/                anchoring, merge, reconcile, verdict, suggestions, rendering, finalize

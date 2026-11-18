@@ -7,8 +7,9 @@ remain. To report a vulnerability, see [SECURITY.md](../SECURITY.md).
 
 | Component | Holds | Talks to |
 |---|---|---|
-| Token step (Action) or the `msreview _mint` child process (CLI) | The GitHub App private key, and briefly a signed JWT | `api.github.com` |
-| Driver and Workflows worker (one process: `msreview ci` / `msreview review`) | The Mistral API key, the installation token (in memory), a per-run seal key | `api.mistral.ai`, `api.github.com`, `github.com` (git fetch) |
+| Token steps (Action) or the `msreview _mint` child process (CLI) | The GitHub App private key, and briefly a signed JWT | `api.github.com` |
+| Driver and Workflows worker (one process: `msreview ci` / `msreview review`) | The Mistral API key, the installation token (in memory; read-only in the Action), a per-run seal key | `api.mistral.ai`, `api.github.com`, `github.com` (git fetch) |
+| Publish step (Action: `msreview ci-publish`) | The write installation token (in memory) and the publish plan | `api.github.com` |
 | `git` child processes | The installation token, only as a per-command header for `fetch` | `github.com` |
 | Agent processes (explorer, verifier, formatter), in the agent environment | The Mistral API key only | `api.mistral.ai` |
 
@@ -18,15 +19,18 @@ It is **never executed**: nothing is installed, built, tested or run from the PR
 
 ## Secrets
 
-- **The GitHub App private key** exists only in the Action's token step, or in the CLI's
-  short-lived mint child. That child signs a JWT, mints an installation token for the
+- **The GitHub App private key** exists only in the Action's two token steps, or in the
+  CLI's short-lived mint child. That child signs a JWT, mints an installation token for the
   one repository under review, and exits. The key never reaches the driver, the
   worker, the agents, payloads or logs. A key file must have mode 0600. A key command
   runs only inside the mint child.
 - **The installation token** expires within an hour. It is limited to one repository,
-  with Contents: read, Pull requests: write and (for labels) Issues: write. It is kept
-  in memory. `msreview ci` removes it from its environment at start-up. It is passed to
-  `git` only for the fetch command, and never to the agents.
+  with Contents: read, Pull requests: write and (for labels) Issues: write. In the
+  Action, the review step only gets a read-only token, and the write token is minted
+  after the review (see [GitHub App tokens](#github-app-tokens)). Tokens are kept in
+  memory. `msreview ci` and `msreview ci-publish` remove them from their environment at
+  start-up. A token is passed to `git` only for the fetch command, and never to the
+  agents.
 - **The Mistral API key** is in the worker's environment, because the Workflows SDK
   needs it there, and in the agents' environment. Every child process gets an
   environment built from an allowlist, never a copy of the parent's. Variables that
@@ -39,6 +43,38 @@ It is **never executed**: nothing is installed, built, tested or run from the PR
 - **Payloads carry no secrets.** Tokens and keys stay in the worker's memory (the run
   context), never in workflow inputs or outputs. Tests check that they do not appear in
   outcomes or in child-process environments.
+
+## GitHub App tokens
+
+An installation token expires after 60 minutes. A review can take longer than that,
+because rate limits make it slower instead of failing it (up to `deadline-minutes`,
+at most 300). So the token that posts is always minted shortly before it is used:
+
+- **Action.** With App credentials, and `post` not set to `never`, the Action mints two
+  tokens with the same pinned `actions/create-github-app-token`:
+  1. Before the review, a **read-only** token: Contents: read, Pull requests: read,
+     and Issues: read when labels are on. The review step (`msreview ci`) uses it to
+     fetch the PR and to read the previous review. This step cannot write to GitHub.
+  2. After the review, a **write** token: Contents: read, Pull requests: write, and
+     Issues: write when labels are on. The publish step (`msreview ci-publish`) posts
+     the review, or the failure notice, with it. These two steps also run when the
+     review step failed.
+
+  The App's private key is an input of the two token steps only. Without App
+  credentials, or with `post: never`, there are no token steps and no publish step.
+- **The publish plan.** The review step gives its result to the publish step in a
+  file in the runner's temporary directory: the review to post, or the failure to
+  report. The file is not sealed, because the seal key exists only in the review
+  process. It has the same trust level as the `outcome.json` that the review step
+  writes: msreview writes both on the same runner, in the same job, and no PR code
+  runs on that runner. The file is not uploaded with the artifact. Before it posts, the
+  publish step checks that the write token belongs to the bot that the review was made
+  for, and that the PR head did not move during the review. If either check fails, it
+  makes a report instead of posting.
+- **CLI.** The mint child mints the token before the review. Before posting, the CLI
+  starts the mint child again when the token is older than 45 minutes, so the private
+  key still never reaches the review process. If that fails, the CLI posts with the old
+  token while it is still valid, and otherwise makes a report with the reason.
 
 ## Threats and mitigations
 
@@ -118,7 +154,7 @@ workflows are often dangerous. The template follows these rules:
 - **The workflow file comes from the base branch.** On `pull_request_target`, a PR
   cannot change the workflow that reviews it.
 - **Pin the action by commit.** Both example workflows refer to the action by a release
-  tag (`@v0.1.0`), with a comment that asks you to pin it. Replace the tag with the full
+  tag (`@v0.1.1`), with a comment that asks you to pin it. Replace the tag with the full
   commit SHA of the release that you reviewed: a tag can be moved to other code, but a
   commit SHA always names the same code.
 
@@ -206,8 +242,9 @@ Fixed in code:
   that started it is gone. The CI orphan sweep leaves executions with a live worker
   alone. When two runs for one PR start at the same time, the second worker moves to a
   deployment of its own, and a task that reaches the wrong worker is retried.
-- **Token lifetime.** `deadline-minutes` is at most 55, because the App token that the
-  run posts with is minted once and expires after 60 minutes.
+- **Token lifetime.** A run can last longer than an installation token (60 minutes).
+  The Action mints the token that posts after the review, and the CLI mints a new one
+  before posting when the first is old (see [GitHub App tokens](#github-app-tokens)).
 
 Residual risks:
 

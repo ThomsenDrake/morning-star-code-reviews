@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 import pytest
@@ -152,11 +154,12 @@ async def test_rate_limit_retry_after_short_wait() -> None:
 
 
 async def test_rate_limit_long_wait_raises() -> None:
-    rec = Recorder([httpx.Response(403, headers={"retry-after": "600"})])
+    # One wait longer than the per-request total (900 s) is not started at all.
+    rec = Recorder([httpx.Response(403, headers={"retry-after": "1000"})])
     gh, slept = client(rec)
     with pytest.raises(GitHubRateLimited) as info:
         await gh.get_json("/x")
-    assert info.value.retry_after_s == 600
+    assert info.value.retry_after_s == 1000
     assert slept == []
     assert not GitHubRateLimited.non_retryable
 
@@ -176,12 +179,93 @@ def test_rate_limit_detection() -> None:
     assert rate_limit_wait(httpx.Response(200), now) is None
 
 
-async def test_repeated_rate_limits_give_up() -> None:
-    rec = Recorder([httpx.Response(429, headers={"retry-after": "1"})])
+async def test_long_rate_limit_waits_instead_of_failing() -> None:
+    # A GitHub rate limit makes the run wait for the Retry-After; it does not fail it.
+    rec = Recorder(
+        [httpx.Response(429, headers={"retry-after": "400"}), httpx.Response(200, json={"a": 1})]
+    )
+    gh, slept = client(rec)
+    assert await gh.get_json("/x") == {"a": 1}
+    assert slept == [400.0]
+
+
+async def test_rate_limit_waits_of_one_request_are_capped_in_total() -> None:
+    rec = Recorder([httpx.Response(429, headers={"retry-after": "300"})])
+    gh, slept = client(rec)
+    with pytest.raises(GitHubRateLimited) as info:
+        await gh.get_json("/x")
+    assert slept == [300.0, 300.0, 300.0]  # a fourth wait would pass 900 s
+    assert sum(slept) <= gh_http.MAX_RATE_WAIT_TOTAL_S == 900.0
+    assert info.value.retry_after_s == 300.0
+
+
+async def test_zero_retry_after_still_waits_and_counts() -> None:
+    rec = Recorder([httpx.Response(429, headers={"retry-after": "0"})])
     gh, slept = client(rec)
     with pytest.raises(GitHubRateLimited):
         await gh.get_json("/x")
-    assert len(slept) == gh_http.MAX_RATE_WAITS
+    assert set(slept) == {gh_http.MIN_RATE_WAIT_S}
+    assert len(slept) == int(gh_http.MAX_RATE_WAIT_TOTAL_S / gh_http.MIN_RATE_WAIT_S)
+
+
+async def test_rate_limit_wait_never_ends_after_wait_until() -> None:
+    rec = Recorder(
+        [httpx.Response(429, headers={"retry-after": "400"}), httpx.Response(200, json={})]
+    )
+    slept: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    gh = GitHubHttp(
+        TOKEN,
+        transport=httpx.MockTransport(rec),
+        sleep=sleep,
+        wait_until_epoch=time.time() + 100,
+    )
+    with pytest.raises(GitHubRateLimited, match="time limit"):
+        await gh.get_json("/x")
+    assert slept == []
+    assert len(rec.requests) == 1
+
+
+async def test_rate_limited_writes_wait_but_errors_are_not_retried() -> None:
+    rec = Recorder(
+        [
+            httpx.Response(403, headers={"retry-after": "400"}),
+            httpx.Response(502),
+            httpx.Response(201, json={"id": 1}),
+        ]
+    )
+    gh, slept = client(rec)
+    with pytest.raises(GitHubTransient):
+        await gh.post_json("/x", {})
+    assert slept == [400.0]
+    assert len(rec.requests) == 2  # the 502 was not repeated: GitHub may have applied it
+
+
+def test_wait_until_defaults_to_the_run_clock(tmp_path: Path) -> None:
+    from builders import make_ctx
+
+    from morning_star_review.core.runctx import clear_run_context, set_run_context
+
+    now = time.time()
+    ctx = make_ctx(
+        tmp_path, run_started_epoch=now, wind_down_epoch=now + 4500, hard_epoch=now + 5400
+    )
+    assert GitHubHttp(TOKEN)._wait_until is None  # no run context
+    set_run_context(ctx)
+    try:
+        assert GitHubHttp(TOKEN)._wait_until == pytest.approx(now + 5400 - 30)
+        assert GitHubHttp(TOKEN, wait_until_epoch=now + 5)._wait_until == now + 5
+    finally:
+        clear_run_context()
+    clear_run_context()
+    set_run_context(make_ctx(tmp_path))  # no run clock: no time bound
+    try:
+        assert GitHubHttp(TOKEN)._wait_until is None
+    finally:
+        clear_run_context()
 
 
 async def test_4xx_is_lasting_and_redacted() -> None:

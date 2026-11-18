@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import math
 import os
 import re
 import shutil
@@ -16,7 +18,6 @@ import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -26,6 +27,7 @@ from morning_star_review.core.contract import (
     AgentBudgets,
     AgentJob,
     AgentPhase,
+    AgentRunResult,
     AgentState,
     ChangedFileRef,
     ExhaustReason,
@@ -33,6 +35,7 @@ from morning_star_review.core.contract import (
     ResolvedBudgets,
     ResolvedRoles,
     Role,
+    RunLimits,
     Usage,
 )
 from morning_star_review.core.errors import (
@@ -45,6 +48,7 @@ from morning_star_review.core.guard import heartbeat
 from morning_star_review.core.jsonio import read_bytes, write_json_atomic
 from morning_star_review.core.models import price
 from morning_star_review.core.naming import slug
+from morning_star_review.core.runclock import RUN_DEADLINE_STOP
 
 __all__ = [
     "CHANGED_FILES_JSON",
@@ -61,6 +65,7 @@ __all__ = [
     "cap_bytes",
     "cap_paths",
     "cost_share",
+    "deadline_run_result",
     "exhaust_reasons",
     "head_text_reader",
     "job_dir_name",
@@ -68,7 +73,12 @@ __all__ = [
     "link_diffs",
     "load_changed_files",
     "mark_started",
+    "meter_epoch",
+    "meter_float",
+    "meter_usage",
     "progress",
+    "read_coverage",
+    "read_meter",
     "read_partial_notes",
     "require_dir",
     "started_epoch",
@@ -303,8 +313,14 @@ def agent_job(
     budgets: AgentBudgets,
     changed_files: Sequence[ChangedFileRef],
     format_target: Literal["review", "verify"] = "review",
+    run_limits: RunLimits | None = None,
+    cooldown_path: Path | None = None,
 ) -> AgentJob:
-    """An ``AgentJob`` whose runner files live in the job directory itself."""
+    """An ``AgentJob`` whose runner files live in the job directory itself.
+
+    ``run_limits`` are the run-level limits of the job's phase (``RunClock.limits``);
+    ``cooldown_path`` is the run's shared cooldown file of the job's model.
+    """
     price_in, price_out = price(role.model)
     return AgentJob(
         phase=phase,
@@ -326,17 +342,22 @@ def agent_job(
         result_path="result.json",
         partial_notes_path="notes.partial.txt",
         format_target=format_target,
+        run_limits=run_limits,
+        cooldown_path=str(cooldown_path) if cooldown_path is not None else None,
     )
 
 
-def launch_timeout(budgets: AgentBudgets, activity_limit: timedelta) -> float:
-    """Wall-clock allowance for the agent process inside one activity attempt.
+def launch_timeout(budgets: AgentBudgets) -> float:
+    """Base wall-clock allowance for the agent process (seconds).
 
     The runner's own budget (explore + grace + rescue) plus room for process start and
-    the SDK's interrupt settling, but always ending before the activity times out.
+    the SDK's interrupt settling. The launcher extends it by the time the agent spent
+    waiting on rate limits (its clocks pause meanwhile), up to the job's run limits
+    (``agent_launcher.run_agent``). The activity timeouts sit above every allowed
+    deadline, so they no longer cap it.
     """
     wanted = budgets.explore_seconds + budgets.grace_seconds + budgets.rescue_seconds + 90
-    return float(max(60, min(wanted, activity_limit.total_seconds() - 60)))
+    return float(max(60, wanted))
 
 
 def exhaust_reasons(values: Sequence[str]) -> list[ExhaustReason]:
@@ -404,12 +425,127 @@ def agent_line(
     exhausted_by: Sequence[str],
     stop_reason: str | None,
     state: str,
+    rl_wait: float = 0.0,
 ) -> str:
-    """The ``msreview agent:`` progress line (space-separated ``key=value`` pairs)."""
+    """The ``msreview agent:`` progress line (space-separated ``key=value`` pairs).
+
+    ``rl_wait`` is the time the agent waited on rate limits (whole seconds).
+    """
     reasons = ",".join(exhausted_by) or "-"
     stop = re.sub(r"\s+", "_", stop_reason or "-")[:60]
+    waited = round(rl_wait) if math.isfinite(rl_wait) and rl_wait > 0 else 0
     return (
         f"msreview agent: phase={phase} model={model} state={state} complete={complete} "
         f"rescued={rescued} budget_exhausted={budget_exhausted} exhausted_by={reasons} "
-        f"stop_reason={stop}"
+        f"stop_reason={stop} rl_wait={waited}"
+    )
+
+
+# ------------------------------------------------------------------------ meter.json
+
+METER_JSON = "meter.json"  # the agent's meter, in the job directory
+METER_MAX_BYTES = 256 * 1024
+_METER_INTS = (
+    "llm_calls",
+    "tool_calls",
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+)
+
+
+def read_meter(job_dir: Path) -> dict[str, Any] | None:
+    """The raw ``meter.json`` of an agent job; None when missing, too large or unusable.
+
+    Bounded read (``METER_MAX_BYTES``, no symlinks). The file is written by our own
+    runner, but every value is still checked by the reader that uses it.
+    """
+    path = job_dir / METER_JSON
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > METER_MAX_BYTES:
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def meter_float(data: dict[str, Any], key: str) -> float:
+    """``data[key]`` as a finite non-negative number, else 0.0 (booleans do not count)."""
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return 0.0
+    number = float(value)
+    return number if math.isfinite(number) and number >= 0 else 0.0
+
+
+def meter_epoch(data: dict[str, Any], key: str) -> float | None:
+    """``data[key]`` as a finite positive epoch, else None."""
+    number = meter_float(data, key)
+    return number if number > 0 else None
+
+
+def meter_usage(job_dir: Path, model: str) -> Usage | None:
+    """Usage of an agent job from its ``meter.json``, attributed to ``model``.
+
+    For a job whose process was stopped before it wrote ``result.json``: the meter
+    still counts every model call made and every rate-limit wait sat out. Same rules
+    as the driver's meter parser; None when the meter is missing or unusable.
+    """
+    data = read_meter(job_dir)
+    if data is None:
+        return None
+    counts = {k: data[k] for k in _METER_INTS if type(data.get(k)) is int and data[k] >= 0}
+    waits = data.get("rl_waits")
+    reasons = data.get("finish_reasons")
+    try:
+        return Usage(
+            model=model,
+            **counts,
+            cost_usd=round(meter_float(data, "cost_usd"), 6),
+            seconds=round(meter_float(data, "seconds"), 3),
+            finish_reasons=[str(r)[:20] for r in reasons][-200:]
+            if isinstance(reasons, list)
+            else [],
+            rate_limit_waits=waits if type(waits) is int and waits >= 0 else 0,
+            rate_limit_wait_seconds=round(meter_float(data, "rl_wait_seconds"), 3),
+        )
+    except ValueError:
+        return None
+
+
+COVERAGE_JSON = "coverage.json"  # paths the agent opened (AgentJob.coverage_path)
+_AGENT_NAMES = {"explore": "explorer", "verify": "verifier", "format": "formatter"}
+
+
+def read_coverage(job_dir: Path, max_bytes: int = 1024 * 1024) -> list[str]:
+    """Paths an agent job recorded in ``coverage.json`` (empty when unreadable)."""
+    try:
+        data = json.loads(read_bytes(job_dir / COVERAGE_JSON, max_bytes=max_bytes))
+    except (MsreviewError, OSError, ValueError):
+        return []
+    return [p for p in data if isinstance(p, str)] if isinstance(data, list) else []
+
+
+def deadline_run_result(phase: AgentPhase, job_dir: Path, model: str) -> AgentRunResult:
+    """What an agent stopped at the run's time limit leaves behind.
+
+    The process was stopped before it wrote ``result.json``: its notes so far
+    (``notes.partial.txt``, read by the caller), the files it opened and the metered
+    usage, including its rate-limit waits. State ``Error`` and stop reason
+    ``run_deadline``, so the verdict says why the agent did not finish.
+    """
+    return AgentRunResult(
+        phase=phase,
+        state="Error",
+        stop_reason=RUN_DEADLINE_STOP,
+        notes=None,
+        rescued=False,
+        complete=False,
+        budget_exhausted=True,
+        exhausted_by=["deadline"],
+        opened_paths=read_coverage(job_dir),
+        usage=meter_usage(job_dir, model) or Usage(model=model),
+        error=f"the {_AGENT_NAMES[phase]} was stopped at the run's time limit",
     )

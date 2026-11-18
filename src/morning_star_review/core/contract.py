@@ -457,6 +457,10 @@ class Usage(Contract):
     finish_reasons: list[Annotated[str, StringConstraints(max_length=20)]] = Field(
         default_factory=list, max_length=200
     )
+    # Rate-limit waits (429 / capacity / 5xx) the agent sat out: waits started by the
+    # runner or the shared-cooldown hook, and the time they took (not part of any budget).
+    rate_limit_waits: int = Field(default=0, ge=0)
+    rate_limit_wait_seconds: float = Field(default=0.0, ge=0)
 
     def plus(self, other: Usage) -> Usage:
         """Sum of two usages (``model`` of ``self`` is kept)."""
@@ -471,6 +475,8 @@ class Usage(Contract):
             cost_usd=self.cost_usd + other.cost_usd,
             seconds=self.seconds + other.seconds,
             finish_reasons=[*self.finish_reasons, *other.finish_reasons][-200:],
+            rate_limit_waits=self.rate_limit_waits + other.rate_limit_waits,
+            rate_limit_wait_seconds=self.rate_limit_wait_seconds + other.rate_limit_wait_seconds,
         )
 
 
@@ -658,6 +664,23 @@ class ChangedFileRef(Contract):
     diff_file: str | None  # rendered hunks file, relative to the job dir
 
 
+class RunLimits(Contract):
+    """Run-level limits of one agent job (wall-clock epoch seconds).
+
+    Tools close at the latest at wind_down_epoch; no model call starts and no
+    rate-limit wait ends after stop_epoch. Never paused.
+    """
+
+    wind_down_epoch: float = Field(allow_inf_nan=False)
+    stop_epoch: float = Field(allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> RunLimits:
+        if self.stop_epoch < self.wind_down_epoch:
+            raise ValueError("stop_epoch must not be before wind_down_epoch")
+        return self
+
+
 class AgentJob(Contract):
     """``job.json`` read by ``python -m morning_star_review.agent <phase> <job_dir>``."""
 
@@ -682,6 +705,10 @@ class AgentJob(Contract):
     partial_notes_path: str
     # Phase "format" only: which strict schema the formatter fills.
     format_target: Literal["review", "verify"] = "review"
+    # Run-level ceiling (core/runclock.py); None = only the job's own budgets apply.
+    run_limits: RunLimits | None = None
+    # Absolute path of the run's shared per-model cooldown file (runclock.cooldown_path).
+    cooldown_path: str | None = None
 
 
 class AgentRunResult(Contract):

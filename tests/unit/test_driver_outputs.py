@@ -9,8 +9,15 @@ from typing import Any
 
 import pytest
 
-from morning_star_review import outputs
-from morning_star_review.core.contract import OperatorPolicy, ReviewOutcome, RunOverrides, Usage
+from morning_star_review import deferred, outputs
+from morning_star_review.core.contract import (
+    FailureInput,
+    OperatorPolicy,
+    ReviewOutcome,
+    ReviewRequest,
+    RunOverrides,
+    Usage,
+)
 from morning_star_review.driver import DriverConfig
 
 PR = "https://github.com/octo-org/widgets/pull/7"
@@ -219,3 +226,112 @@ def test_symlinks_in_the_report_dir_are_replaced_not_followed(tmp_path: Path) ->
     for name in outputs.REPORT_FILES:
         assert not (out / name).is_symlink()
     assert (out / "report.md").read_text() == 'x = "$(touch pwned)"\n'
+
+
+def test_usage_line_shows_rate_limit_waits() -> None:
+    usage = {
+        "explorer:mistral-large-4": Usage(
+            model="mistral-large-4", llm_calls=4, rate_limit_waits=5, rate_limit_wait_seconds=430.7
+        ),
+        "explorer:zai-glm-5-3": Usage(model="zai-glm-5-3", llm_calls=3),
+    }
+    line = outputs.usage_line(outcome(usage=usage))
+    first, second = line.removeprefix("msreview usage: ").split("; ")[:2]
+    assert first.endswith("cost=$0.0000 rl_wait=431")
+    assert "rl_wait" not in second
+
+
+def _failure_plan(run_dir: Path) -> ReviewOutcome:
+    req = ReviewRequest(
+        pr_url=PR,
+        repo="octo-org/widgets",
+        mode="ci",
+        policy=OperatorPolicy(trust_repo_config_models=True),
+        run_label="gha:test",
+    )
+    inp = FailureInput(req=req, snap=None, stage="explore", error_type="E", error_text="boom")
+    o = outcome(status="failed", verdict=None, reason="explore failed: E: boom", review_url=None)
+    plan = deferred.DeferredPlan(
+        kind="failure", execution_id=o.execution_id, failure=inp, outcome=o
+    )
+    deferred.write_plan(run_dir, plan)
+    return o
+
+
+def test_deferred_emit_names_only_the_plan(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gh_out, summary = tmp_path / "gh_output", tmp_path / "summary.md"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    o = _failure_plan(run_dir)
+    c = cfg(tmp_path)
+    c.defer_publish_dir = tmp_path / "publish"
+    env = {"GITHUB_OUTPUT": str(gh_out), "GITHUB_STEP_SUMMARY": str(summary)}
+    path = outputs.emit(c, o, run_dir, deployment="msreview-ci-d", env=env)
+    plan = tmp_path / "publish" / deferred.PUBLISH_PLAN_JSON
+    assert deferred.load_plan(plan).kind == "failure"
+    assert plan.stat().st_mode & 0o777 == 0o600
+    lines = dict(line.split("=", 1) for line in gh_out.read_text().splitlines())
+    # Status, verdict, findings and the summary come from the publish step.
+    assert lines == {
+        "publish-plan": str(plan),
+        "execution-id": o.execution_id,
+        "deployment": "msreview-ci-d",
+    }
+    assert not summary.exists()
+    assert path is not None and path.is_file()  # the report files are still written
+    out = capsys.readouterr()
+    assert out.out == ""  # no annotation
+    usage, result = out.err.strip().splitlines()
+    assert usage.startswith("msreview usage: ") and usage.endswith("; posting in the next step")
+    assert result == "msreview result: status=failed verdict=- findings=0; posting in the next step"
+
+
+def test_deferred_dir_without_a_plan_emits_as_usual(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gh_out = tmp_path / "gh_output"
+    c = cfg(tmp_path)
+    c.defer_publish_dir = tmp_path / "publish"
+    outputs.emit(
+        c,
+        outcome(status="skipped", verdict=None),
+        tmp_path / "run",
+        env={"GITHUB_OUTPUT": str(gh_out)},
+    )
+    lines = dict(line.split("=", 1) for line in gh_out.read_text().splitlines())
+    assert lines["status"] == "skipped" and "publish-plan" not in lines
+    assert not (tmp_path / "publish").exists()
+    assert capsys.readouterr().out.startswith("::notice ")
+
+
+def test_emit_published_writes_the_ci_results(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gh_out, summary = tmp_path / "gh_output", tmp_path / "summary.md"
+    run_dir = tmp_path / "plan" / "run"
+    (run_dir / "report").mkdir(parents=True)
+    (run_dir / "report" / "report.md").write_text("posted report\n")
+    stop = outputs.StopCommands(stream=io.StringIO())
+    stop.start()
+    env = {"GITHUB_OUTPUT": str(gh_out), "GITHUB_STEP_SUMMARY": str(summary)}
+    path = outputs.emit_published(outcome(), tmp_path / "report", env, run_dir=run_dir, stop=stop)
+    assert path == tmp_path / "report" / "report.md" and path.read_text() == "posted report\n"
+    assert json.loads((tmp_path / "report" / "run.json").read_text())["status"] == "posted"
+    lines = dict(line.split("=", 1) for line in gh_out.read_text().splitlines())
+    assert lines == {
+        "status": "posted",
+        "verdict": "findings",
+        "findings": "0",
+        "execution-id": "msreview-ci-x-pr7-latest-0a0b0c0d",
+        "report-path": str(path),
+    }
+    assert "report body" in summary.read_text()
+    assert not stop.active
+    out = capsys.readouterr()
+    assert out.out.startswith("::notice title=Morning Star Code Review::posted")
+    assert "msreview result: status=posted" in out.err
+    # Without a run directory the files come from the outcome.
+    outputs.emit_published(outcome(status="failed", reason="r"), tmp_path / "r2", {}, run_dir=None)
+    assert json.loads((tmp_path / "r2" / "run.json").read_text())["status"] == "failed"

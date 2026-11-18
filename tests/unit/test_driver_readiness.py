@@ -8,6 +8,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
@@ -15,14 +17,18 @@ if str(_HERE) not in sys.path:
 from test_driver_lifecycle import (  # noqa: E402
     FAST,
     SECRETS,
+    FakeClock,
     FakePlatform,
+    Worker,
     _run_root,  # noqa: F401 - autouse: the fake publish step writes outcome.json there
+    hooks,
     make_cfg,
     no_skip,
+    rate_limited,
 )
 
 from morning_star_review import driver  # noqa: E402
-from morning_star_review.platform import DeploymentState  # noqa: E402
+from morning_star_review.platform import DeploymentState, PlatformError  # noqa: E402
 
 NOW = datetime(2026, 11, 17, 12, 0, 0, tzinfo=UTC)
 
@@ -142,3 +148,138 @@ async def test_a_stale_deployment_alone_times_out(tmp_path: Path) -> None:
     assert code == driver.EXIT_FAILED
     assert "not ready" in (outcome.reason or "")
     assert p.started == [] and p.terminated == []
+
+
+# ----------------------------------------------------------------------------- slow, not dead
+# API errors extend the readiness wait; a rate-limited worker start is retried.
+
+READY_TIMING = driver.Timing(
+    **{
+        **FAST.__dict__,
+        "readiness_timeout_s": 90.0,
+        "readiness_poll_s": 1.0,
+        "start_retry_s": 2.0,
+        "readiness_error_budget_s": 600.0,
+    }
+)
+
+
+@pytest.fixture
+def fake_clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    """The driver's monotonic clock; only the hooks' sleeps advance it."""
+    c = FakeClock()
+    monkeypatch.setattr(driver, "_now", c.now)
+    return c
+
+
+class ErrorsWhileStarting(FakePlatform):
+    """Deployment reads fail with 429 for ``seconds`` (fake time) once the worker runs."""
+
+    def __init__(self, clock: FakeClock, seconds: float) -> None:
+        super().__init__()
+        self.clock = clock
+        self.seconds = seconds
+        self.until: float | None = None
+        self.refused = 0
+
+    async def deployment(self, name: str) -> DeploymentState | None:
+        if self.worker_running:
+            if self.until is None:
+                self.until = self.clock.t + self.seconds
+            if self.clock.t < self.until:
+                self.calls.append(("deployment", name))
+                self.refused += 1
+                raise rate_limited("get_deployment")
+        return await super().deployment(name)
+
+
+async def test_readiness_is_extended_by_time_lost_to_api_errors(
+    tmp_path: Path, fake_clock: FakeClock
+) -> None:
+    clock = fake_clock
+    # 200 s of 429s: more than the 90 s readiness timeout, within the error budget.
+    p = ErrorsWhileStarting(clock, 200.0)
+    h = hooks(p, Worker(p), sleep=clock.sleep, timing=READY_TIMING)
+    outcome, code = await driver.run_review(make_cfg(tmp_path, deadline_s=3600), SECRETS, h)
+    assert code == driver.EXIT_OK and outcome.status == "posted"
+    assert p.refused >= 5 and p.started == [outcome.execution_id]
+
+
+async def test_readiness_extension_is_bounded_by_its_budget(
+    tmp_path: Path, fake_clock: FakeClock
+) -> None:
+    clock = fake_clock
+    p = ErrorsWhileStarting(clock, 100_000.0)
+    w = Worker(p)
+    h = hooks(p, w, sleep=clock.sleep, timing=READY_TIMING)
+    start = clock.t
+    outcome, code = await driver.run_review(make_cfg(tmp_path, deadline_s=3600), SECRETS, h)
+    assert code == driver.EXIT_FAILED and "not ready within 90s" in (outcome.reason or "")
+    assert "lost to Workflows API errors" in (outcome.reason or "")
+    waited = clock.t - start
+    budget = READY_TIMING.readiness_timeout_s + READY_TIMING.readiness_error_budget_s
+    assert budget - 60 <= waited <= budget + READY_TIMING.api_backoff_max_s
+    assert p.started == [] and w.cancelled
+
+
+def _register_429() -> BaseException:
+    """What the Workflows SDK raises when spec registration gets a 429 (not retried)."""
+    from http import HTTPStatus
+
+    from mistralai.workflows.exceptions import ErrorCode, WorkflowsException
+
+    return WorkflowsException(
+        message="Failed to register workflow specs",
+        status=HTTPStatus.TOO_MANY_REQUESTS,
+        code=ErrorCode.POST_WORKFLOWS_REGISTER_ERROR,
+    )
+
+
+class FailingWorker(Worker):
+    """Fails with ``error`` on its first ``failures`` starts, then runs normally."""
+
+    def __init__(self, platform: FakePlatform, error: BaseException, failures: int) -> None:
+        super().__init__(platform)
+        self.error = error
+        self.failures = failures
+
+    async def __call__(self) -> None:
+        if self.starts < self.failures:
+            self.starts += 1
+            raise self.error
+        await super().__call__()
+
+
+async def test_a_worker_rate_limited_at_registration_is_started_again(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    p = FakePlatform()
+    w = FailingWorker(p, _register_429(), failures=2)
+    outcome, code = await driver.run_review(make_cfg(tmp_path), SECRETS, hooks(p, w))
+    assert code == driver.EXIT_OK and outcome.status == "posted"
+    assert w.starts == 3 and p.started == [outcome.execution_id]
+    err = capsys.readouterr().err
+    assert "starting it again" in err and "(2 of 5)" in err
+
+
+async def test_worker_restarts_are_limited(tmp_path: Path) -> None:
+    p = FakePlatform()
+    w = FailingWorker(p, _register_429(), failures=100)
+    outcome, code = await driver.run_review(make_cfg(tmp_path), SECRETS, hooks(p, w))
+    assert code == driver.EXIT_FAILED and "worker failed" in (outcome.reason or "")
+    assert w.starts == 1 + FAST.worker_restarts
+    assert p.started == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ValueError("bad config"), PlatformError("register failed (HTTP 400)", 400)],
+)
+async def test_a_worker_that_fails_for_good_is_not_started_again(
+    tmp_path: Path, error: BaseException
+) -> None:
+    p = FakePlatform()
+    w = FailingWorker(p, error, failures=1)
+    outcome, code = await driver.run_review(make_cfg(tmp_path), SECRETS, hooks(p, w))
+    assert code == driver.EXIT_FAILED and "worker failed" in (outcome.reason or "")
+    assert w.starts == 1 and p.started == []

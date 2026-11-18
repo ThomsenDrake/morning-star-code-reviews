@@ -13,7 +13,13 @@ from typing import Any
 
 import pytest
 
-from morning_star_review.core.contract import AgentBudgets, AgentJob, Candidate, ChangedFileRef
+from morning_star_review.core.contract import (
+    AgentBudgets,
+    AgentJob,
+    Candidate,
+    ChangedFileRef,
+    RunLimits,
+)
 
 BASE_FILES = {
     "shop/money.py": (
@@ -125,6 +131,8 @@ class JobKit:
         format_target: str = "review",
         candidates: list[Candidate] | None = None,
         meter: dict[str, Any] | None = None,
+        run_limits: RunLimits | None = None,
+        cooldown_path: Path | None = None,
         **budget_overrides: Any,
     ) -> Path:
         job_dir = self.root / (name or f"job-{phase}")
@@ -163,6 +171,8 @@ class JobKit:
             result_path="result.json",
             partial_notes_path="notes.partial.txt",
             format_target=format_target,  # type: ignore[arg-type]
+            run_limits=run_limits,
+            cooldown_path=str(cooldown_path) if cooldown_path is not None else None,
         )
         (job_dir / "job.json").write_text(job.model_dump_json())
         if meter is not None:
@@ -275,3 +285,118 @@ END FINDING
 SUMMARY: Checked the refund change against prorate in shop/money.py; the call swaps two arguments.
 REVIEW COMPLETE
 """
+
+
+# ------------------------------------------------------------------ failing models, fake time
+
+FAILURES = {
+    # step: (failure kind, HTTP status, details reason, retryable) -> the SDK's error code
+    "429": ("provider", 429, "rate_limited", True),  # completion_rate_limited
+    "capacity": ("provider", 429, "service_tier_capacity_exceeded", True),  # unavailable
+    "503": ("provider", 503, "unavailable", True),  # completion_unavailable
+    "400": ("provider", 400, "invalid_request_error", False),  # completion_rejected
+    "lost": ("incomplete", None, None, True),  # completion_failed (a lost stream)
+}
+
+
+def failure(code: str, extra: dict[str, Any] | None = None) -> Any:
+    """The SDK exception a provider call raises for the failing step ``code``."""
+    from mistralai.vibe.harness.runtime.completion.models import (
+        CompletionError,
+        CompletionFailure,
+    )
+
+    kind, status, reason, retryable = FAILURES[code]
+    details: dict[str, Any] = {}
+    if status is not None:
+        details = {"reason": reason, "status_code": status}
+    details.update(extra or {})
+    message = "Rate limit exceeded" if status == 429 else f"failure {code}"
+    if code == "400":
+        message = "Invalid model"
+    return CompletionError(
+        CompletionFailure(
+            kind=kind,  # type: ignore[arg-type]
+            retryable=retryable,
+            status_code=status,
+            message=message,
+            details=details or None,
+        )
+    )
+
+
+def flaky_model(steps: list[Any], clock: Callable[[], float] | None = None) -> Any:
+    """A ScriptedModel whose steps may also fail.
+
+    A failing step is a key of ``FAILURES`` or ``(key, extra_details)``, for example
+    ``("429", {"retry_after_seconds": 200})``. ``requests`` keeps the last user message
+    of every model call; ``times`` the ``clock`` value at every call (when given).
+    """
+    from mistralai.agents import testing
+
+    class FlakyModel(testing.ScriptedModel):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.steps = list(steps)
+            self.used = 0
+            self.requests: list[str] = []
+            self.times: list[float] = []
+
+        def __deepcopy__(self, memo: dict[int, object]) -> FlakyModel:
+            memo[id(self)] = self
+            return self
+
+        async def complete(self, request: Any) -> Any:
+            assert self.used < len(self.steps), f"model call {self.used + 1} has no step"
+            step = self.steps[self.used]
+            self.used += 1
+            users = [m for m in request.messages if getattr(m, "role", "") == "user"]
+            self.requests.append(str(users[-1].content) if users else "")
+            if clock is not None:
+                self.times.append(clock())
+            if isinstance(step, str):
+                raise failure(step)
+            if isinstance(step, tuple):
+                raise failure(step[0], step[1])
+            inner = testing.ScriptedModel([step])
+            async for item in inner.complete(request):
+                yield item
+
+        def assert_consumed(self) -> None:
+            assert self.used == len(self.steps), f"used {self.used} of {len(self.steps)} steps"
+
+    return FlakyModel()
+
+
+class FakeTime:
+    """A clock for the meter and a sleep that advances it.
+
+    ``real`` makes every sleep also wait that many real seconds (an awaited hook that
+    really sleeps); otherwise a sleep only yields to the event loop.
+    """
+
+    def __init__(self, real: float = 0.0) -> None:
+        self.now = 1_000_000.0
+        self.sleeps: list[float] = []
+        self.real = real
+
+    def clock(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        import asyncio
+
+        self.sleeps.append(seconds)
+        await asyncio.sleep(self.real)
+        self.now += seconds
+
+
+@pytest.fixture
+def fake_time(monkeypatch: pytest.MonkeyPatch) -> FakeTime:
+    """Fake time for the runner's backoff and the hook's cooldown waits."""
+    from morning_star_review.agent import hooks, runner
+
+    ft = FakeTime()
+    monkeypatch.setattr(runner, "_sleep", ft.sleep)
+    monkeypatch.setattr(hooks, "_sleep", ft.sleep)
+    return ft

@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import re
 import secrets
 import sys
 import textwrap
@@ -300,3 +301,196 @@ def test_agent_exits_when_its_launcher_dies(tmp_path: Path) -> None:
     else:
         os.kill(pid, 9)
         pytest.fail("the agent outlived its launcher")
+
+
+# ------------------------------------------------------------------------ rate-limit waits
+
+
+def _meter_writer() -> str:
+    """Agent code: ``put(**keys)`` writes ``meter.json`` atomically.
+
+    Indented like the test bodies it is joined with (``_agent`` dedents the whole).
+    """
+    return """
+        def put(**keys):
+            data = {"phase": phase, "model": "mistral-large-4", "llm_calls": 1, **keys}
+            tmp = job_dir / "meter.tmp"
+            tmp.write_text(json.dumps(data))
+            os.replace(tmp, job_dir / "meter.json")
+        """
+
+
+async def test_rate_limit_waits_extend_the_allowance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The agent's meter shows growing waits: it outlives ``timeout_s`` and finishes."""
+    job = tmp_path / "job"
+    job.mkdir()
+    monkeypatch.setattr(launcher, "HEARTBEAT_EVERY", 0.2)
+    agent = _agent(
+        tmp_path,
+        _meter_writer()
+        + f"""
+        start = time.time()
+        while time.time() - start < 4.0:
+            put(rl_wait_seconds=time.time() - start, rl_waits=1, rl_until_epoch=time.time() + 1)
+            time.sleep(0.1)
+        (job_dir / "result.json").write_text({_result()!r})
+        """,
+    )
+    started = time.monotonic()
+    # A 2 s base leaves room for a slow interpreter start on a loaded machine.
+    res = await run_agent("explore", job, _ctx(tmp_path, agent), 2.0, latest_epoch=time.time() + 60)
+    assert res.state == "Completed"
+    assert time.monotonic() - started > 3.5
+
+
+async def test_rate_limit_waits_end_at_the_run_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """However long the wait, the process is stopped at ``latest_epoch`` + the margin."""
+    job = tmp_path / "job"
+    job.mkdir()
+    monkeypatch.setattr(launcher, "HEARTBEAT_EVERY", 0.2)
+    monkeypatch.setattr(launcher, "LATEST_MARGIN_S", 0.5)
+    agent = _agent(
+        tmp_path,
+        _meter_writer()
+        + """
+        (job_dir / "agent.pid").write_text(str(os.getpid()))
+        put(rl_wait_seconds=600.0, rl_waits=3, rl_until_epoch=time.time() + 3600)
+        time.sleep(30)
+        """,
+    )
+    started = time.monotonic()
+    latest = time.time() + 1.0
+    with pytest.raises(AgentTimedOut):
+        await run_agent("explore", job, _ctx(tmp_path, agent), 30, latest_epoch=latest)
+    assert time.time() >= latest + 0.5
+    assert 1.3 < time.monotonic() - started < 10
+    assert not _alive(int((job / "agent.pid").read_text()))
+
+
+async def test_without_run_limits_the_waits_have_a_fallback_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from morning_star_review.core import runclock
+
+    job = tmp_path / "job"
+    job.mkdir()
+    monkeypatch.setattr(launcher, "HEARTBEAT_EVERY", 0.2)
+    monkeypatch.setattr(runclock, "RL_FALLBACK_MAX_WAIT_S", 2.0)
+    agent = _agent(
+        tmp_path,
+        _meter_writer()
+        + """
+        put(rl_wait_seconds=0.0, rl_waits=1, rl_until_epoch=time.time() + 3600)
+        time.sleep(30)
+        """,
+    )
+    started = time.monotonic()
+    # The meter must be read before the 2 s base runs out, even on a loaded machine.
+    with pytest.raises(AgentTimedOut):
+        await run_agent("explore", job, _ctx(tmp_path, agent), 2.0)
+    assert 3.6 < time.monotonic() - started < 15  # 2 s base + 2 s fallback
+
+
+async def test_waits_of_an_earlier_attempt_do_not_extend_this_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "meter.json").write_text(json.dumps({"rl_wait_seconds": 900.0, "rl_waits": 4}))
+    monkeypatch.setattr(launcher, "HEARTBEAT_EVERY", 0.2)
+    agent = _agent(tmp_path, "time.sleep(30)\n")
+    started = time.monotonic()
+    with pytest.raises(AgentTimedOut):
+        await run_agent("explore", job, _ctx(tmp_path, agent), 1.0, latest_epoch=time.time() + 60)
+    assert time.monotonic() - started < 8
+
+
+async def test_each_new_wait_is_shown_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    monkeypatch.setattr(launcher, "HEARTBEAT_EVERY", 0.2)
+    agent = _agent(
+        tmp_path,
+        _meter_writer()
+        + f"""
+        t0 = time.time()
+        put(rl_waits=1, rl_wait_seconds=0.0, rl_until_epoch=t0 + 100, rl_last_code="x")
+        time.sleep(1.2)
+        put(rl_waits=2, rl_wait_seconds=430.0, rl_until_epoch=t0 + 200)
+        time.sleep(1.2)
+        put(rl_waits=2, rl_wait_seconds=630.0, rl_until_epoch=None)
+        time.sleep(0.8)
+        (job_dir / "result.json").write_text({_result()!r})
+        """,
+    )
+    beats: list[dict[str, object]] = []
+    monkeypatch.setattr(launcher, "heartbeat", beats.append)
+    await run_agent("explore", job, _ctx(tmp_path, agent), 30, model="mistral-large-4")
+    lines = [x for x in capsys.readouterr().err.splitlines() if "rate-limited" in x]
+    assert len(lines) == 2, lines
+    assert re.fullmatch(
+        r"msreview: mistral-large-4 rate-limited \(explore\); waiting (99|100)s "
+        r"\(total waited 0s\)",
+        lines[0],
+    )
+    assert re.fullmatch(
+        r"msreview: mistral-large-4 rate-limited \(explore\); waiting 19[89]s "
+        r"\(total waited 7m 10s\)",
+        lines[1],
+    )
+    assert {"phase": "explore", "llm_calls": 1, "rl_wait": 630} in beats
+
+
+def test_the_total_waited_leaves_out_the_wait_that_starts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The meter pauses for the whole planned wait when it starts: 164 s waited before,
+    # a 132 s wait starting now. Like agent.log, the line says 2m 44s, not 4m 56s.
+    now = 5_000_000.0
+    monkeypatch.setattr(launcher.time, "time", lambda: now)
+    notice = launcher._WaitNotice("explore", "mistral-large-4")
+    meter = {
+        "rl_waits": 5,
+        "rl_wait_seconds": 164.0 + 132.0,
+        "rl_wait_planned": 132.0,
+        "rl_until_epoch": now + 132.0,
+    }
+    notice.check(meter)
+    notice.check(meter)  # the same wait is shown once
+    # A meter without the planned seconds (an older agent) shows its total as it is.
+    notice.check({"rl_waits": 6, "rl_wait_seconds": 70.0, "rl_until_epoch": now + 15.0})
+    lines = [x for x in capsys.readouterr().err.splitlines() if "rate-limited" in x]
+    assert lines == [
+        "msreview: mistral-large-4 rate-limited (explore); waiting 132s (total waited 2m 44s)",
+        "msreview: mistral-large-4 rate-limited (explore); waiting 15s (total waited 1m 10s)",
+    ]
+
+
+def test_the_allowance_counts_the_wait_in_progress_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The meter adds the whole planned wait to rl_wait_seconds when the wait starts.
+    now = 5_000_000.0
+    monkeypatch.setattr(launcher.time, "time", lambda: now)
+    monkeypatch.setattr(launcher.time, "monotonic", lambda: 100.0)
+    allowance = launcher._Allowance(60.0, now + 3600.0, {"rl_wait_seconds": 10.0})
+    waiting = {"rl_wait_seconds": 10.0 + 120.0, "rl_wait_planned": 120.0}
+    assert allowance.remaining({**waiting, "rl_until_epoch": now + 120.0}) == 180.0
+    assert allowance.remaining({**waiting, "rl_until_epoch": now + 30.0}) == 180.0
+    # A meter without the planned seconds (an older agent) adds the rest of the wait.
+    assert allowance.remaining({"rl_wait_seconds": 40.0, "rl_until_epoch": now + 15.0}) == 105.0
+
+
+def test_meter_details_carry_the_rate_limit_wait(tmp_path: Path) -> None:
+    (tmp_path / "meter.json").write_text(
+        json.dumps({"llm_calls": 2, "rl_wait_seconds": 12.6, "rl_until_epoch": 1.0})
+    )
+    assert launcher.meter_details(tmp_path) == {"llm_calls": 2, "rl_wait": 13}
+    (tmp_path / "meter.json").write_text(json.dumps({"rl_wait_seconds": "x"}))
+    assert launcher.meter_details(tmp_path) == {"rl_wait": 0}
+    (tmp_path / "meter.json").write_text("[1, 2]")
+    assert launcher.meter_details(tmp_path) == {}

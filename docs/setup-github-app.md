@@ -59,7 +59,7 @@ The verdict labels need Issues: write. If the App does not have it:
 
 - **CLI:** labels are skipped, and the outcome records a note. `msreview app-check`
   shows it.
-- **Action:** set the input `labels: "false"`. Otherwise the token step requests a
+- **Action:** set the input `labels: "false"`. Otherwise the token steps request a
   permission that the installation does not have, and GitHub refuses the token. The run
   then falls back to report mode.
 

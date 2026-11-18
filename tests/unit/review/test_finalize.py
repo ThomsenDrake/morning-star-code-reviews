@@ -8,16 +8,23 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from morning_star_review.core.contract import (
     ExcludedFile,
+    FinalizeInput,
     FinalReview,
     PriorStatus,
+    ReviewRequest,
+    Usage,
     VerifyEntry,
+    VerifyResult,
 )
 from morning_star_review.core.ids import finding_id
+from morning_star_review.core.runclock import RUN_DEADLINE_STOP
+from morning_star_review.core.runctx import RunContext
 from morning_star_review.review import finalize, render
 from morning_star_review.review.final import models_of
 from morning_star_review.review.merge import merge_drafts
@@ -627,3 +634,163 @@ def test_a_later_review_does_not_carry_a_possible_issue_as_a_finding(make, scope
             make.info(),
         )
     assert final.verdict == "clean" and final.findings == []
+
+
+# --- run time limit and rate-limit waits (run clock in the RunContext) ------------------
+
+T0 = 1_800_000_000.0
+
+
+def run_ctx(**kw: Any) -> RunContext:
+    base: dict[str, Any] = {
+        "execution_id": "msreview-cli-octo-ledger-pr7-aaaaaaa-1234abcd",
+        "request_sha256": "0" * 64,
+        "seal_key": b"k" * 32,
+        "run_root": "/tmp/runs",
+        "mode": "cli",
+        "on_worker": False,
+        "github_token": None,
+        "read_token": None,
+        "bot_login": BOT,
+        "mistral_api_key": "test-key",
+        "agent_python": "/usr/bin/python3",
+        "run_started_epoch": T0,
+        "wind_down_epoch": T0 + 75 * 60,
+        "hard_epoch": T0 + 90 * 60,
+    }
+    base.update(kw)
+    return RunContext(**base)
+
+
+def finalize_input(make, run_dir: Path, verify: VerifyResult | None) -> FinalizeInput:
+    req = ReviewRequest(
+        pr_url="https://github.com/octo/ledger/pull/7",
+        repo="octo/ledger",
+        mode="cli",
+        policy=make.policy(),
+        run_label="cli:abc",
+    )
+    return FinalizeInput(
+        req=req,
+        snap=make.snapshot(run_dir=str(run_dir)),
+        prep=make.prepared(job_root=str(run_dir)),
+        verify=verify,
+    )
+
+
+def test_run_info_reads_the_run_clock_and_sums_rate_limit_waits(make, tmp_path) -> None:
+    from morning_star_review.activities.common import STARTED_FILE
+    from morning_star_review.activities.finalize import run_info
+
+    (tmp_path / STARTED_FILE).write_text(f"{T0 + 5:.3f}\n", encoding="utf-8")
+    verify = make.verify(
+        [],
+        usage=make.usage(GLM, rate_limit_waits=2, rate_limit_wait_seconds=45.0),
+        formatter_usage=make.usage(LARGE, rate_limit_waits=1, rate_limit_wait_seconds=15.0),
+    )
+    inp = finalize_input(make, tmp_path, verify)
+    explores = [
+        make.explore(GLM),
+        make.explore(
+            LARGE, usage=make.usage(LARGE, rate_limit_waits=7, rate_limit_wait_seconds=780.4)
+        ),
+    ]
+    drafts = [
+        make.review_draft(
+            [], model=LARGE, formatter_usage=make.usage(LARGE, rate_limit_wait_seconds=60.0)
+        )
+    ]
+    ctx = run_ctx()
+
+    def info(now: float, **kw: Any):
+        return run_info(inp, "exec-1", now, explores=explores, drafts=drafts, **kw)
+
+    before = info(T0 + 60 * 60, ctx=ctx)
+    assert (before.run_limit_reached, before.deadline_minutes) == (False, 90)
+    assert before.rate_limit_wait_seconds == pytest.approx(900.4)
+    assert before.duration_seconds == pytest.approx(60 * 60 - 5)
+    assert info(T0 + 75 * 60, ctx=ctx).run_limit_reached  # at the wind-down
+    assert info(T0 + 89 * 60, ctx=ctx).run_limit_reached
+    # A context without a run clock (older driver, tests): no limit, waits still summed.
+    for no_clock in (None, run_ctx(run_started_epoch=None, wind_down_epoch=None, hard_epoch=None)):
+        plain = info(T0 + 89 * 60, ctx=no_clock)
+        assert (plain.run_limit_reached, plain.deadline_minutes) == (False, None)
+        assert plain.rate_limit_wait_seconds == pytest.approx(900.4)
+    assert run_info(inp, "exec-1", T0, ctx=ctx).rate_limit_wait_seconds == pytest.approx(60.0)
+
+
+def test_with_a_verifier_the_run_winds_down_with_the_explorers(make, tmp_path) -> None:
+    """A verifying run stops its explorers at 64.5 of 90 min: finalize after that was
+    finished early, even though the run's own wind-down (75) has not come yet."""
+    from morning_star_review.activities.finalize import run_info
+
+    req = finalize_input(make, tmp_path, None).req
+    snap = make.snapshot(run_dir=str(tmp_path))
+    ctx = run_ctx()
+    for verifier, expected in ((GLM, True), (None, False)):
+        roles = make.roles(explorers=(GLM, LARGE), verifier=verifier)
+        prep = make.prepared(job_root=str(tmp_path), roles=roles)
+        inp = FinalizeInput(req=req, snap=snap, prep=prep)
+        assert not run_info(inp, "exec-1", T0 + 64 * 60, ctx=ctx).run_limit_reached
+        assert run_info(inp, "exec-1", T0 + 65 * 60, ctx=ctx).run_limit_reached is expected
+        assert run_info(inp, "exec-1", T0 + 75 * 60, ctx=ctx).run_limit_reached
+
+
+def test_finalize_after_the_wind_down_is_never_clean(make) -> None:
+    info = make.info(run_limit_reached=True, deadline_minutes=25, rate_limit_wait_seconds=600.0)
+    snap = make.snapshot()
+    final = finalize(
+        snap,
+        make.prepared(),
+        make.explore(),
+        make.review_draft([]),
+        make.anchors(),
+        make.heads().get,
+        info,
+    )
+    assert final.verdict == "incomplete" and not final.state.complete
+    assert final.verdict_reasons == [
+        "the review was finished early to stay within its 25-minute time limit; "
+        "models were rate-limited for 10 min in total"
+    ]
+
+
+def test_skipped_verifier_leaves_every_candidate_unconfirmed(make) -> None:
+    roles = make.roles([GLM], verifier=GLM)
+    snap = make.snapshot(config=make.config(roles))
+    prep = make.prepared(roles=roles)
+    draft = make.review_draft([make.draft(severity="critical")])
+    merge = merge_drafts([draft], make.anchors(), make.heads().get)
+    skipped = make.verify(
+        [],
+        source="empty",
+        state="NotRun",
+        stop_reason=RUN_DEADLINE_STOP,
+        complete=False,
+        budget_exhausted=True,
+        exhausted_by=["deadline"],
+        opened_paths=[],
+        unaddressed=[c.candidate_id for c in merge.candidates],
+        usage=Usage(model=GLM),
+    )
+    final = finalize(
+        snap,
+        prep,
+        make.explore(),
+        draft,
+        make.anchors(),
+        make.heads().get,
+        make.info(run_limit_reached=True, deadline_minutes=90),
+        explores=[make.explore()],
+        drafts=[draft],
+        merge=merge,
+        verify=skipped,
+    )
+    assert final.verdict == "incomplete" and not final.state.complete
+    assert final.verdict_reasons == [
+        "the review was finished early to stay within its 90-minute time limit",
+        "the verifier did not run: the run reached its time limit",
+    ]
+    assert [f.verify_status for f in final.findings] == ["uncertain"]
+    assert "Verifier: did not run; 1 not confirmed\n" in final.summary_md
+    assert "Rate-limit wait" not in final.summary_md

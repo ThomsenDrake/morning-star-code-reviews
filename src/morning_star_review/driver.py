@@ -4,6 +4,13 @@ One driver process serves exactly one review: it starts its own Workflows worker
 per-PR deployment, starts the execution routed to that deployment, waits for it, and
 always terminates the execution and stops the worker before it exits. ``--local`` runs
 the workflow in-process instead (no server).
+
+A slow run is fine, a run that dies of rate limits is not: the driver plans the run
+clock (``core.runclock``: wind-down W, hard deadline H) and passes it to the activities
+in the run context. Workflows API rate limits and server errors (status None, 408, 429,
+5xx) are waited out with a backoff instead of ending the run; only H ends it. At H the
+driver terminates the execution and still records the failure on the PR in-process
+(the deadline backstop).
 """
 
 from __future__ import annotations
@@ -29,13 +36,16 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from morning_star_review.core.contract import (
     MAX_USAGE_KEYS,
+    FailureInput,
     Mode,
     OperatorPolicy,
+    PrSnapshot,
     ReviewOutcome,
     ReviewRequest,
     Role,
     RunOverrides,
     Severity,
+    Stage,
     Usage,
     severity_at_least,
     usage_key,
@@ -50,6 +60,7 @@ from morning_star_review.core.naming import (
     parse_pr_url,
 )
 from morning_star_review.core.redact import redact
+from morning_star_review.core.runclock import SNAPSHOT_FILE, RunClock, plan_clock
 from morning_star_review.platform import (
     API_BASE,
     TERMINAL_STATUSES,
@@ -59,10 +70,12 @@ from morning_star_review.platform import (
     Platform,
     PlatformAuthError,
     PlatformError,
+    transient_worker_error,
 )
 
 if TYPE_CHECKING:
     from morning_star_review.activities.fetch_pr import EarlySkip
+    from morning_star_review.core.runctx import RunContext, TokenBox
 
 __all__ = [
     "CI_CANCELLED",
@@ -152,6 +165,10 @@ class DriverConfig:
     run_root: Path | None = None  # default: a fresh temporary directory
     keep_run_dir: bool = False
     stop_commands: Any = None  # outputs.StopCommands while the Actions log is muted
+    # Test knob: start the wind-down this many seconds after the start (runclock).
+    wind_down_after_s: float | None = None
+    # CI deferred publish: when set, the run writes a publish plan and copies it here.
+    defer_publish_dir: Path | None = None
 
 
 @dataclass
@@ -161,6 +178,11 @@ class DriverSecrets:
     read_token: str | None = field(default=None, repr=False)
     bot_login: str | None = None
     cannot_post_reason: str | None = None
+    # CLI: re-mints the App installation token (None when it cannot be minted).
+    github_token_refresh: Callable[[], Awaitable[str | None]] | None = field(
+        default=None, repr=False
+    )
+    github_token_minted_epoch: float | None = None
 
     def values(self) -> list[str]:
         return [v for v in (self.mistral_api_key, self.github_token, self.read_token) if v]
@@ -178,12 +200,22 @@ class Timing:
     clock_skew_s: float = 5.0
     precheck_timeout_s: float = 20.0  # the GitHub pre-check before any worker starts
     busy_wait_s: float = 30.0
-    start_attempts: int = 3
-    start_retry_s: float = 2.0
+    start_retry_s: float = 2.0  # first backoff after a retryable API error
     poll_s: float = 3.0
     terminate_timeout_s: float = 8.0
+    terminate_retry_s: float = 15.0  # retryable terminate errors are retried this long
     worker_stop_timeout_s: float = 15.0
-    max_poll_errors: int = 10
+    # Workflows API errors that may pass (status None, 408, 429, 5xx) are retried with a
+    # backoff from ``start_retry_s`` doubling up to ``api_backoff_max_s``, within these
+    # budgets (and never past the hard deadline):
+    api_backoff_max_s: float = 30.0
+    preflight_retry_s: float = 300.0  # whoami and the deployment reads before the worker
+    start_retry_budget_s: float = 600.0  # the execution start
+    readiness_error_budget_s: float = 600.0  # extends readiness by the time lost to errors
+    worker_restarts: int = 5  # a worker that fails with a 429/5xx before it is ready
+    # Polling tolerates such errors until the hard deadline (interval up to the max).
+    wind_down_check_s: float = 30.0  # the wind-down announcer checks the clock this often
+    backstop_timeout_s: float = 120.0  # the deadline backstop (record the failure)
 
 
 def prepare_process_env(
@@ -245,6 +277,55 @@ def _say(line: str) -> None:
     # After SIGHUP the terminal may be gone; a failed write must not stop the cleanup.
     with contextlib.suppress(OSError, ValueError):
         print(line, file=sys.stderr, flush=True)
+
+
+def _minutes(seconds: float) -> str:
+    """``90``, ``0.5``: minutes for the progress lines."""
+    return f"{round(seconds / 60, 1):g}"
+
+
+def api_backoff(timing: Timing, failures: int, base: float | None = None) -> float:
+    """The wait after ``failures`` retryable Workflows API errors in a row.
+
+    ``base`` (default ``start_retry_s``, 2 s) doubles per failure up to
+    ``api_backoff_max_s`` (30 s).
+    """
+    first = timing.start_retry_s if base is None else base
+    exponent = min(max(0, failures - 1), 30)
+    return min(timing.api_backoff_max_s, first * 2**exponent)
+
+
+async def retry_api[T](
+    call: Callable[[], Awaitable[T]],
+    *,
+    what: str,
+    timing: Timing,
+    budget_s: float,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    until: float | None = None,
+) -> T:
+    """``await call()``, retrying retryable ``PlatformError`` s with ``api_backoff``.
+
+    Gives up (re-raises the last error) when the next wait would end more than
+    ``budget_s`` after the first attempt, or after ``until`` (a ``_now()`` value: the
+    hard deadline). Errors that are not retryable are raised at once.
+    """
+    begun = _now()
+    limit = begun + budget_s if until is None else min(begun + budget_s, until)
+    failures = 0
+    while True:
+        try:
+            return await call()
+        except PlatformError as exc:
+            if not exc.retryable:
+                raise
+            failures += 1
+            delay = api_backoff(timing, failures)
+            if _now() + delay > limit:
+                raise
+            if failures == 1:
+                _say(f"msreview: Workflows API error ({exc}); retrying {what} with a backoff")
+            await sleep(delay)
 
 
 # ----------------------------------------------------------------------------- requests
@@ -337,18 +418,23 @@ async def choose_deployment(
     ref: PrRef,
     timing: Timing,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    until: float | None = None,
 ) -> str:
-    """The stable per-PR name, or a ``-x<hex>`` variant when another worker is live on it."""
+    """The stable per-PR name, or a ``-x<hex>`` variant when another worker is live on it.
+
+    Rate limits and server errors on the deployment read are retried for up to
+    ``timing.preflight_retry_s`` (and not past ``until``, a ``_now()`` value).
+    """
 
     async def state(name: str) -> DeploymentState | None:
-        for attempt in range(1, 4):  # a brief API hiccup should not end the run
-            try:
-                return await platform.deployment(name)
-            except PlatformError as exc:
-                if not exc.retryable or attempt == 3:
-                    raise
-                await sleep(timing.start_retry_s * attempt)
-        return None  # unreachable
+        return await retry_api(
+            lambda: platform.deployment(name),
+            what="get_deployment",
+            timing=timing,
+            budget_s=timing.preflight_retry_s,
+            sleep=sleep,
+            until=until,
+        )
 
     name = deployment_name(mode, ref)
     if not is_live(await state(name), timing):
@@ -363,16 +449,17 @@ async def choose_deployment(
 async def _served_by_live_worker(platform: Platform, eid: str, timing: Timing) -> bool:
     """True when ``eid`` runs on a deployment whose worker heartbeats: another live run.
 
-    An unknown deployment (or a read error) counts as not live, so a true orphan is
-    still terminated.
+    An unknown deployment (or an error that will not pass) counts as not live, so a
+    true orphan is still terminated. A rate limit or server error proves nothing:
+    it counts as live, so a slow run of another driver is never terminated.
     """
     try:
         state = await platform.execution(eid)
         if not state.deployment_name:
             return False
         return is_live(await platform.deployment(state.deployment_name), timing)
-    except PlatformError:
-        return False
+    except PlatformError as exc:
+        return exc.retryable
 
 
 async def sweep_orphans(
@@ -396,7 +483,7 @@ async def sweep_orphans(
         if not eid.startswith(prefix):
             continue
         if await _served_by_live_worker(platform, eid, timing):
-            _say(f"msreview: execution {eid} has a live worker (another run); not terminated")
+            _say(f"msreview: execution {eid} may have a live worker (another run); not terminated")
             continue
         try:
             await platform.terminate(eid)
@@ -434,6 +521,43 @@ def outcome_from_run_dir(run_dir: Path, eid: str) -> ReviewOutcome | None:
     except (OSError, ValueError):
         return None
     return outcome if outcome.execution_id == eid else None
+
+
+# A sealed PrSnapshot is far below this (fetch_pr bounds the PR data it keeps).
+_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024
+
+
+def deadline_stage(run_dir: Path) -> Stage:
+    """The stage a run reached, from the directories its activities created."""
+    try:
+        names = {p.name for p in run_dir.iterdir()}
+    except OSError:
+        return "fetch_pr"
+    if "verify" in names or "verify-format" in names:
+        return "verify"
+    if any(n.startswith("format-") for n in names):
+        return "structure"
+    if any(n.startswith("explore-") for n in names):
+        return "explore"
+    if SNAPSHOT_FILE in names:
+        return "prepare"
+    return "fetch_pr"
+
+
+def sealed_snapshot(run_dir: Path, ctx: RunContext) -> PrSnapshot | None:
+    """``<run_dir>/snapshot.json`` (fetch_pr's sealed snapshot) if this run sealed it."""
+    from morning_star_review.core.jsonio import read_bytes
+    from morning_star_review.core.seal import verify
+
+    path = run_dir / SNAPSHOT_FILE
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        snap = PrSnapshot.model_validate_json(read_bytes(path, max_bytes=_SNAPSHOT_MAX_BYTES))
+    except Exception as exc:  # unreadable, too large or not a snapshot
+        log.info("deadline backstop: no usable snapshot (%s)", type(exc).__name__)
+        return None
+    return snap if verify(snap, ctx) else None
 
 
 # Agent job directories under the run dir hold the runner's ``meter.json``:
@@ -475,12 +599,15 @@ def _meter_usage(path: Path) -> tuple[str, Usage] | None:
         return None
     counts = {k: data[k] for k in _METER_INTS if type(data.get(k)) is int and data[k] >= 0}
     reasons = data.get("finish_reasons")
+    rl_waits = data.get("rl_waits")
     try:
         usage = Usage(
             model=model,
             **counts,
             cost_usd=round(_non_negative(data.get("cost_usd")), 6),
             seconds=round(_non_negative(data.get("seconds")), 3),
+            rate_limit_waits=rl_waits if type(rl_waits) is int and rl_waits >= 0 else 0,
+            rate_limit_wait_seconds=round(_non_negative(data.get("rl_wait_seconds")), 3),
             finish_reasons=[str(r)[:20] for r in reasons][-200:]
             if isinstance(reasons, list)
             else [],
@@ -554,6 +681,8 @@ class Hooks:
     configure_sdk: bool | None = None
     # The GitHub skip pre-check before a worker starts (default: GitHub's REST API).
     precheck: Precheck | None = None
+    # Wall clock (epoch seconds) of the run clock and the wind-down announcer.
+    wall_clock: Callable[[], float] = time.time
 
 
 async def _default_precheck(req: ReviewRequest, secrets: DriverSecrets) -> EarlySkip | None:
@@ -618,12 +747,29 @@ class _Run:
         self.ref = ref
         self.started_at = _now()
         self.deadline = self.started_at + cfg.deadline_s
+        # The run clock (wall-clock epochs) the activities get in the run context.
+        self.start_epoch = hooks.wall_clock()
+        self.clock: RunClock = plan_clock(self.start_epoch, cfg.deadline_s, cfg.wind_down_after_s)
+        self.token_box: TokenBox | None = None
+        if secrets.github_token and secrets.github_token_refresh is not None:
+            from morning_star_review.core.runctx import TokenBox
+
+            minted = secrets.github_token_minted_epoch
+            self.token_box = TokenBox(
+                token=secrets.github_token,
+                minted_epoch=self.start_epoch if minted is None else minted,
+                refresh=secrets.github_token_refresh,
+            )
+        self.ctx: RunContext | None = None
         self.eid = execution_id(cfg.mode, ref, cfg.expected_head_sha, pysecrets.token_hex(4))
         self.deployment: str | None = None
         self.platform: Platform | None = None
         self.worker: asyncio.Task[None] | None = None
+        self.factory: WorkerFactory | None = None
+        self.worker_restarts = 0
         self.start_attempted = False
         self.terminal = False
+        self.deadline_hit = False  # the hard deadline ended the run
         self.stopping = False  # cleanup has begun; a signal must not interrupt it
         self.run_root = cfg.run_root or default_run_root(cfg.mode)
         self.ready_seconds: float | None = None
@@ -631,19 +777,31 @@ class _Run:
         self.before_worker: DeploymentState | None = None
         self.before_known = False
         self.worker_started_at: datetime | None = None
+        self.announcer: asyncio.Task[None] | None = None
 
     @property
     def run_dir(self) -> Path:
         return self.run_root / self.eid
 
-    def fail(self, reason: str) -> ReviewOutcome:
-        return failed_outcome(self.req, self.eid, reason, self.secrets.values())
+    def secret_values(self) -> list[str]:
+        """Every secret to redact, including GitHub tokens re-minted during the run."""
+        values = self.secrets.values()
+        if self.token_box is not None:
+            values += [t for t in self.token_box.history if t and t not in values]
+        return values
 
-    def context(self, on_worker: bool) -> Any:
+    def fail(self, reason: str) -> ReviewOutcome:
+        return failed_outcome(self.req, self.eid, reason, self.secret_values())
+
+    def deadline_reason(self) -> str:
+        return f"the review did not finish within the {self.cfg.deadline_s / 60:g}-minute deadline"
+
+    def context(self, on_worker: bool) -> RunContext:
+        """The run context (kept: the deadline backstop checks seals with its key)."""
         from morning_star_review.core.runctx import RunContext
         from morning_star_review.core.seal import request_digest
 
-        return RunContext(
+        self.ctx = RunContext(
             execution_id=self.eid,
             request_sha256=request_digest(self.req),
             seal_key=pysecrets.token_bytes(32),
@@ -657,10 +815,97 @@ class _Run:
             agent_python=self.cfg.agent_python,
             cannot_post_reason=self.secrets.cannot_post_reason,
             telemetry=self.cfg.telemetry,
+            run_started_epoch=self.clock.start_epoch,
+            wind_down_epoch=self.clock.wind_down_epoch,
+            hard_epoch=self.clock.hard_epoch,
+            defer_publish=self.cfg.defer_publish_dir is not None,
+            token_box=self.token_box,
         )
+        return self.ctx
 
     def remaining(self) -> float:
         return self.deadline - _now()
+
+    # ------------------------------------------------------------------ run clock
+
+    def start_clock(self) -> None:
+        """Say the deadline and the wind-down, and announce the wind-down when it comes."""
+        wind_down_s = self.clock.wind_down_epoch - self.clock.start_epoch
+        _say(
+            f"msreview: deadline {_minutes(self.clock.deadline_s)} min; "
+            f"wind-down at {_minutes(wind_down_s)} min"
+        )
+        if self.announcer is None:
+            self.announcer = asyncio.create_task(self._announce_wind_down())
+
+    async def _announce_wind_down(self) -> None:
+        clock = self.clock
+        while (left := clock.wind_down_epoch - self.hooks.wall_clock()) > 0:
+            await asyncio.sleep(min(left, max(0.001, self.timing.wind_down_check_s)))
+        used = clock.wind_down_epoch - clock.start_epoch
+        _say(
+            f"msreview: wind-down: {_minutes(used)} of {_minutes(clock.deadline_s)} minutes "
+            "used; finishing the review with what it has"
+        )
+
+    def cancel_clock(self) -> None:
+        if self.announcer is not None:
+            self.announcer.cancel()
+            self.announcer = None
+
+    async def stop_clock(self) -> None:
+        announcer, self.announcer = self.announcer, None
+        if announcer is None:
+            return
+        announcer.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await announcer
+
+    # ------------------------------------------------------------------ deadline backstop
+
+    async def deadline_backstop(self, outcome: ReviewOutcome) -> ReviewOutcome:
+        """After the hard deadline, record the failure as ``report_failure`` would.
+
+        The execution is gone (terminated or cancelled), so its ``report_failure`` never
+        ran: the driver writes ``outcome.json`` and marks the PR (failure banner and
+        label; a failure plan in CI deferred mode) in-process. An outcome an activity of
+        this run already wrote wins and is returned instead; otherwise the outcome stays
+        the driver's ``failed`` one. Never raises.
+        """
+        found = outcome_from_run_dir(self.run_dir, self.eid)
+        if found is not None:
+            return found
+        ctx = self.ctx
+        if ctx is None:
+            return outcome
+        stage = deadline_stage(self.run_dir)
+        try:
+            recorded = await asyncio.wait_for(
+                self._record_deadline_failure(ctx, stage),
+                max(0.001, self.timing.backstop_timeout_s),
+            )
+        except Exception as exc:  # TimeoutError included; best effort
+            detail = redact(f"{type(exc).__name__}: {exc}", self.secret_values())[:300]
+            _say(f"msreview: could not record the deadline failure on the PR ({detail})")
+            return outcome
+        _say(f"msreview: recorded the deadline failure (the run reached stage {stage})")
+        head = getattr(recorded, "head_sha", None)
+        if isinstance(head, str) and head and outcome.head_sha is None:
+            return outcome.model_copy(update={"head_sha": head})
+        return outcome
+
+    async def _record_deadline_failure(self, ctx: RunContext, stage: Stage) -> Any:
+        # Imported here: the activity modules load the Workflows SDK.
+        from morning_star_review.activities import report_failure
+
+        inp = FailureInput(
+            req=self.req,
+            snap=sealed_snapshot(self.run_dir, ctx),
+            stage=stage,
+            error_type="MsreviewDeadline",
+            error_text=self.deadline_reason(),
+        )
+        return await report_failure.record_failure(inp, ctx)
 
     # ------------------------------------------------------------------ local mode
 
@@ -673,16 +918,20 @@ class _Run:
             _configure_workflows_sdk(None, self.secrets.mistral_api_key, local=True)
             runner = _default_local_runner
         _say(f"msreview: execution {self.eid} (local, in-process)")
+        self.start_clock()
         try:
             result = await asyncio.wait_for(runner(self.req), max(1.0, self.remaining()))
         except TimeoutError:
-            minutes = self.cfg.deadline_s / 60
-            return self.fail(f"the review did not finish within the {minutes:g}-minute deadline")
+            self.deadline_hit = True
+            self.stopping = True  # the backstop is the cleanup now: no signal cancels it
+            return await self.deadline_backstop(self.fail(self.deadline_reason()))
         except Exception as exc:
             found = outcome_from_run_dir(self.run_dir, self.eid)
             if found is not None:
                 return found
             return self.fail(f"{type(exc).__name__}: {exc}")
+        finally:
+            await self.stop_clock()
         self.terminal = True
         if isinstance(result, ReviewOutcome):
             return result
@@ -704,9 +953,20 @@ class _Run:
         return self.platform
 
     async def preflight(self) -> str:
-        """whoami with the key; a refused key ends the run before any worker starts."""
+        """whoami with the key; a refused key ends the run before any worker starts.
+
+        Rate limits and server errors are retried for up to ``preflight_retry_s``.
+        """
+        platform = self._platform()
         try:
-            who = await self._platform().whoami()
+            who = await retry_api(
+                platform.whoami,
+                what="whoami",
+                timing=self.timing,
+                budget_s=self.timing.preflight_retry_s,
+                sleep=self.hooks.sleep,
+                until=self.deadline,
+            )
         except PlatformAuthError as exc:
             raise DriverError(
                 f"the Mistral API key was refused by the Workflows API ({exc}); check "
@@ -759,7 +1019,12 @@ class _Run:
         platform = self._platform()
         try:
             self.deployment = await choose_deployment(
-                platform, self.cfg.mode, self.ref, self.timing, self.hooks.sleep
+                platform,
+                self.cfg.mode,
+                self.ref,
+                self.timing,
+                self.hooks.sleep,
+                until=self.deadline,
             )
         except PlatformError as exc:
             raise DriverError(f"cannot read the deployment status ({exc})") from None
@@ -767,6 +1032,7 @@ class _Run:
             f"msreview: execution {self.eid} on deployment {self.deployment} "
             f"(workspace namespace {namespace[:8]})"
         )
+        self.start_clock()
         if self.cfg.mode == "ci":
             await sweep_orphans(platform, self.ref, self.req.pr_url, self.timing)
         set_run_context(self.context(on_worker=True))
@@ -778,6 +1044,18 @@ class _Run:
             _configure_workflows_sdk(self.deployment, self.secrets.mistral_api_key, local=False)
         if factory is None:
             factory = _default_worker
+        self.factory = factory
+        try:
+            outcome = await self._execute(factory, configure)
+        finally:
+            await self.cleanup()
+        if self.deadline_hit and self.start_attempted:
+            # The execution is terminated now; its own report_failure never ran.
+            outcome = await self.deadline_backstop(outcome)
+        return outcome
+
+    async def _execute(self, factory: WorkerFactory, configure: bool) -> ReviewOutcome:
+        """Start the worker, wait until it is ready, start the execution, wait for it."""
         try:
             self.before_known, self.before_worker = await self._deployment_now()
             if self.before_known and is_live(self.before_worker, self.timing):
@@ -796,8 +1074,6 @@ class _Run:
             return self.fail(str(exc))
         except PlatformError as exc:
             return self.fail(f"Workflows API error: {exc}")
-        finally:
-            await self.cleanup()
 
     def _move_to_fresh_deployment(self, configure: bool) -> None:
         """Switch to a ``-x<hex>`` deployment of our own (no worker of ours runs yet)."""
@@ -882,42 +1158,105 @@ class _Run:
         """Wait until our worker has registered: a heartbeat newer than its start.
 
         A stale ``is_active`` from a worker that stopped moments ago does not count;
-        otherwise the start could be sent before our worker exists.
+        otherwise the start could be sent before our worker exists. The readiness
+        timeout counts only time in which the deployment reads work: time lost to
+        retryable API errors (and worker restarts) extends it, by at most
+        ``readiness_error_budget_s``. A worker that fails with a rate limit or a
+        server error before it is ready is started again (``worker_restarts``).
         """
         name = self._deployment_name()
         platform = self._platform()
-        limit = _now() + self.timing.readiness_timeout_s
+        timing = self.timing
         begun = _now()
-        since = self.worker_started_at or datetime.now(UTC)
+        extension = 0.0
+        errors = 0
+
+        def limit() -> float:
+            return begun + timing.readiness_timeout_s + extension
+
         while True:
+            if self.remaining() <= 0:
+                self.deadline_hit = True
+                raise RunFailed(self.deadline_reason())
             if self.worker is not None and self.worker.done():
-                raise self._worker_failure()
+                failure = self._worker_failure()
+                if not self._may_restart_worker(limit()):
+                    raise failure
+                self.worker_restarts += 1
+                delay = api_backoff(timing, self.worker_restarts)
+                detail = redact(str(failure), self.secret_values())[:300]
+                _say(
+                    f"msreview: {detail}; starting it again in {delay:g}s "
+                    f"({self.worker_restarts} of {timing.worker_restarts})"
+                )
+                extension = min(timing.readiness_error_budget_s, extension + delay)
+                await self.hooks.sleep(delay)
+                await self._start_worker_again()
+                continue
+            t0 = _now()
             try:
                 d = await platform.deployment(name)
             except PlatformError as exc:
                 if not exc.retryable:
                     raise
-                d = None
+                errors += 1
+                delay = api_backoff(timing, errors)
+                lost = max(0.0, _now() - t0) + delay
+                extension = min(timing.readiness_error_budget_s, extension + lost)
+                if errors == 1:
+                    _say(f"msreview: Workflows API error ({exc}) while waiting for the worker")
+                if _now() + delay > limit():
+                    raise RunFailed(self._not_ready(extension)) from None
+                await self.hooks.sleep(delay)
+                continue
+            errors = 0
             if worker_registered(
                 d,
-                since=since,
+                since=self.worker_started_at or datetime.now(UTC),
                 before=self.before_worker,
-                skew_s=self.timing.clock_skew_s,
+                skew_s=timing.clock_skew_s,
                 before_known=self.before_known,
             ):
                 self.ready_seconds = _now() - begun
                 _say(f"msreview: worker ready in {self.ready_seconds:.1f}s")
                 return
-            if _now() >= limit:
-                limit_s = self.timing.readiness_timeout_s
-                raise RunFailed(f"the Workflows worker was not ready within {limit_s:g}s")
-            await self.hooks.sleep(self.timing.readiness_poll_s)
+            if _now() >= limit():
+                raise RunFailed(self._not_ready(extension))
+            await self.hooks.sleep(timing.readiness_poll_s)
+
+    def _not_ready(self, extension: float) -> str:
+        text = f"the Workflows worker was not ready within {self.timing.readiness_timeout_s:g}s"
+        if extension >= 1:
+            text += f" (plus {extension:.0f}s lost to Workflows API errors)"
+        return text
+
+    def _may_restart_worker(self, limit: float) -> bool:
+        """True when our worker failed with a 429/5xx and may be started again."""
+        worker = self.worker
+        if worker is None or not worker.done() or worker.cancelled() or self.factory is None:
+            return False
+        if self.worker_restarts >= self.timing.worker_restarts or _now() >= limit:
+            return False
+        return transient_worker_error(worker.exception())
+
+    async def _start_worker_again(self) -> None:
+        """Start the worker again on the same deployment (the old one has stopped)."""
+        if self.factory is None:
+            raise RunFailed("the Workflows worker did not start")
+        self.worker = None
+        # The state before the new worker: a heartbeat the failed one left is not ours.
+        self.before_known, self.before_worker = await self._deployment_now()
+        self.worker_started_at = datetime.now(UTC)
+        self.worker = asyncio.create_task(self._guarded_worker(self.factory))
 
     async def _start(self) -> None:
+        """Start the execution; rate limits and server errors are retried with the same
+        id for up to ``start_retry_budget_s`` (409 ``WF_1101``: already started)."""
         name = self._deployment_name()
         platform = self._platform()
         payload = self.req.model_dump(mode="json")
-        for attempt in range(1, self.timing.start_attempts + 1):
+
+        async def attempt() -> None:
             self.start_attempted = True
             try:
                 await platform.start(
@@ -928,35 +1267,49 @@ class _Run:
                 )
             except AlreadyStarted:
                 _say(f"msreview: execution {self.eid} already started; attaching")
-                return
-            except PlatformError as exc:
-                if not exc.retryable or attempt == self.timing.start_attempts:
-                    raise
-                await self.hooks.sleep(self.timing.start_retry_s * attempt)
-                continue
-            return
+
+        await retry_api(
+            attempt,
+            what="execute_workflow",
+            timing=self.timing,
+            budget_s=self.timing.start_retry_budget_s,
+            sleep=self.hooks.sleep,
+            until=self.deadline,
+        )
 
     async def _wait_done(self) -> ExecutionState:
+        """Poll the execution until it ends or the hard deadline passes.
+
+        Retryable API errors (rate limits, server errors) never end the run: the poll
+        interval backs off to ``api_backoff_max_s`` while they last and returns to
+        ``poll_s`` after a successful read. Other errors are raised.
+        """
         platform = self._platform()
         errors = 0
         while True:
             if self.worker is not None and self.worker.done():
                 raise self._worker_failure()
             if self.remaining() <= 0:
-                minutes = self.cfg.deadline_s / 60
-                raise RunFailed(f"the review did not finish within the {minutes:g}-minute deadline")
+                self.deadline_hit = True
+                raise RunFailed(self.deadline_reason())
             try:
                 state = await platform.execution(self.eid)
             except PlatformError as exc:
-                errors += 1
-                if not exc.retryable or errors > self.timing.max_poll_errors:
+                if not exc.retryable:
                     raise
+                errors += 1
+                if errors == 1:
+                    _say(f"msreview: Workflows API error ({exc}); still waiting, with a backoff")
+                delay = api_backoff(self.timing, errors, base=self.timing.poll_s)
             else:
+                if errors:
+                    _say(f"msreview: the Workflows API answers again after {errors} errors")
                 errors = 0
                 if state.status in TERMINAL_STATUSES:
                     self.terminal = True
                     return state
-            await self.hooks.sleep(min(self.timing.poll_s, max(0.0, self.remaining())))
+                delay = self.timing.poll_s
+            await self.hooks.sleep(min(delay, max(0.0, self.remaining())))
 
     def _outcome_of(self, state: ExecutionState) -> ReviewOutcome:
         found = outcome_from_run_dir(self.run_dir, self.eid)
@@ -978,9 +1331,22 @@ class _Run:
         """Step 11: terminate a non-terminal execution, then stop the worker."""
         self.stopping = True
         if self.start_attempted and not self.terminal and self.platform is not None:
-            try:
+            platform = self.platform
+
+            async def terminate() -> None:
                 await asyncio.wait_for(
-                    self.platform.terminate(self.eid), self.timing.terminate_timeout_s
+                    platform.terminate(self.eid), self.timing.terminate_timeout_s
+                )
+
+            try:
+                # A rate-limited terminate is tried again briefly: a terminate that never
+                # lands leaves the execution running without a worker until it times out.
+                await retry_api(
+                    terminate,
+                    what="terminate_workflow_execution",
+                    timing=self.timing,
+                    budget_s=self.timing.terminate_retry_s,
+                    sleep=self.hooks.sleep,
                 )
                 _say(f"msreview: terminated execution {self.eid}")
                 if self.worker is not None and not self.worker.done():
@@ -999,6 +1365,7 @@ class _Run:
         elif worker is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 worker.result()  # retrieve it so asyncio does not log "never retrieved"
+        await self.stop_clock()
 
 
 # ----------------------------------------------------------------------------- signals
@@ -1191,6 +1558,7 @@ async def _run_review(
         except Exception as exc:  # reporting problems never change the review result
             _say(f"msreview: could not write the reports ({type(exc).__name__}: {exc})")
     finally:
+        run.cancel_clock()
         guard.remove()
         clear_run_context()
         if not cfg.keep_run_dir:

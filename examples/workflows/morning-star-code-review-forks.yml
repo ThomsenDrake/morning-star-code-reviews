@@ -43,7 +43,8 @@ jobs:
          github.event.label.name == 'msreview: safe-to-review')
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Model rate limits slow a review down; keep this about 20 above deadline-minutes.
+    timeout-minutes: 110
     permissions:
       contents: read
       pull-requests: read
@@ -75,13 +76,14 @@ jobs:
               ;;
           esac
       # Pin to the full commit SHA of the release you reviewed.
-      - uses: ThomsenDrake/morning-star-code-reviews@v0.1.0
+      - uses: ThomsenDrake/morning-star-code-reviews@v0.1.1
         with:
           mistral-api-key: ${{ secrets.MISTRAL_API_KEY }}
           client-id: ${{ vars.MSREVIEW_APP_CLIENT_ID }}
           app-private-key: ${{ secrets.MSREVIEW_APP_PRIVATE_KEY }}
           expected-head-sha: ${{ github.event.pull_request.head.sha }}
           remove-label: "msreview: safe-to-review"
+          # deadline-minutes: "90"   # keep about 20 below timeout-minutes
 
   revoke-approval:
     # A new push to a PR that is not reviewed automatically invalidates the approval.
