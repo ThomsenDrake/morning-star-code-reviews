@@ -55,6 +55,12 @@ jobs:
           VENV: ${{ matrix.venv }}
         run: |
           if [ "$VENV" = agent ]; then uv sync --extra agent; else uv sync; fi
+          # The boundary tests probe each environment's interpreter. Here .venv is the
+          # matrix environment, so point that kind at it and let the other kind skip.
+          other=$([ "$VENV" = agent ] && echo WORKER || echo AGENT)
+          kind=$(echo "$VENV" | tr '[:lower:]' '[:upper:]')
+          echo "MSREVIEW_TEST_${kind}_PYTHON=$GITHUB_WORKSPACE/.venv/bin/python" >> "$GITHUB_ENV"
+          echo "MSREVIEW_TEST_${other}_PYTHON=$RUNNER_TEMP/no-${other,,}-venv/bin/python" >> "$GITHUB_ENV"
       - run: uv run --no-sync pytest -q
 
   action-dry-run:
