@@ -21,6 +21,7 @@ from morning_star_review.core.ids import finding_id
 from morning_star_review.review import finalize, render
 from morning_star_review.review.final import models_of
 from morning_star_review.review.merge import merge_drafts
+from morning_star_review.review.verdict import is_possible
 
 GOLDEN = Path(__file__).resolve().parents[2] / "fixtures" / "review" / "golden"
 GLM, LARGE, DEEPSEEK = "zai-glm-5-3", "mistral-large-4", "deepseek-v4-1-flash-1017"
@@ -281,9 +282,12 @@ def test_pipeline_outcome(make) -> None:
     }
     assert final.cost_usd == pytest.approx(0.06 + 0.05 + 0.04 + 0.01 + 0.03)
     assert final.coverage == {"reviewable": 1, "covered": 1, "excluded": 1}
-    # State: every listed finding, with the head code as evidence for new anchored ones.
+    # State: every listed finding but the possible issues, with the head code as
+    # evidence for new anchored ones.
     state_ids = {p.id: p for p in final.state.findings}
-    assert set(state_ids) == {f.id for f in final.findings}
+    possible = {f.id for f in final.findings if is_possible(f)}
+    assert money.id in possible and len(possible) == 2
+    assert set(state_ids) == {f.id for f in final.findings} - possible
     assert state_ids[off.id].evidence == "        end = start + size + 1"
     assert state_ids[sqli.id].comment_id == 103 and final.state.summary_comment_id == 55
     assert final.state.complete and final.state.verdict == "findings"
@@ -450,13 +454,14 @@ def test_verifier_failure_keeps_candidates_but_blocks_clean(make) -> None:
         merge=merge,
         verify=None,
     )
-    # The unconfirmed finding is open (summary only), so the verdict is "findings";
-    # without the verifier the review is not complete.
-    assert final.verdict == "findings" and final.verdict_reasons == ["the verifier did not run"]
-    assert not final.state.complete
+    # The unconfirmed finding is a possible issue (summary only), which does not count
+    # as a finding; without the verifier the review is not complete.
+    assert final.verdict == "incomplete" and final.verdict_reasons == ["the verifier did not run"]
+    assert not final.state.complete and final.state.verdict == "incomplete"
     f = final.findings[0]
     assert f.verify_status == "uncertain" and f.state == "summary_only"  # one vote: summary only
     assert "#### Possible issues (not confirmed)" in final.summary_md
+    assert "**Verdict: incomplete** · 1 possible issue (not confirmed) · " in final.summary_md
 
 
 def test_explore_without_draft_is_incomplete_not_clean(make) -> None:
@@ -486,7 +491,7 @@ def test_verifier_configured_but_no_merge_publishes_nothing_as_confirmed(make) -
         make.heads().get,
         make.info(),
     )
-    assert final.verdict == "findings" and final.verdict_reasons == ["the verifier did not run"]
+    assert final.verdict == "incomplete" and final.verdict_reasons == ["the verifier did not run"]
     assert not final.state.complete
     assert [(f.verify_status, f.state) for f in final.findings] == [("uncertain", "summary_only")]
 
@@ -532,3 +537,93 @@ def test_head_text_is_never_asked_for_paths_outside_the_checkout(make) -> None:
     )
     assert "../../etc/passwd" not in asked
     assert [p.action for p in final.priors] == ["file_deleted"]
+
+
+# --------------------------------------------------------------------------------------
+# Possible issues only: they do not make the verdict "findings"
+# --------------------------------------------------------------------------------------
+
+
+def possible_only(make, *, verifier_complete: bool = True, votes: int = 1, severity="medium"):
+    """One explorer per vote reports the same finding; the verifier leaves it uncertain."""
+    models = [GLM, LARGE, DEEPSEEK][:votes]
+    roles = make.roles(models, verifier=GLM)
+    snap = make.snapshot(config=make.config(roles))
+    prep = make.prepared(roles=roles)
+    drafts = [
+        make.review_draft([make.draft(severity=severity, title="Maybe off by one")], model=m)
+        for m in models
+    ]
+    merge = merge_drafts(drafts, make.anchors(), make.heads().get)
+    verify = make.verify(
+        [VerifyEntry(candidate_id=c.candidate_id, status="uncertain") for c in merge.candidates],
+        complete=verifier_complete,
+    )
+    explores = [make.explore(m) for m in models]
+    return finalize(
+        snap,
+        prep,
+        explores[0],
+        drafts[0],
+        make.anchors(),
+        make.heads().get,
+        make.info(),
+        explores=explores,
+        drafts=drafts,
+        merge=merge,
+        verify=verify,
+    )
+
+
+def test_possible_issue_alone_is_clean_when_complete(make) -> None:
+    final = possible_only(make)
+    assert final.verdict == "clean" and final.verdict_reasons == []
+    assert final.state.complete and final.state.verdict == "clean"
+    [f] = final.findings
+    assert (f.verify_status, f.state, f.carried) == ("uncertain", "summary_only", False)
+    head = "**Verdict: clean** · No confirmed findings · 1 possible issue (not confirmed) · "
+    assert head in final.summary_md and head in final.report_md
+    assert "#### Possible issues (not confirmed)" in final.summary_md
+    check_golden("possible_only_summary.md", final.summary_md)
+    make.assert_safe(final.summary_md)
+
+
+def test_possible_issue_alone_follows_completeness(make) -> None:
+    final = possible_only(make, verifier_complete=False)
+    assert final.verdict == "incomplete"
+    assert final.verdict_reasons == ["the verifier did not finish"]
+    assert "**Verdict: incomplete** · 1 possible issue (not confirmed) · " in final.summary_md
+
+
+def test_unconfirmed_finding_posted_inline_is_a_finding(make) -> None:
+    # ADDENDUM D: 2+ votes and high severity put an uncertain finding inline, tagged
+    # "(unconfirmed)"; it counts as an open finding.
+    final = possible_only(make, votes=2, severity="high")
+    [f] = final.findings
+    assert (f.verify_status, f.state) == ("uncertain", "open")
+    assert final.verdict == "findings" and final.state.verdict == "findings"
+    assert "**Verdict: 1 open finding (1 high)** · " in final.summary_md
+    assert "possible issue" not in final.summary_md
+
+
+@pytest.mark.parametrize("scope", ["incremental", "carry_over"])
+def test_a_later_review_does_not_carry_a_possible_issue_as_a_finding(make, scope) -> None:
+    # The state has no verification status: a recorded possible issue would come back
+    # as a carried, open finding and turn the next review into "findings".
+    first = possible_only(make)
+    assert first.verdict == "clean" and first.state.findings == []
+    snap = make.snapshot(prior=first.state)
+    prep = make.prepared(scope=scope, since_sha=first.state.head_sha)
+    if scope == "carry_over":
+        final = finalize(snap, prep, None, None, make.anchors(), make.heads().get, make.info())
+    else:
+        final = finalize(
+            snap,
+            prep,
+            make.explore(),
+            make.review_draft([]),
+            make.anchors(),
+            make.heads().get,
+            make.info(),
+        )
+    assert final.verdict == "clean" and final.findings == []

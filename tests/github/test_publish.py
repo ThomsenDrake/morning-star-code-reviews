@@ -156,6 +156,28 @@ async def test_superseded_during_publish(fake: FakeGitHub, tmp_path: Path) -> No
     assert (Path(snap.run_dir) / "report" / "report.md").exists()
 
 
+@pytest.mark.parametrize("can_post", [True, False])
+async def test_outcome_and_run_json_carry_reasons_and_possible_issues(
+    fake: FakeGitHub, tmp_path: Path, can_post: bool
+) -> None:
+    maybe = final_finding(
+        "f00000000000e", 20, state="summary_only", verify_status="uncertain", votes=["a"]
+    )
+    final = make_final([maybe], verdict="incomplete").model_copy(
+        update={"verdict_reasons": ["the verifier did not finish"]}
+    )
+    snap = make_snap(tmp_path, can_post=can_post, cannot_post_reason=None if can_post else "no")
+    outcome = await run(fake, tmp_path, snap, final)
+    assert outcome.status == ("posted" if can_post else "report")
+    assert outcome.verdict_reasons == ["the verifier did not finish"]
+    assert outcome.possible_issues == 1
+    run_json = json.loads((Path(snap.run_dir) / "report" / "run.json").read_text())
+    assert run_json["verdict_reasons"] == ["the verifier did not finish"]
+    assert run_json["possible_issues"] == 1
+    if can_post:
+        assert fake.pr_labels == ["msreview: incomplete"]
+
+
 async def test_report_mode_makes_no_requests(fake: FakeGitHub, tmp_path: Path) -> None:
     reason = REPORT_REASONS["not_installed"].format(slug="app", owner="octo-org", repo="widgets")
     snap = make_snap(tmp_path, can_post=False, cannot_post_reason=reason)

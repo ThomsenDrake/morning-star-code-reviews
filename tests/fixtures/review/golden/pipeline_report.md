@@ -1,5 +1,5 @@
 ### Morning Star Code Review report
-**Verdict: 5 open findings (4 critical, 1 medium)** · 2 possible issues not confirmed · `aaaaaaa` · full review
+**Verdict: 5 open findings (4 critical, 1 medium)** · 2 possible issues (not confirmed) · `aaaaaaa` · full review
 
 | Severity | Finding | Location | Status |
 |---|---|---|---|

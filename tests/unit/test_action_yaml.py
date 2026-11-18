@@ -137,9 +137,17 @@ def test_fork_workflow_follows_addendum_g() -> None:
     for assoc in ("OWNER", "MEMBER", "COLLABORATOR"):
         assert assoc in review["if"]
     assert "msreview: safe-to-review" in review["if"]
-    (step,) = review["steps"]
+    gate, step = review["steps"]
+    assert step["uses"].startswith("ThomsenDrake/morning-star-code-reviews@")
     assert step["with"]["expected-head-sha"] == "${{ github.event.pull_request.head.sha }}"
     assert step["with"]["remove-label"] == "msreview: safe-to-review"
+    # The triage role can add labels too: the approval path first checks the permission
+    # of the person who added the label, with the read-only workflow token.
+    assert gate["if"] == "github.event.action == 'labeled'"
+    assert gate["env"]["SENDER"] == "${{ github.event.sender.login }}"
+    assert gate["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert "collaborators/$SENDER/permission" in gate["run"]
+    assert "continue-on-error" not in gate
     revoke = doc["jobs"]["revoke-approval"]
     assert "synchronize" in revoke["if"] and "!contains" in revoke["if"]
     assert revoke["permissions"] == {}
@@ -155,6 +163,54 @@ def test_fork_workflow_follows_addendum_g() -> None:
     # Concurrency groups are repository-wide: the non-fork workflow joins its group even
     # when it skips a fork PR, so a shared name would cancel the fork review.
     assert review["concurrency"]["group"] != load(EXAMPLE)["concurrency"]["group"]
+
+
+def approval_gate_script() -> str:
+    gate = load(FORKS)["jobs"]["review"]["steps"][0]
+    assert gate["shell"] == "bash"
+    return str(gate["run"])
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+@pytest.mark.parametrize(
+    ("answer", "allowed"),
+    [
+        ("admin", True),
+        ("write", True),  # write, maintain, and custom roles based on them
+        ("read", False),  # read and triage
+        ("none", False),
+        ("", False),
+        ("Admin", False),
+        (None, False),  # the API call failed, for example HTTP 404
+    ],
+)
+def test_fork_approval_gate_needs_write_access(
+    tmp_path: Path, answer: str | None, allowed: bool
+) -> None:
+    # A stand-in `gh` prints what `gh api ... --jq .permission` would print.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "gh"
+    if answer is None:
+        fake.write_text("#!/bin/sh\necho 'gh: Not Found (HTTP 404)' >&2\nexit 1\n")
+    else:
+        fake.write_text(f'#!/bin/sh\necho "$*" > "{tmp_path}/args"\necho "{answer}"\n')
+    fake.chmod(0o755)
+    env = {"PATH": f"{bindir}:/usr/bin:/bin", "REPO": "o/r", "SENDER": "someone"}
+    res = subprocess.run(
+        ["bash", "-c", approval_gate_script()],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert (res.returncode == 0) is allowed, res.stdout + res.stderr
+    if answer is not None:
+        assert (tmp_path / "args").read_text().split()[:2] == [
+            "api",
+            "repos/o/r/collaborators/someone/permission",
+        ]
 
 
 def test_release_has_no_pypi_publish() -> None:

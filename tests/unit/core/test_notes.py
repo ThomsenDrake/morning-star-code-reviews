@@ -1209,3 +1209,105 @@ def test_escaped_verdict_evidence_is_unescaped() -> None:
     assert entry.reason == "Read handlers.py; the check is inverted."
     kept = parse_verdicts('VERDICT c2\nstatus: confirmed\nevidence: s = "a\\nb"\nEND VERDICT', IDS)
     assert kept.entries[0].evidence == 's = "a\\nb"'
+
+
+# --------------------------------------------------------------------------------------
+# Evidence written as a location line, then a fenced block (live: Mistral Large 4)
+# --------------------------------------------------------------------------------------
+
+_DB_HEAD = "file: ledger/db.py\nline: 155\nend_line: 156\nseverity: high\ntitle: T\nwhy: W\n"
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        # The live shape: the location line, then the code in a fence.
+        "evidence:\nledger/db.py:155-156:\n```python\n    cur.execute(q)\n    conn.commit()\n```",
+        "evidence: ledger/db.py:155-156:\n```python\n    cur.execute(q)\n    conn.commit()\n```",
+        "evidence: `ledger/db.py:155-156`:\n\n```\n    cur.execute(q)\n    conn.commit()\n```",
+        "evidence: **ledger/db.py (lines 155-156):**\n~~~py\n    cur.execute(q)\n"
+        "    conn.commit()\n~~~",
+        "evidence: ledger/db.py#L155-L156\n```python\n    cur.execute(q)\n    conn.commit()",
+        r"evidence: ledger/db.py:155:\n```python\n    cur.execute(q)\n    conn.commit()\n```",
+    ],
+)
+def test_location_line_before_a_fence_is_not_evidence(evidence: str) -> None:
+    f = _one(_DB_HEAD + evidence)
+    assert f.evidence == "cur.execute(q)\n    conn.commit()"
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected"),
+    [
+        # Not a location: code, or no line number, or not a file name.
+        ("evidence:\nelse:\n```python\nx\n```", "else:\n```python\nx\n```"),
+        ("evidence:\nledger/db.py:\n```python\nx\n```", "ledger/db.py:\n```python\nx\n```"),
+        ("evidence:\n127.0.0.1:8080\n```\nx\n```", "127.0.0.1:8080\n```\nx\n```"),
+        # A location line without a fence is left alone.
+        (
+            "evidence:\nledger/db.py:155:\n    cur.execute(q)",
+            "ledger/db.py:155:\n    cur.execute(q)",
+        ),
+    ],
+)
+def test_other_first_lines_stay_in_the_evidence(evidence: str, expected: str) -> None:
+    assert _one(_DB_HEAD + evidence).evidence == expected
+
+
+def test_location_line_before_a_fence_keeps_the_anchor_exact() -> None:
+    from morning_star_review.core.contract import AnchorFile, AnchorMap
+    from morning_star_review.review.anchoring import anchor_finding
+
+    head = [f"# line {n}" for n in range(1, 155)] + ["    cur.execute(q)", "    conn.commit()"]
+    af = AnchorFile(path="ledger/db.py", right_lines=list(range(150, 157)), hunks=[(150, 156)])
+    anchors = AnchorMap(files={"ledger/db.py": af}, renamed_from={})
+    f = _one(
+        _DB_HEAD + "evidence: ledger/db.py:155-156:\n```python\n    cur.execute(q)\n"
+        "    conn.commit()\n```"
+    )
+    a = anchor_finding(f, anchors, head, {"ledger/db.py"})
+    assert (a.kind, a.line, a.end_line, a.exact) == ("inline", 155, 156, True)
+
+
+# "FINDING: none" (seen live from zai-glm-5-3) is a no-findings declaration, not a block.
+NONE_MARKER_NOTES = """\
+- Checked the new tests against the fixtures they use.
+
+FINDING: none
+
+NO FINDINGS
+
+SUMMARY: The change only adds tests; nothing wrong found.
+REVIEW COMPLETE
+"""
+
+
+@pytest.mark.parametrize(
+    "marker", ["FINDING: none", "FINDING: None.", "**FINDING:** n/a", "FINDING - none found"]
+)
+def test_finding_none_declares_no_findings(marker: str) -> None:
+    notes = NONE_MARKER_NOTES.replace("FINDING: none", marker)
+    parsed = parse_notes(notes)
+    assert parsed.marker_count == 0
+    assert parsed.findings == []
+    assert parsed.unparsed == []
+    assert parsed.no_findings_declared
+    assert parsed.lossless
+    assert parsed.looks_complete
+    assert not looks_like_unformatted_findings(notes)
+
+
+def test_numbered_finding_none_is_still_a_marker() -> None:
+    parsed = parse_notes("FINDING 1: none\nfile: a.py\nline: 3\nEND FINDING\nREVIEW COMPLETE\n")
+    assert parsed.marker_count == 1
+
+
+def test_finding_none_inside_an_open_suggestion_stays_code() -> None:
+    notes = (
+        "FINDING\nfile: a.py\nline: 2\nseverity: high\ncategory: correctness\ntitle: t\n"
+        "evidence: x = 1\nwhy: w\nfix: f\nsuggestion:\n<<<\n    FINDING: none\n>>>\nEND FINDING\n"
+        "SUMMARY: s\nREVIEW COMPLETE\n"
+    )
+    parsed = parse_notes(notes)
+    assert parsed.marker_count == 1
+    assert len(parsed.findings) == 1

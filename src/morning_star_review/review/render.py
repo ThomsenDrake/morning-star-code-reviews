@@ -38,7 +38,7 @@ from morning_star_review.core.sanitize import (
 )
 from morning_star_review.review import suggest
 from morning_star_review.review.anchoring import line_text
-from morning_star_review.review.verdict import resolved_without_fix
+from morning_star_review.review.verdict import counts_as_finding, is_possible, resolved_without_fix
 
 __all__ = [
     "OTHER_HEADING",
@@ -255,17 +255,12 @@ def _counts(findings: Sequence[FinalFinding]) -> str:
     return ", ".join(f"{by[s]} {s}" for s in sorted(by, key=lambda s: SEVERITY_ORDER[s]))
 
 
-def _is_possible(f: FinalFinding) -> bool:
-    """Summary-only because the verifier could not confirm it (ADDENDUM D)."""
-    return f.verify_status == "uncertain" and f.state == "summary_only" and not f.carried
-
-
 def _below_threshold(f: FinalFinding, threshold: Severity) -> bool:
     return SEVERITY_ORDER[f.severity] > SEVERITY_ORDER[threshold]
 
 
 def _is_main(f: FinalFinding, threshold: Severity) -> bool:
-    if _is_possible(f):
+    if is_possible(f):
         return False
     if f.state == "open":
         return True
@@ -273,22 +268,22 @@ def _is_main(f: FinalFinding, threshold: Severity) -> bool:
 
 
 def verdict_headline(s: SummaryInput) -> str:
-    """The bold verdict line, with the head commit and the scope of the review."""
-    possible = [f for f in s.findings if _is_possible(f)]
-    open_ = [f for f in s.findings if f.state in ("open", "summary_only") and not _is_possible(f)]
-    if s.verdict == "clean":
-        text = "clean"
-    elif s.verdict == "incomplete":
-        text = "incomplete"
-    elif open_:
+    """The bold verdict line, with the head commit and the scope of the review.
+
+    Possible issues (unconfirmed, not inline) never count as open findings: with only
+    those, the verdict follows completeness and the line says none was confirmed.
+    """
+    n_possible = sum(1 for f in s.findings if is_possible(f))
+    open_ = [f for f in s.findings if counts_as_finding(f)]
+    if s.verdict == "findings" and open_:
         text = f"{_plural(len(open_), 'open finding')} ({_counts(open_)})"
-    elif possible:
-        text = f"{_plural(len(possible), 'possible issue')}, not confirmed"
     else:
-        text = "findings"
+        text = s.verdict
     extra = ""
-    if s.verdict == "findings" and open_ and possible:
-        extra = f" · {_plural(len(possible), 'possible issue')} not confirmed"
+    if n_possible:
+        extra = f" · {_plural(n_possible, 'possible issue')} (not confirmed)"
+        if s.verdict == "clean":
+            extra = " · No confirmed findings" + extra
     sha7 = code_span(s.head_sha[:7])
     since = code_span((s.since_sha or "")[:7])
     scope = {
@@ -375,7 +370,7 @@ def _possible_section(s: SummaryInput) -> str:
     rows = [
         [_severity(f.severity), _cell(f.title), _location(s, f), _plural(len(f.votes), "explorer")]
         for f in s.findings
-        if _is_possible(f)
+        if is_possible(f)
     ]
     if not rows:
         return ""
@@ -393,7 +388,7 @@ def _other_section(s: SummaryInput) -> str:
             _other_reason(f, s.inline_min_severity),
         ]
         for f in s.findings
-        if not _is_main(f, s.inline_min_severity) and not _is_possible(f)
+        if not _is_main(f, s.inline_min_severity) and not is_possible(f)
     ]
     if not rows:
         return ""

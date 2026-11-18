@@ -9,6 +9,13 @@ Precedence:
 2. ``incomplete`` when nothing is open and the review was not complete.
 3. ``clean`` otherwise.
 
+A *possible issue* does not count as open (see ``is_possible``): a new finding that the
+verifier could neither confirm nor refute (``uncertain``) and that was not posted inline
+(ADDENDUM D posts one inline, tagged "(unconfirmed)", only with 2+ explorer votes and
+high severity or worse). It is listed under "Possible issues (not confirmed)" and does
+not by itself make the verdict ``findings``: then the verdict follows completeness. An
+unconfirmed finding posted inline, and a carried prior, still count as open.
+
 ``clean`` is a claim that the whole change was reviewed and nothing was found, so it
 needs proof. The review is complete (it has no *blockers*) only when the primary
 explorer finished within its budget, every other explorer finished (see below), the
@@ -47,9 +54,11 @@ __all__ = [
     "RESOLVED_WITHOUT_FIX",
     "Assessment",
     "assess",
+    "counts_as_finding",
     "decide",
     "incomplete_reasons",
     "is_open",
+    "is_possible",
     "resolved_without_fix",
 ]
 
@@ -63,6 +72,20 @@ _FULL_DRAFT = ("parser", "parser+formatter")
 def is_open(f: FinalFinding) -> bool:
     """New or carried, posted inline or summary-only: anything not fixed or dismissed."""
     return f.state in ("open", "summary_only")
+
+
+def is_possible(f: FinalFinding) -> bool:
+    """A possible issue: new, ``uncertain`` after verification and not posted inline.
+
+    Only summary-only findings qualify: an uncertain finding that met the
+    "(unconfirmed)" inline rule (ADDENDUM D) is ``open`` and counts as a finding.
+    """
+    return f.verify_status == "uncertain" and f.state == "summary_only" and not f.carried
+
+
+def counts_as_finding(f: FinalFinding) -> bool:
+    """An open finding that makes the verdict ``findings`` (possible issues do not)."""
+    return is_open(f) and not is_possible(f)
 
 
 def resolved_without_fix(priors: Sequence[ResolvedPrior]) -> list[ResolvedPrior]:
@@ -319,7 +342,7 @@ def assess(
         unreviewed_code=unreviewed_code,
     )
     verdict: Verdict
-    if any(is_open(f) for f in findings) or resolved_without_fix(priors):
+    if any(counts_as_finding(f) for f in findings) or resolved_without_fix(priors):
         verdict = "findings"
     elif blockers:
         verdict = "incomplete"

@@ -43,7 +43,7 @@ from morning_star_review.review.reconcile import (
     refound_priors,
     sources_from_draft,
 )
-from morning_star_review.review.verdict import Assessment, assess
+from morning_star_review.review.verdict import Assessment, assess, is_possible
 
 __all__ = [
     "STATE_VERSION",
@@ -163,6 +163,10 @@ def _state(
     recorded = {p.id: p for p in snap.prior.findings} if snap.prior else {}
     items: list[PriorFinding] = []
     for f in findings:
+        if is_possible(f):
+            # Not recorded: a later review would carry it as an open finding (the state
+            # has no verification status), and possible issues never count as findings.
+            continue
         prior = recorded.get(f.id)
         items.append(
             PriorFinding(

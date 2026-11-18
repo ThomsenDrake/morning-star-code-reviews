@@ -22,7 +22,8 @@ First public release.
   - `examples/workflows/morning-star-code-review-forks.yml`, a hardened
     `pull_request_target` template for fork PRs. It reviews trusted authors
     automatically. Other authors need a maintainer's `msreview: safe-to-review` label,
-    which covers one head commit only.
+    which covers one head commit only. The label counts only when the person who added
+    it has write, maintain or admin access (the triage role can add labels too).
 - **CLI `msreview`:**
   - `review` (post or report);
   - `doctor` (with `--models` and `--deployments`);
@@ -40,8 +41,14 @@ First public release.
   and `mistral`. Supported models: `zai-glm-5-3`, `mistral-large-4`,
   `zai-glm-5-3-flash`, `deepseek-v4-1-flash-1017`.
 - **Verifier:** each merged candidate is confirmed, refuted or marked uncertain.
-  Uncertain findings go to "Possible issues (not confirmed)". Refuted findings are
-  dropped and kept in the report JSON.
+  Uncertain findings go to "Possible issues (not confirmed)"; on their own they do not
+  make the verdict `findings`, and `fail-on` and the `findings` output do not count
+  them. Refuted findings are dropped and kept in the report JSON.
+- **Budgets:** per-run cost cap, and tool-call and time budgets for each agent. A
+  tool-call budget that you set applies as set, also above a model's own default (25
+  for the flash models), up to the hard limit of 200. A turn that fails with a
+  temporary model error (for example HTTP 429) is retried while the agent's deadline
+  and cost share allow.
 - **Deterministic anchoring:** code anchors findings to diff lines, and evidence must
   match the head file. Inline comments are posted in one `COMMENT` review, with a
   one-by-one fallback when GitHub rejects a position.
@@ -59,8 +66,10 @@ First public release.
 - **Cross-file context:** the definitions of functions called on added lines are added
   to the prompt.
 - **Repository configuration** `.morning-star-review.yml`, read from the base commit.
-  It can only lower budgets. The CLI ignores its model and budget settings unless you
-  pass `--trust-repo-config`.
+  It can only lower budgets. The Action always uses it. Unless you pass
+  `--trust-repo-config`, the CLI ignores the file's model and budget settings and the
+  settings that steer the review (`exclude`, `review.instructions`,
+  `review.path_instructions`, `review.inline_min_severity`) for every repository.
 - **Security measures:**
   - read-only, confined agent tools;
   - hardened git;

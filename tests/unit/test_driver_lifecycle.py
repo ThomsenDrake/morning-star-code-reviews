@@ -335,6 +335,49 @@ async def test_hangup_cleans_up_like_sigterm(tmp_path: Path, sig: signal.Signals
     assert w.cancelled
 
 
+async def test_cancel_in_ci_says_the_workflow_run_was_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Live: Actions' Cancel arrives as SIGINT, which the step's trap forwards as SIGTERM;
+    # "cancelled by SIGTERM" told users nothing.
+    output, summary = tmp_path / "gh-output", tmp_path / "gh-summary"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    p = FakePlatform()
+    p.statuses = ["RUNNING"]
+    w = Worker(p)
+
+    def on_start(eid: str) -> None:
+        asyncio.get_running_loop().call_later(0.05, os.kill, os.getpid(), signal.SIGTERM)
+
+    p.on_start = on_start
+    h = driver.Hooks(platform=p, worker=w, timing=FAST, install_signals=True, precheck=no_skip)
+    cfg = make_cfg(tmp_path, mode="ci", policy=OperatorPolicy(trust_repo_config_models=True))
+    outcome, code = await driver.run_review(cfg, SECRETS, h)
+    assert code == driver.EXIT_CANCELLED and outcome.status == "failed"
+    assert outcome.reason == "cancelled (the workflow run was cancelled)"
+    assert p.terminated == [outcome.execution_id] and w.cancelled
+    out = capsys.readouterr().out
+    assert "::error title=Morning Star Code Review::cancelled (the workflow run" in out
+    assert "SIGTERM" not in out and "SIGTERM" not in summary.read_text(encoding="utf-8")
+
+
+async def test_empty_key_in_ci_names_the_action_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    p = FakePlatform()
+    cfg = make_cfg(tmp_path, mode="ci", policy=OperatorPolicy(trust_repo_config_models=True))
+    with pytest.raises(driver.DriverError, match="Action input `mistral-api-key` is empty"):
+        await driver.run_review(cfg, driver.DriverSecrets(mistral_api_key=""), hooks(p, Worker(p)))
+    with pytest.raises(driver.DriverError, match=r"^no Mistral API key$"):
+        await driver.run_review(
+            make_cfg(tmp_path), driver.DriverSecrets(mistral_api_key=""), hooks(p, Worker(p))
+        )
+    assert p.calls == []
+
+
 async def test_refused_key_is_a_preflight_error(tmp_path: Path) -> None:
     p = FakePlatform()
     p.whoami_error = PlatformAuthError("whoami failed (HTTP 401)", 401)
@@ -457,7 +500,7 @@ async def test_run_dir_is_removed_unless_kept(tmp_path: Path) -> None:
     assert not (tmp_path / "runs" / outcome.execution_id).exists()
 
 
-def _finding(severity: str, state: str = "open") -> FinalFinding:
+def _finding(severity: str, state: str = "open", verify_status: str | None = None) -> FinalFinding:
     return FinalFinding.model_validate(
         {
             "id": "f0123456789ab",
@@ -470,6 +513,7 @@ def _finding(severity: str, state: str = "open") -> FinalFinding:
             "evidence": "x",
             "explanation": "e",
             "state": state,
+            "verify_status": verify_status,
         }
     )
 
@@ -497,6 +541,21 @@ def test_fixed_findings_do_not_trigger_fail_on() -> None:
         {**outcome_dict("e"), "findings": [_finding("critical", state="fixed")]}
     )
     assert driver.exit_code_for(outcome, "findings") == 0
+
+
+@pytest.mark.parametrize("fail_on", ["findings", "high", "critical"])
+def test_possible_issues_do_not_trigger_fail_on(fail_on: str) -> None:
+    # Unconfirmed and summary-only: the verdict ignores it, and so does fail-on.
+    possible = _finding("critical", state="summary_only", verify_status="uncertain")
+    outcome = ReviewOutcome.model_validate(outcome_dict("e", findings=[possible]))
+    assert outcome.verdict == "clean" and outcome.possible_issues == 1
+    assert driver.exit_code_for(outcome, fail_on) == 0
+    # Posted inline as "(unconfirmed)": it counts.
+    inline = possible.model_copy(update={"state": "open"})
+    outcome = ReviewOutcome.model_validate(
+        {**outcome_dict("e"), "verdict": "findings", "findings": [inline]}
+    )
+    assert driver.exit_code_for(outcome, fail_on) == 3
 
 
 async def test_local_mode_runs_in_process(tmp_path: Path) -> None:

@@ -31,7 +31,9 @@ as **your own GitHub App**, or it writes a report when it cannot post.
 - **Honest verdicts.** Each PR gets one summary comment and one label: `clean`,
   `findings` or `incomplete`. The verdict is `clean` only when every reviewable file was
   read and every agent finished. A review that found nothing but could not finish is
-  `incomplete`, never a guessed `clean`.
+  `incomplete`, never a guessed `clean`. Findings that the verifier could neither
+  confirm nor refute are listed as "possible issues" and do not make the verdict
+  `findings` on their own.
 - **Incremental and idempotent.** On later pushes, only the files changed since the last
   reviewed commit are reviewed. Findings whose code changed are marked as addressed.
   Hidden markers make retries safe: a retry never posts duplicates.
@@ -72,12 +74,13 @@ and artifact) that tells you why nothing was posted.
 them. To review them, use the hardened `pull_request_target` template
 [`examples/workflows/morning-star-code-review-forks.yml`](examples/workflows/morning-star-code-review-forks.yml).
 It reviews automatically for trusted authors. For other authors, a maintainer must add a
-label, and the approval applies to one head commit only. Read
-[docs/security.md](docs/security.md) before you use it.
+label, and the approval applies to one head commit only. The job checks that the person
+who added the label has write, maintain or admin access, because the triage role can
+add labels too. Read [docs/security.md](docs/security.md) before you use it.
 
 ## Quickstart: CLI
 
-Requires Python 3.12+, `git` and [uv](https://docs.astral.sh/uv/), on macOS or Linux.
+Requires Python 3.12 to 3.14, `git` and [uv](https://docs.astral.sh/uv/), on macOS or Linux.
 
 ```bash
 uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews
@@ -173,10 +176,15 @@ review:
 exclude: ["docs/**"]
 ```
 
-The repository file can only *lower* budgets. When the CLI reviews a repository that is
-not yours, the file's model and budget settings are ignored unless you pass
-`--trust-repo-config`. The full schema, every Action input and the precedence rules
-are in [docs/configuration.md](docs/configuration.md).
+The repository file can only *lower* budgets. The Action always uses the file. The
+CLI does not check who owns the repository: without `--trust-repo-config` it ignores
+the file's model and budget settings (`preset`, `models`, `ensemble`, `verify`,
+`reasoning_effort`, `budgets`) and the settings that steer the review (`exclude`,
+`review.instructions`, `review.path_instructions`, `review.inline_min_severity`) for
+**every** repository, including your own, and the summary lists what it ignored. So
+the example above has an effect in the CLI only with `--trust-repo-config`; pass it
+when you trust whoever can merge to the base branch. The full schema, every Action
+input and the precedence rules are in [docs/configuration.md](docs/configuration.md).
 
 ## Limitations
 

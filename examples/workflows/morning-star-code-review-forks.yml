@@ -16,8 +16,10 @@
 #   is removed after the review and on every new push, so each push needs a fresh
 #   approval.
 # - Check the head commit before you add the label: a push that lands while you read
-#   (before the label) is the commit that gets reviewed. Anyone with triage or write
-#   access can add labels. See docs/security.md.
+#   (before the label) is the commit that gets reviewed.
+# - GitHub lets the triage role add labels too. The first step of the review job reads
+#   the repository permission of the person who added the label and stops the job
+#   unless it is write, maintain or admin. See docs/security.md.
 # - The workflow token is read-only; the GitHub App token does all writes.
 # Residual risks (steerable review text, cost, rate limits): see docs/security.md.
 name: Morning Star Code Review (forks)
@@ -52,6 +54,26 @@ jobs:
       group: morning-star-code-review-forks-${{ github.repository }}-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     steps:
+      # The triage role can add labels, but only write, maintain or admin may approve a
+      # review. `permission` is the base role: maintain reads as "write", triage as
+      # "read", and a custom role as the role it is based on. Any API error stops the job.
+      - name: Check that the label was added by someone with write access
+        if: github.event.action == 'labeled'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SENDER: ${{ github.event.sender.login }}
+        run: |
+          set -euo pipefail
+          permission=$(gh api "repos/$REPO/collaborators/$SENDER/permission" --jq .permission)
+          case "$permission" in
+            admin|write) echo "Approved by $SENDER ($permission access)." ;;
+            *)
+              echo "::error::Only people with write, maintain or admin access can approve a review. Remove the label; a maintainer can add it again."
+              exit 1
+              ;;
+          esac
       # Pin to the full commit SHA of the release you reviewed.
       - uses: ThomsenDrake/morning-star-code-reviews@v0.1.0
         with:

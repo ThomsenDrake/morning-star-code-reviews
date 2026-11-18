@@ -65,6 +65,8 @@ if TYPE_CHECKING:
     from morning_star_review.activities.fetch_pr import EarlySkip
 
 __all__ = [
+    "CI_CANCELLED",
+    "CI_NO_KEY",
     "EXIT_CANCELLED",
     "EXIT_FAILED",
     "EXIT_FAIL_ON",
@@ -97,6 +99,15 @@ TERMINATED_ACTIVITY_NOTE = (
     "msreview: a Temporal 'Activity not found on completion' warning may follow; it is "
     "expected after a termination and harmless"
 )
+
+# ci mode: the key comes only from the Action's `mistral-api-key` input (MISTRAL_API_KEY),
+# and GitHub does not enforce `required: true` for composite-action inputs.
+CI_NO_KEY = (
+    "no Mistral API key: the Action input `mistral-api-key` is empty (for example, the "
+    "MISTRAL_API_KEY secret is missing, or the workflow does not pass it to the action)"
+)
+# ci mode: Actions stops the step with a signal when someone cancels the workflow run.
+CI_CANCELLED = "cancelled (the workflow run was cancelled)"
 
 # Wait multiplier of the Workflows SDK's client-side activity retry in --local mode.
 LOCAL_RETRY_BACKOFF_COEFFICIENT = 0.0
@@ -204,10 +215,13 @@ def prepare_process_env(
 
 
 def fail_on_triggered(outcome: ReviewOutcome, fail_on: str) -> bool:
-    """True when the open findings meet the ``fail-on`` threshold."""
+    """True when the open findings meet the ``fail-on`` threshold.
+
+    Possible issues (unconfirmed, summary-only) do not count, as for the verdict.
+    """
     if fail_on == "never":
         return False
-    open_findings = [f for f in outcome.findings if f.state in ("open", "summary_only")]
+    open_findings = outcome.counted_findings()
     if fail_on == "findings":
         return bool(open_findings)
     threshold: Severity = "critical" if fail_on == "critical" else "high"
@@ -1142,7 +1156,7 @@ async def _run_review(
     if cfg.fail_on not in FAIL_ON_VALUES:
         raise DriverError(f"fail-on must be one of {', '.join(FAIL_ON_VALUES)}")
     if not secrets.mistral_api_key:
-        raise DriverError("no Mistral API key")
+        raise DriverError(CI_NO_KEY if cfg.mode == "ci" else "no Mistral API key")
     if cfg.deadline_s <= 0:
         raise DriverError("the deadline must be positive")
     req, ref = build_request(cfg)
@@ -1165,7 +1179,9 @@ async def _run_review(
             if task is not None:
                 task.uncancel()
             name = signal.Signals(guard.received).name
-            outcome = run.fail(f"cancelled by {name}")
+            # The runner sends SIGINT and the step's trap forwards it as SIGTERM: in ci
+            # mode the signal name says nothing to the user.
+            outcome = run.fail(CI_CANCELLED if cfg.mode == "ci" else f"cancelled by {name}")
             code = EXIT_CANCELLED
         # A run that ended before finalize (cancelled, terminated, failed) still spent
         # what its agents' meters recorded; report that instead of "usage: none".

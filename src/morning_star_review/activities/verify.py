@@ -42,6 +42,7 @@ from morning_star_review.core.contract import (
     AgentRunResult,
     Candidate,
     PrSnapshot,
+    ResolvedBudgets,
     Usage,
     VerifyDraft,
     VerifyEntry,
@@ -68,6 +69,7 @@ __all__ = [
     "render_candidate",
     "render_verify_prompt",
     "time_left",
+    "verifier_tool_calls",
     "verify",
     "verify_result",
 ]
@@ -85,6 +87,16 @@ OPENED_MAX_BYTES = 32 * 1024
 PR_BODY_CHARS = 1500
 ERROR_MAX = 2000
 REASON_KEEP = 300  # DroppedCandidate.reason bound
+
+
+def verifier_tool_calls(b: ResolvedBudgets, model: str) -> int:
+    """Tool-call budget of the verifier on ``model``.
+
+    An explicit ``verifier_max_tool_calls`` applies as set; otherwise the per-model
+    default applies when it is lower (presets set no verifier budget).
+    """
+    explicit = "verifier_max_tool_calls" in b.explicit
+    return tool_call_limit(model, b.verifier_max_tool_calls, explicit=explicit)
 
 
 # ------------------------------------------------------------------------ prompt
@@ -287,7 +299,7 @@ async def verify(inp: VerifyInput) -> VerifyResult:
         b = prep.budgets
         budgets = agent_budgets(
             b,
-            max_tool_calls=tool_call_limit(role.model, b.verifier_max_tool_calls),
+            max_tool_calls=verifier_tool_calls(b, role.model),
             seconds=b.verifier_minutes * 60,
             max_cost_usd=cost_share(prep.roles, b.max_cost_usd, "verifier"),
         )

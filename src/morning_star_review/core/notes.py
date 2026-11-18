@@ -455,7 +455,44 @@ def _code_value(text: str) -> str:
     unescaping: ``if x:\\n    raise E()`` in backticks becomes two lines, and the
     anchoring step then matches its first non-blank line (``evidence_variants``).
     """
-    return _unwrap(_unescape(text.strip(), code_spans=False))
+    return _unwrap(_without_location_line(_unescape(text.strip(), code_spans=False)))
+
+
+# A file name in a location line: no spaces, and a directory or an extension.
+_FILE_TOKEN = re.compile(r"[\w.@+-]+(?:/[\w.@+-]+)*")
+_EXTENSION = re.compile(r"\.[A-Za-z]\w*$")
+
+
+def _is_location(line: str) -> bool:
+    """A line that only says where code is: ``ledger/db.py:155-156:``, ``a.py#L3``,
+    ``**a.py (lines 3-4)**:``. A line number is required."""
+    text = line.strip(" \t*_`'\":")  # bold, code span, quotes, the closing colon
+    if not text or len(text) > 600:
+        return False
+    path, start, _ = _path_and_line(text)
+    return (
+        start is not None
+        and _FILE_TOKEN.fullmatch(path) is not None
+        and ("/" in path or _EXTENSION.search(path) is not None)
+    )
+
+
+def _without_location_line(text: str) -> str:
+    """Evidence written as a location line and then a fenced block: the block alone.
+
+    Mistral models sometimes write ``ledger/db.py:155-156:`` and then fence the code.
+    The location is not code: left in, it would be the line anchoring tries to match
+    (``evidence_variants``), and the anchor would not be exact.
+    """
+    lines = text.split("\n")
+    if len(lines) < 3 or not _is_location(lines[0]):
+        return text
+    rest = lines[1:]
+    while rest and not rest[0].strip():
+        rest = rest[1:]
+    if len(rest) >= 2 and _FENCE.match(rest[0]):
+        return "\n".join(rest)
+    return text
 
 
 def _cap(text: str, limit: int) -> str:
@@ -753,6 +790,19 @@ def _finding_marker(bare: str) -> re.Match[str] | None:
     return None
 
 
+_NO_FINDING_WORDS = frozenset(
+    {"none", "n/a", "na", "nil", "null", "-", "no findings", "none found"}
+)
+
+
+def _declares_no_finding(marker: re.Match[str]) -> bool:
+    """``FINDING: none`` is a model's way of saying NO FINDINGS, not an empty block."""
+    if marker.group("num"):
+        return False
+    rest = marker.group("rest").strip().strip(".").strip("`*_").strip().lower()
+    return rest in _NO_FINDING_WORDS
+
+
 def _prior_line(bare: str) -> PriorStatus | str | None:
     """A PriorStatus, the raw text of an unreadable PRIOR line, or None for prose."""
     m = _PRIOR.match(bare)
@@ -812,6 +862,13 @@ def parse_notes(notes: str) -> ParsedNotes:
                 tail = []
             continue
         marker = _finding_marker(bare)
+        if marker is not None and not strict and _declares_no_finding(marker):
+            close()
+            in_summary = False
+            structure_seen = True
+            out.no_findings_declared = True
+            tail = []
+            continue
         if marker is not None:
             close()
             in_summary = False
@@ -897,9 +954,10 @@ def looks_like_unformatted_findings(notes: str) -> bool:
     in_block = False
     for line in _normalise_newlines(notes):
         bare = _bare(line)
-        if _END_FINDING.match(bare):
+        marker = _finding_marker(bare)
+        if _END_FINDING.match(bare) or (marker is not None and _declares_no_finding(marker)):
             in_block = False
-        elif _finding_marker(bare) is not None:
+        elif marker is not None:
             in_block = True
         elif in_block and (_SUMMARY.match(bare) or _REVIEW_COMPLETE.match(bare)):
             in_block = False

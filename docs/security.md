@@ -52,9 +52,9 @@ It is **never executed**: nothing is installed, built, tested or run from the PR
 | **Someone dismisses findings without permission** | Resolving a thread dismisses a finding only when the person has write access or more. `review.author_may_dismiss: false` excludes the PR author. A resolve by anyone else is recorded as "resolved without a fix", and the finding stays open. |
 | **Foreign tasks on your Workflows task queue** (deployment names are predictable) | Each activity checks that the task belongs to this run's execution and request. Payloads between activities carry an HMAC seal with a key that exists only in the worker's memory. `publish` posts only sealed content. Execution ids have a random suffix. |
 | **A `.env` file or environment variables redirect the SDK** | The driver moves to an empty directory before the Workflows SDK is imported. Variables that break or redirect its configuration are removed. A non-default `SERVER_URL` is refused unless you allow it explicitly. |
-| **A repository configures expensive models or large budgets** | The repository file is read from the base commit only, and it can only lower budgets. In the CLI, a repository file is not trusted for models and budgets unless you pass `--trust-repo-config`. |
+| **A repository configures expensive models or large budgets** | The repository file is read from the base commit only, and it can only lower budgets. In the CLI, the file's model and budget settings, and the settings that steer the review (`exclude`, `review.instructions`, `review.path_instructions`, `review.inline_min_severity`), are ignored for every repository unless you pass `--trust-repo-config`. |
 | **Cost abuse** (huge PRs, or injected text asking the agents to read everything) | A hard USD cap for each run is checked before every model call. Each agent also has limits on tool calls, time and context size. Very large PRs are capped at 20,000 changed lines and marked partial. Commits that were already reviewed are skipped. Concurrency settings cancel superseded runs. |
-| **Supply chain** | Actions are pinned by full commit SHA. The Action installs from `uv.lock` with `--frozen`. `msreview setup` installs the agent dependencies with `--require-hashes`. The Mistral packages are pinned exactly. |
+| **Supply chain** | The third-party actions in `action.yml` and in this project's own workflows are pinned by full commit SHA. The example workflows refer to this action by a release tag, with a comment that asks you to pin the full commit SHA instead. The Action installs from `uv.lock` with `--frozen`. `msreview setup` installs the agent dependencies with `--require-hashes`. The Mistral packages are pinned exactly. |
 
 ## Data that leaves your machine or runner
 
@@ -99,19 +99,33 @@ workflows are often dangerous. The template follows these rules:
   the review job gets only `contents: read` and `pull-requests: read`. The App
   token does all writes.
 - **Only trusted authors are reviewed automatically:** `OWNER`, `MEMBER` or
-  `COLLABORATOR`.
+  `COLLABORATOR`, and only when the PR comes from a fork that the author owns.
 - **Other authors need a maintainer's approval for each push.** A maintainer reads the
   change, then adds the label `msreview: safe-to-review`. The review job passes
   `expected-head-sha` from the event, so the approval covers that one head commit. If
   the author pushes again before the review starts, the run is skipped as superseded.
   The label is removed after every review. A separate small job also removes it on every
   new push from an untrusted author, so each push needs a fresh approval.
+- **The label counts only from someone with write access.** GitHub also lets the
+  **triage** role add labels, so the label alone is not enough. When the job starts
+  from a label, its first step uses the read-only workflow token to read the
+  repository permission of the person who added the label
+  (`GET /repos/{owner}/{repo}/collaborators/{username}/permission`, which needs only
+  the Metadata: read permission that every token has). The job stops, before any
+  secret is used, unless the permission is write or admin. GitHub reports the maintain
+  role as write, the triage role as read, and a custom role as the role it is based on.
+  An API error also stops the job.
 - **The workflow file comes from the base branch.** On `pull_request_target`, a PR
   cannot change the workflow that reviews it.
-- Like the other example, the template uses a full-SHA pin. Use the commit that you reviewed.
+- **Pin the action by commit.** Both example workflows refer to the action by a release
+  tag (`@v0.1.0`), with a comment that asks you to pin it. Replace the tag with the full
+  commit SHA of the release that you reviewed: a tag can be moved to other code, but a
+  commit SHA always names the same code.
 
-Only people with write access can add labels. Anyone who can add the label can start a
-paid review.
+Anyone with write, maintain or admin access can start a paid review by adding the
+label. When someone with less access (for example the triage role) adds it, the run
+fails at the permission check and the label stays on the PR. Remove it; someone with
+write access can add it again after reading the change.
 
 ### Residual risks of reviewing fork PRs
 
@@ -142,7 +156,8 @@ paid review.
 
 - Create the App with exactly the permissions in [setup-github-app.md](setup-github-app.md).
   Do **not** grant Contents: write.
-- Pin the action to a full commit SHA that you reviewed.
+- Pin the action to a full commit SHA that you reviewed, not to a tag. The example
+  workflows use a tag only as a placeholder.
 - Use a dedicated Mistral workspace with a spending limit.
 - Keep `max-cost-usd` at a level you accept for one PR.
 - Rotate the App's private key and the Mistral key from time to time. GitHub Apps can
@@ -199,8 +214,11 @@ Residual risks:
 - **Fork approval timing.** The `msreview: safe-to-review` label approves the head
   commit at the moment the label is added. If the author pushes while you read, the
   label approves the new commit. Look at the head commit (the "Commits" tab) just
-  before you add the label. People with the **triage** role can add labels too, not
-  only people with write access, so they can also start paid fork reviews.
+  before you add the label.
+- **Triage role.** People with the triage role can add the label. They cannot start a
+  review, because the permission check stops the run. But a new run of the review job
+  cancels the one in progress for the same PR. So by removing and adding the label
+  again, they can cancel an approved review that is running.
 - **Trusted authors' forks.** Automatic fork reviews need a trusted author and a head
   repository that the author owns. If other people can push to that fork, their pushes
   are reviewed automatically too.

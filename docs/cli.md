@@ -62,16 +62,16 @@ Flags:
 | `--verify`, `--no-verify` | Turn the verifier on or off |
 | `--verifier-model ID`, `--verifier-effort LEVEL` | The verifier's model and effort |
 | `--max-cost-usd X` | Cost limit for the whole run (default 10.00, at most 100) |
-| `--max-tool-calls N`, `--explorer-minutes N` | Budget per explorer (defaults 60 and 15) |
-| `--verifier-max-tool-calls N`, `--verifier-minutes N` | Verifier budget (defaults 30 and 8) |
-| `--deadline-minutes N` | Overall time limit (default 45) |
+| `--max-tool-calls N`, `--explorer-minutes N` | Budget per explorer (defaults 60 and 15; at most 200 and 25). A flash explorer outside `best` gets 25 tool calls unless you set this |
+| `--verifier-max-tool-calls N`, `--verifier-minutes N` | Verifier budget (defaults 30 and 8; at most 200 and 25). A flash verifier gets 25 tool calls unless you set this |
+| `--deadline-minutes N` | Overall time limit (default 45, at most 55: the App token that the run posts with expires after 60 minutes) |
 | `--expected-head-sha SHA` | Skip the review if the PR head is no longer this commit |
 | `--out DIR` | Where to write `report.md`, `findings.json` and `run.json` (default `./msreview-reports`). The files are replaced on each run |
 | `--json` | Print the outcome as JSON instead of Markdown |
 | `--force` | Review drafts, closed PRs and head commits that were already reviewed |
 | `--trust-repo-config` | Let the repository file choose models, budgets, exclusions and instructions (see [configuration.md](configuration.md#untrusted-repository-files-cli)) |
 | `--read-token env\|gh\|none` | Read-only GitHub token, used when there is no App token: `env` uses `GITHUB_TOKEN` or `GH_TOKEN`, `gh` runs `gh auth token`, `none` uses no token |
-| `--fail-on LEVEL` | `never`, `findings`, `high` or `critical`: exit 3 when the open findings reach this level |
+| `--fail-on LEVEL` | `never`, `findings`, `high` or `critical`: exit 3 when the open findings reach this level (possible issues that the verifier could not confirm do not count) |
 | `--no-labels`, `--no-suggestions` | Do not set verdict labels, or do not post suggestion blocks |
 | `--local` | Run the workflow in this process, without starting a Workflows worker (for development and debugging) |
 | `--verbose` | More log output on stderr |
@@ -82,8 +82,10 @@ App, for example `--read-token gh`. Public repositories work without a token, bu
 GitHub's limits for unauthenticated requests are low.
 
 **Output.** Progress lines go to stderr. The result goes to stdout: the review as
-Markdown, or the outcome as JSON with `--json`. The last stderr lines are stable and
-easy to parse:
+Markdown, or the outcome as JSON with `--json`. The JSON outcome has, among others,
+`status`, `verdict`, `verdict_reasons` (for example why the review is `incomplete`),
+`possible_issues` (the number of findings that the verifier could not confirm) and
+`findings`. The last stderr lines are stable and easy to parse:
 
 ```
 msreview usage: explorer:zai-glm-5-3 llm=6 tools=9 in=… cached=… out=… reasoning=… cost=$0.0612; …; est_cost=$0.19
