@@ -14,9 +14,32 @@ One process runs one phase of one job directory:
 Both agents use ``Builtins.none()``, an explicit ``auto_compact_threshold`` and no
 ``reasoning_effort`` when the effort is ``default``.
 
-A turn of any phase that fails with a temporary model error (HTTP 429, an unavailable
-provider, a lost stream) runs again in the same session after a backoff
-(``RETRY_DELAYS``), while the phase deadline, the cost cap and the model-call limit allow.
+Rate limits slow a phase down; only the run's limits, the cost cap or a fixed wait cap
+end it:
+
+- A turn that fails with a temporary model error runs again in the same session after a
+  backoff (``ratelimit.backoff``: 15, 30, 60, 120, 180, 180, ... s, at least the
+  provider's Retry-After). Rate limits and unavailable models (``ratelimit.RL_CODES``)
+  are retried without a count limit, until the job's run limits (``RunLimits``), the
+  cost cap or, without run limits, ``RL_FALLBACK_MAX_WAIT_S`` of waiting stop them.
+  Lost streams and the like give up after ``TRANSIENT_MAX_STREAK`` failures in a row.
+- When a full backoff would end too close to the run's stop, the runner makes one last,
+  shorter wait that ends ``RETRY_MIN_TURN_SECONDS + FINAL_WAIT_MARGIN_S`` before the
+  stop, so the retried turn still gets its time. One clock reading decides each wait,
+  and the last wait is not checked against the stop a second time. A turn that the
+  run's stop ends (no room for another wait, or interrupted at the stop) gets the stop
+  reason ``RUN_DEADLINE_STOP``, so the review says the run's time limit ended the
+  agent.
+- Waiting pauses the phase clocks (``Meter.pause``), so a rate-limited explorer keeps
+  its whole exploration time; refused calls do not use up model calls.
+- A rate-limited agent that makes a wait extends the run's shared cooldown file of its
+  model to the wait's end (a wait it does not make leaves the file alone); every agent
+  process of the run waits it out before its next call of that model (``BudgetHook``).
+- The SDK itself tries every call ``ratelimit.SDK_MAX_ATTEMPTS`` times and waits at most
+  ``ratelimit.SDK_RETRY_AFTER_CAP_S`` per Retry-After, so long waits happen here, where
+  the meter sees them.
+- A running turn is polled (``_settled``) against an end that is re-read on every poll,
+  so a pause moves it.
 """
 
 from __future__ import annotations
@@ -24,7 +47,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import random
 import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -36,7 +58,7 @@ from mistralai import agents
 from mistralai.agents.pattern.hook import StructuredOutputHook
 from pydantic import BaseModel, ValidationError
 
-from morning_star_review.agent import hooks, jobio, prompts, tools
+from morning_star_review.agent import hooks, jobio, prompts, ratelimit, tools
 from morning_star_review.core.contract import (
     AgentJob,
     AgentRunResult,
@@ -50,6 +72,11 @@ from morning_star_review.core.notes import (
     parse_verdicts,
 )
 from morning_star_review.core.redact import redact
+from morning_star_review.core.runclock import (
+    RL_FALLBACK_MAX_WAIT_S,
+    RUN_DEADLINE_STOP,
+    format_wait,
+)
 
 __all__ = [
     "EXPLORER_NAME",
@@ -79,19 +106,12 @@ MAX_ERROR_CHARS = 2000
 
 # A turn that fails with a temporary model error (HTTP 429, an overloaded or unavailable
 # provider, a lost stream) is run again in the same session, which keeps its context and
-# the meter, after these waits plus up to RETRY_JITTER of each, while the phase deadline
-# and the cost cap allow. The SDK has already retried the model call a few times.
-RETRY_DELAYS = (15.0, 30.0, 60.0)
-RETRY_JITTER = 0.25
-RETRY_MIN_TURN_SECONDS = 30.0  # time the retried turn needs before the deadline
-RETRY_CODES = frozenset(
-    {
-        "completion_rate_limited",
-        "completion_unavailable",
-        "completion_timed_out",
-        "completion_failed",
-    }
-)
+# the meter, after a backoff (``ratelimit.backoff``). The SDK has already retried the
+# model call a few times. A retried turn needs RETRY_MIN_TURN_SECONDS before its end.
+RETRY_MIN_TURN_SECONDS = 30.0
+RETRY_CODES = ratelimit.TEMPORARY_CODES
+POLL_SECONDS = 60.0  # a running turn is checked against its (moving) end this often
+RESCUE_MARGIN_S = 30.0  # a rescue turn may finish its last call after the rescue window
 RETRY_MESSAGE = (
     "The last model call failed with a temporary error. Continue the same task from "
     "where you stopped, and write your answer in the required format."
@@ -111,9 +131,32 @@ def _hook_list(extra: Sequence[agents.Hook] = ()) -> list[agents.Hook]:
     return [hooks.BudgetHook(), *extra]
 
 
-def build_explorer(job: AgentJob) -> agents.Agent:
-    return agents.Agent(
-        model=job.model,
+_SDK_AGENT_WARNED = False
+
+
+def _agent(job: AgentJob, sdk_retry: bool, **kwargs: Any) -> agents.Agent:
+    """``agents.Agent(model=job.model, **kwargs)``, with our SDK retry policy if possible.
+
+    With ``sdk_retry`` the agent gets ``completion=ratelimit.sdk_completion(...)``
+    (same requests, the SDK's Retry-After wait capped). When the config or the agent
+    cannot be built with it, the agent uses the SDK defaults (logged once).
+    """
+    global _SDK_AGENT_WARNED
+    config = ratelimit.sdk_completion(job.model) if sdk_retry else None
+    if config is not None:
+        try:
+            return agents.Agent(model=job.model, completion=config, **kwargs)
+        except Exception:  # an SDK change: the defaults still work
+            if not _SDK_AGENT_WARNED:
+                _SDK_AGENT_WARNED = True
+                hooks.log("sdk retry config unavailable; using SDK defaults")
+    return agents.Agent(model=job.model, **kwargs)
+
+
+def build_explorer(job: AgentJob, *, sdk_retry: bool = True) -> agents.Agent:
+    return _agent(
+        job,
+        sdk_retry,
         name=EXPLORER_NAME,
         instructions=prompts.explorer_instructions(job.variant, job.budgets.max_tool_calls),
         tools=list(tools.ALL_TOOLS),
@@ -127,9 +170,10 @@ def build_explorer(job: AgentJob) -> agents.Agent:
     )
 
 
-def build_verifier(job: AgentJob) -> agents.Agent:
-    return agents.Agent(
-        model=job.model,
+def build_verifier(job: AgentJob, *, sdk_retry: bool = True) -> agents.Agent:
+    return _agent(
+        job,
+        sdk_retry,
         name=VERIFIER_NAME,
         instructions=prompts.verifier_instructions(job.budgets.max_tool_calls),
         tools=list(tools.ALL_TOOLS),
@@ -180,15 +224,16 @@ def _replace_with(text: str) -> Any:
     )
 
 
-def build_formatter(job: AgentJob) -> agents.Agent:
+def build_formatter(job: AgentJob, *, sdk_retry: bool = True) -> agents.Agent:
     target: type[BaseModel] = FormatterDraft if job.format_target == "review" else VerifyDraft
     structured: agents.Hook = (
         _ReviewHook(max_retries=1, on_limit="reject", schema_in_prompt=False)
         if job.format_target == "review"
         else _VerifyHook(max_retries=1, on_limit="reject", schema_in_prompt=False)
     )
-    return agents.Agent(
-        model=job.model,
+    return _agent(
+        job,
+        sdk_retry,
         name=FORMATTER_NAME,
         instructions=(
             prompts.FORMATTER_REVIEW if job.format_target == "review" else prompts.FORMATTER_VERIFY
@@ -217,6 +262,7 @@ class _Turn:
     retryable: bool = False
     code: str | None = None  # the error code of a Failed turn
     retries: int = 0  # retries made after temporary model errors
+    retry_after: float | None = None  # the provider's Retry-After of a Failed turn
 
 
 def _reduce(state: Any) -> _Turn:
@@ -236,19 +282,44 @@ def _reduce(state: Any) -> _Turn:
             error=f"{code}{err.message}",
             retryable=bool(err.retryable),
             code=err.code,
+            retry_after=ratelimit.retry_after_of(getattr(err, "details", None)),
         )
     if isinstance(state, agents.Interrupted):
         return _Turn(kind=kind, stop_reason=state.cause, text="")
     return _Turn(kind=kind, stop_reason=kind.lower(), text="")
 
 
-async def _settled(session: Any, content: str, timeout: float) -> tuple[Any, bool]:
-    """Run one turn and return its record; interrupt it when it outlives ``timeout``.
+End = Callable[[], float]  # an absolute epoch, read again on every poll
 
-    ``session.run`` returns ``Running`` at the timeout and leaves the turn running, so
-    the turn is interrupted to stop its model calls. The flag says it timed out.
+
+def _poll_timeout(m: hooks.Meter, end: End) -> float:
+    return min(POLL_SECONDS, max(1.0, end() - m.clock()))
+
+
+async def _settled(session: Any, content: str, m: hooks.Meter, end: End) -> tuple[Any, bool]:
+    """Run one turn and return its record; interrupt it when it outlives ``end()``.
+
+    The turn is polled every ``POLL_SECONDS`` at most, and ``end`` is read again each
+    time, so a pause of the meter (a rate-limit wait inside the turn) moves it.
+    ``session.run`` and ``turn.result`` return ``Running`` at their timeout and leave
+    the turn running; at the end the turn is interrupted to stop its model calls. The
+    flag says it timed out.
     """
-    state = await session.run(content, timeout=max(1.0, timeout))
+    state = await session.run(content, timeout=_poll_timeout(m, end))
+    quick_blocks = 0
+    while isinstance(state, agents.Running | agents.Blocked) and m.clock() < end():
+        blocked = isinstance(state, agents.Blocked)
+        started = time.monotonic()
+        state = await session.turn(state.turn_id).result(
+            timeout=_poll_timeout(m, end), after=state if blocked else None
+        )
+        # Our agents open no callbacks; a turn that blocks again at once would spin.
+        if blocked and isinstance(state, agents.Blocked) and time.monotonic() - started < 1.0:
+            quick_blocks += 1
+            if quick_blocks >= 2:
+                break
+        else:
+            quick_blocks = 0
     if isinstance(state, agents.Running | agents.Blocked):
         turn = session.turn(state.turn_id)
         await turn.interrupt()
@@ -256,66 +327,69 @@ async def _settled(session: Any, content: str, timeout: float) -> tuple[Any, boo
     return state, False
 
 
-async def _run_turn(session: Any, content: str, timeout: float) -> _Turn:
-    """Run one turn; interrupt it when it outlives ``timeout``."""
-    state, timed_out = await _settled(session, content, timeout)
-    reduced = _reduce(state)
-    if timed_out and reduced.kind in ("Interrupted", "Running", "Blocked"):
-        reduced.stop_reason = "timeout"
-    return reduced
-
-
 # ------------------------------------------------------------------------ retries
 
-# Replaced in tests; the meter's clock decides the deadline, this only waits.
+# Replaced in tests; the meter's clock decides the limits, this only waits.
 _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
-
-# Codes of model calls that the provider refused before it produced output: no tokens
-# were billed, so the meter must not charge its estimate for them.
-_REFUSED_CODES = frozenset({"completion_rate_limited", "completion_unavailable"})
 
 
 def _should_retry(turn: _Turn) -> bool:
     return turn.kind == "Failed" and turn.retryable and turn.code in RETRY_CODES
 
 
-def _turn_end(m: hooks.Meter) -> float:
-    """When the meter stops admitting model calls (the rescue deadline or deadline + grace)."""
-    s = m.state
-    if s.rescue_deadline_epoch is not None:
-        return s.rescue_deadline_epoch
-    return s.deadline_epoch + m.budgets.grace_seconds
+# The blocker of a retry that the run's stop leaves no room for (see ``_GaveUp``).
+RUN_LIMIT_BLOCKER = "the run's time limit is reached"
 
 
-def _retry_delay(retry: int) -> float:
-    base = RETRY_DELAYS[retry]
-    return base + random.uniform(0.0, base * RETRY_JITTER)  # noqa: S311 - jitter, not crypto
+@dataclass(frozen=True)
+class _GaveUp:
+    """Why a turn that failed with a temporary model error does not run again."""
 
-
-def _forget_refused_call(m: hooks.Meter, turn: _Turn) -> None:
-    """Drop the pending charge of a model call that the provider refused (not billed)."""
-    if turn.code not in _REFUSED_CODES:
-        return
-    with m.lock:
-        if m.state.pending_call:
-            m.state.pending_call = False
-            m.save()
+    error: str  # the turn's error, with the reason
+    run_limit: bool  # the run's stop ended the retries (stop reason RUN_DEADLINE_STOP)
 
 
 def _retry_blocker(
-    m: hooks.Meter, retries: int, delay: float, end: float | None = None
+    m: hooks.Meter,
+    code: str | None,
+    delay: float,
+    end: End | None = None,
+    *,
+    now: float | None = None,
+    final: bool = False,
 ) -> str | None:
     """Why the failed turn may not run again after ``delay`` seconds; ``None`` = it may.
 
-    ``end`` is an earlier time limit of the caller (the formatter's own timeout).
+    The wait pauses the phase clocks, so the turn's own end moves with it; the run's
+    stop does not. ``end`` is an earlier end of the caller (the formatter's own window).
+    ``now`` is the one clock reading the whole decision uses (default: read it here).
+    ``final``: the wait was cut by ``_final_delay`` to end before the run's stop with a
+    margin, so it is not checked against the stop again; only the phase's own end is.
     """
-    if retries >= len(RETRY_DELAYS):
-        return "the retry limit is reached"
     with m.lock:
         s, b = m.state, m.budgets
-        limit = _turn_end(m) if end is None else min(end, _turn_end(m))
-        if m.clock() + delay + RETRY_MIN_TURN_SECONDS > limit:
-            return "the phase deadline leaves no time for another attempt"
+        if now is None:
+            now = m.clock()
+        if (
+            code in ratelimit.TRANSIENT_CODES
+            and s.transient_streak >= ratelimit.TRANSIENT_MAX_STREAK
+        ):
+            return f"{s.transient_streak} failures in a row"
+        own = m.call_end() if end is None else min(end(), m.call_end())
+        stop = m.stop_epoch()
+        if final:
+            # The phase's own end moves with the wait; the stop was checked already.
+            if now + RETRY_MIN_TURN_SECONDS > own:
+                return "the phase deadline leaves no time for another attempt"
+        else:
+            limit = own + delay if stop is None else min(own + delay, stop)
+            if now + delay + RETRY_MIN_TURN_SECONDS > limit:
+                if stop is not None and limit >= stop:
+                    return RUN_LIMIT_BLOCKER
+                return "the phase deadline leaves no time for another attempt"
+        if stop is None and s.rl_wait_seconds + delay > RL_FALLBACK_MAX_WAIT_S:
+            minutes = RL_FALLBACK_MAX_WAIT_S / 60
+            return f"the rate-limit waits reached their {minutes:.0f}-minute limit"
         if s.llm_calls >= s.llm_call_limit:
             return "the model-call limit is reached"
         pending = m.projected_next_call_cost() if s.pending_call else 0.0
@@ -324,71 +398,131 @@ def _retry_blocker(
     return None
 
 
+# The last shorter wait ends this long before it must (RETRY_MIN_TURN_SECONDS before the
+# run's stop), so the retried turn's first call surely starts in time.
+FINAL_WAIT_MARGIN_S = 5.0
+
+
+def _final_delay(m: hooks.Meter, now: float, at_least: float = 0.0) -> float | None:
+    """The one last, shorter wait before the run's stop, or ``None``.
+
+    The wait ends ``RETRY_MIN_TURN_SECONDS + FINAL_WAIT_MARGIN_S`` before the stop, so
+    the retried turn still gets its time. Only one such wait is made per job
+    (``MeterState.rl_final_wait``). ``None`` when the job has no run limits, the last
+    wait was made, no wait fits, or the wait would end before ``at_least`` seconds
+    (the run's shared cooldown of the model, which the retry would wait out anyway).
+    """
+    stop = m.stop_epoch()
+    if stop is None or m.state.rl_final_wait:
+        return None
+    room = stop - RETRY_MIN_TURN_SECONDS - FINAL_WAIT_MARGIN_S - now
+    return room if room > 0.0 and room >= at_least else None
+
+
+def _shared_wait(m: hooks.Meter, code: str | None, now: float) -> float:
+    """Seconds until the run's shared cooldown of the model ends (rate limits only)."""
+    if code not in ratelimit.RL_CODES or m.cooldown_path is None:
+        return 0.0
+    until = ratelimit.read_cooldown(m.cooldown_path, m.state.model, now=now)
+    if until is None:
+        return 0.0
+    return max(0.0, min(until, m.wait_limit()) - now)
+
+
 async def _wait_to_retry(
-    m: hooks.Meter, turn: _Turn, retries: int, end: float | None = None
-) -> str | None:
+    m: hooks.Meter, turn: _Turn, retries: int, end: End | None = None
+) -> _GaveUp | None:
     """Wait before retry ``retries + 1`` of a turn that failed with a temporary error.
 
-    Returns ``None`` after the wait, or the turn's error with the reason why it must
-    not run again.
+    The provider's refusal is forgotten (not billed, not counted) and the time the SDK
+    spent on it pauses the phase clocks, like the backoff itself. The wait is at least
+    the backoff and lasts until the run's shared cooldown of the model ends. One clock
+    reading decides it: a wait that would end too close to the run's stop becomes one
+    last, shorter wait (``_final_delay``), which is not checked against the stop again.
+    Only a wait that is made moves the shared cooldown (rate limits) to its end; a
+    refused one leaves the file alone. Returns ``None`` after the wait, or why the turn
+    must not run again.
     """
-    _forget_refused_call(m, turn)
-    delay = _retry_delay(retries) if retries < len(RETRY_DELAYS) else 0.0
-    blocker = _retry_blocker(m, retries, delay, end)
+    refused = m.forget_refused_call() if turn.code in ratelimit.RL_CODES else 0.0
+    m.pause(refused)
+    streak = m.note_temporary_failure(turn.code)
+    now = m.clock()  # the one reading this decision uses
+    shared = _shared_wait(m, turn.code, now)
+    delay = max(ratelimit.backoff(streak, turn.retry_after), shared)
+    final = False
+    blocker = _retry_blocker(m, turn.code, delay, end, now=now)
+    if blocker == RUN_LIMIT_BLOCKER:
+        last = _final_delay(m, now, at_least=shared)
+        if last is not None:
+            blocker = _retry_blocker(m, turn.code, last, end, now=now, final=True)
+            delay, final = last, blocker is None
     if blocker is not None:
         plural = "retry" if retries == 1 else "retries"
         why = (
             f"gave up after {retries} {plural}: {blocker}" if retries else f"not retried: {blocker}"
         )
         hooks.log(f"temporary model error ({turn.code}); {why}")
-        return f"{turn.error} ({why})"
+        return _GaveUp(error=f"{turn.error} ({why})", run_limit=blocker == RUN_LIMIT_BLOCKER)
+    if turn.code in ratelimit.RL_CODES and m.cooldown_path is not None:
+        # The wait is made: other agents of the model wait until it ends, too.
+        ratelimit.extend_cooldown(m.cooldown_path, m.state.model, now + delay, streak, now=now)
+    last_note = ", the last wait before the run's time limit" if final else ""
     hooks.log(
-        f"temporary model error ({turn.code}); retry {retries + 1} of {len(RETRY_DELAYS)} "
-        f"in {delay:.0f}s"
+        f"temporary model error ({turn.code}); waiting {delay:.0f}s{last_note} "
+        f"(total waited {format_wait(m.state.rl_wait_seconds)})"
     )
-    await _sleep(delay)
+    if final:
+        m.note_final_wait()
+    m.begin_wait(now + delay, turn.code)
+    try:
+        await _sleep(max(0.0, now + delay - m.clock()))
+    finally:
+        m.end_wait()
     return None
 
 
-async def _run_turn_retrying(
-    session: Any, content: str, m: hooks.Meter, timeout: Callable[[], float]
-) -> _Turn:
-    """``_run_turn``, run again in the same session after a temporary model error.
-
-    The session keeps the context of the failed turn, so the retry only asks the model
-    to continue. Retries wait ``RETRY_DELAYS`` (with jitter) and stop at the phase
-    deadline, the cost cap or the model-call limit; the turn that gave up says why in
-    its error.
-    """
-    turn = await _run_turn(session, content, timeout())
-    retries = 0
-    while _should_retry(turn):
-        gave_up = await _wait_to_retry(m, turn, retries)
-        if gave_up is not None:
-            turn.error = gave_up
-            break
-        retries += 1
-        turn = await _run_turn(session, RETRY_MESSAGE, timeout())
-    turn.retries = retries
-    return turn
-
-
 async def _settled_retrying(
-    session: Any, content: str, m: hooks.Meter, ends: float
-) -> tuple[Any, str | None]:
-    """``_settled`` with the same retries, all before ``ends`` (the formatter's limit).
+    session: Any, content: str, m: hooks.Meter, end: End, own_end: End | None = None
+) -> tuple[Any, bool, int, _GaveUp | None]:
+    """``_settled``, run again in the same session after a temporary model error.
 
-    Returns the last turn's state and, when the retries gave up, the error with why.
+    The session keeps the context of the failed turn, so a retry only asks the model to
+    continue. Returns the last turn's state, whether it timed out, the retries made and,
+    when the retries gave up, why. ``own_end`` is the caller's own window for the retry
+    check (the formatter's).
     """
-    state, _ = await _settled(session, content, ends - m.clock())
+    state, timed_out = await _settled(session, content, m, end)
     retries = 0
     while _should_retry(turn := _reduce(state)):
-        gave_up = await _wait_to_retry(m, turn, retries, ends)
+        gave_up = await _wait_to_retry(m, turn, retries, own_end)
         if gave_up is not None:
-            return state, gave_up
+            return state, timed_out, retries, gave_up
         retries += 1
-        state, _ = await _settled(session, RETRY_MESSAGE, ends - m.clock())
-    return state, None
+        state, timed_out = await _settled(session, RETRY_MESSAGE, m, end)
+    return state, timed_out, retries, None
+
+
+def _at_run_stop(m: hooks.Meter) -> bool:
+    stop = m.stop_epoch()
+    return stop is not None and m.clock() >= stop
+
+
+async def _run_turn_retrying(session: Any, content: str, m: hooks.Meter, end: End) -> _Turn:
+    """One turn with retries (``_settled_retrying``), reduced; the error says why it gave up.
+
+    A turn that the run's stop ended (the retries gave up for it, or the turn was
+    interrupted at it) gets the stop reason ``RUN_DEADLINE_STOP``.
+    """
+    state, timed_out, retries, gave_up = await _settled_retrying(session, content, m, end)
+    turn = _reduce(state)
+    if timed_out and turn.kind in ("Interrupted", "Running", "Blocked"):
+        turn.stop_reason = RUN_DEADLINE_STOP if _at_run_stop(m) else "timeout"
+    if gave_up is not None:
+        turn.error = gave_up.error
+        if gave_up.run_limit:
+            turn.stop_reason = RUN_DEADLINE_STOP
+    turn.retries = retries
+    return turn
 
 
 # Usage.finish_reasons caps each entry at 20 characters and the list at 200 entries.
@@ -519,13 +653,9 @@ def _state_of(turn: _Turn, ran: bool) -> Literal["Completed", "Failed", "Error",
     return "Error"
 
 
-def _timeout_for(m: hooks.Meter, clock: float) -> float:
-    return max(5.0, m.state.deadline_epoch - clock) + m.budgets.grace_seconds
-
-
-def _rescue_timeout(m: hooks.Meter) -> float:
-    """Wall time for a rescue turn: what is left of the rescue window, plus a margin."""
-    return max(5.0, _turn_end(m) - m.clock()) + 30.0
+def _rescue_end(m: hooks.Meter) -> float:
+    """End of a rescue turn: the rescue window (inside ``call_end``), plus a margin."""
+    return m.call_end() + RESCUE_MARGIN_S
 
 
 def _stop_reason_extras(turn: _Turn) -> list[str]:
@@ -533,7 +663,7 @@ def _stop_reason_extras(turn: _Turn) -> list[str]:
         return ["iterations"]
     if turn.stop_reason == "output_limit":
         return ["length"]
-    if turn.stop_reason == "timeout":
+    if turn.stop_reason in ("timeout", RUN_DEADLINE_STOP):
         return ["deadline"]
     return []
 
@@ -544,7 +674,7 @@ async def _explore_turns(
     async with agents.local_runtime():
         session = await agent.start_session()
         try:
-            first = await _run_turn_retrying(session, prompt, m, lambda: _timeout_for(m, m.clock()))
+            first = await _run_turn_retrying(session, prompt, m, m.call_end)
             out = _Outcome(
                 final=first, notes=first.text, extra_exhausted=_stop_reason_extras(first)
             )
@@ -558,7 +688,7 @@ async def _explore_turns(
                 else:  # the turn ended normally but without notes in the grammar
                     message = prompts.RESCUE_EXPLORE_FORMAT
                 out.rescue_attempted = early
-                second = await _run_turn_retrying(session, message, m, lambda: _rescue_timeout(m))
+                second = await _run_turn_retrying(session, message, m, lambda: _rescue_end(m))
                 out.extra_exhausted += _stop_reason_extras(second)
                 if second.text.strip():
                     out.notes = second.text
@@ -574,13 +704,13 @@ async def _explore(
 ) -> AgentRunResult:
     ctx = tools.configure(job, files.job_dir, files.coverage)
     m = hooks.meter()
-    agent = build_explorer(job)
+    agent = build_explorer(job, sdk_retry=model is None)
     m.reset_context(len(prompt) + len(agent.instructions or ""))
     if model is not None:
         agent = agent.override(model=model)
-    calls_before = m.state.llm_calls
+    calls_before = m.calls_attempted()
     out = await _explore_turns(agent, job, prompt, m)
-    ran = m.state.llm_calls > calls_before
+    ran = m.calls_attempted() > calls_before
     notes = out.notes
     if not notes.strip():
         notes = _partial_notes(files)
@@ -653,7 +783,7 @@ async def _verify_turns(
     async with agents.local_runtime():
         session = await agent.start_session()
         try:
-            first = await _run_turn_retrying(session, prompt, m, lambda: _timeout_for(m, m.clock()))
+            first = await _run_turn_retrying(session, prompt, m, m.call_end)
             out = _Outcome(
                 final=first, notes=first.text, extra_exhausted=_stop_reason_extras(first)
             )
@@ -668,7 +798,7 @@ async def _verify_turns(
                 else:
                     message = prompts.verify_missing_message(missing)
                 out.rescue_attempted = early
-                second = await _run_turn_retrying(session, message, m, lambda: _rescue_timeout(m))
+                second = await _run_turn_retrying(session, message, m, lambda: _rescue_end(m))
                 out.extra_exhausted += _stop_reason_extras(second)
                 out.notes = _join(out.notes, second.text)
                 out.final = second
@@ -693,13 +823,13 @@ async def _verify(
             complete=True,
             usage=_usage(m),
         )
-    agent = build_verifier(job)
+    agent = build_verifier(job, sdk_retry=model is None)
     m.reset_context(len(prompt) + len(agent.instructions or ""))
     if model is not None:
         agent = agent.override(model=model)
-    calls_before = m.state.llm_calls
+    calls_before = m.calls_attempted()
     out = await _verify_turns(agent, prompt, ids, m)
-    ran = m.state.llm_calls > calls_before
+    ran = m.calls_attempted() > calls_before
     exhausted = _exhausted(m, out)
     complete = verify_complete(
         ended_normally=_ended_normally(out.final, m),
@@ -791,6 +921,21 @@ class _FormatOutcome:
     draft: BaseModel | None
     error: str | None
     retried: bool = False
+    run_limit: bool = False  # the retries gave up at the run's stop
+
+
+def _formatter_end(m: hooks.Meter, timeout: float) -> End:
+    """The formatter's window: ``timeout`` from now plus the time paused for rate limits
+    since, never after the run's stop."""
+    start = m.clock()
+    paused_before = m.state.rl_wait_seconds
+
+    def end() -> float:
+        own = start + timeout + max(0.0, m.state.rl_wait_seconds - paused_before)
+        stop = m.stop_epoch()
+        return own if stop is None else min(own, stop)
+
+    return end
 
 
 async def _format_turns(
@@ -803,21 +948,27 @@ async def _format_turns(
 ) -> _FormatOutcome:
     """One formatter turn, plus one retry when it dropped FINDING blocks (lesson 4).
 
-    A turn that fails with a temporary model error is retried first, within ``timeout``.
+    A turn that fails with a temporary model error is retried first, within the
+    formatter's window (``_formatter_end``: rate-limit waits extend it).
     """
-    ends = m.clock() + timeout
+    end = _formatter_end(m, timeout)
     async with agents.local_runtime():
         session = await agent.start_session()
         try:
-            state, gave_up = await _settled_retrying(session, message, m, ends)
+            state, _, _, gave_up = await _settled_retrying(session, message, m, end, end)
             draft, error = _draft_of(state, target)
-            out = _FormatOutcome(state=state, draft=draft, error=error or gave_up)
+            out = _FormatOutcome(
+                state=state,
+                draft=draft,
+                error=error or (gave_up.error if gave_up is not None else None),
+                run_limit=gave_up is not None and gave_up.run_limit,
+            )
             got = _finding_count(draft)
-            remaining = ends - m.clock()
+            remaining = end() - m.clock()
             if draft is not None and got < expected_findings and remaining >= 20.0:
                 out.retried = True
                 retry = prompts.formatter_dropped(expected_findings, got)
-                state2, _ = await _settled(session, retry, remaining)
+                state2, _ = await _settled(session, retry, m, end)
                 draft2, _error2 = _draft_of(state2, target)
                 if draft2 is not None and _finding_count(draft2) > got:
                     out.state, out.draft = state2, draft2
@@ -838,16 +989,16 @@ async def _format(
     else:
         expected = parse_notes(notes).marker_count
     target: type[BaseModel] = FormatterDraft if job.format_target == "review" else VerifyDraft
-    agent = build_formatter(job)
+    agent = build_formatter(job, sdk_retry=model is None)
     message = prompts.formatter_message(notes, ids)
     m.reset_context(len(message) + len(agent.instructions or ""))
     if model is not None:
         agent = agent.override(model=model)
-    calls_before = m.state.llm_calls
+    calls_before = m.calls_attempted()
     timeout = min(FORMATTER_TIMEOUT, max(30.0, float(m.budgets.explore_seconds)))
     out = await _format_turns(agent, message, target, expected, timeout, m)
     state, draft, error = out.state, out.draft, out.error
-    ran = m.state.llm_calls > calls_before
+    ran = m.calls_attempted() > calls_before
     result_state: Literal["Completed", "Failed", "InvalidOutput", "Error", "NotRun"]
     stop_reason: str | None = None
     if isinstance(state, agents.Completed):
@@ -863,7 +1014,7 @@ async def _format(
             error = error or f"no answer (stop reason: {stop_reason})"
     else:
         reduced = _reduce(state)
-        stop_reason = reduced.stop_reason
+        stop_reason = RUN_DEADLINE_STOP if out.run_limit else reduced.stop_reason
         result_state = "NotRun" if not ran else ("Failed" if reduced.kind == "Failed" else "Error")
         error = error or reduced.error or f"turn ended as {reduced.kind}"
     return AgentRunResult(
@@ -925,11 +1076,15 @@ async def run_job(
         price_out_per_m=job.price_out_per_m,
         path=files.meter,
         clock=clock,
+        limits=job.run_limits,
+        cooldown_path=Path(job.cooldown_path) if job.cooldown_path else None,
     )
     hooks.install_meter(m)
     if phase in ("explore", "verify"):
         m.on_text = lambda t: jobio.write_partial_notes(files, t)
-    hooks.log(f"{phase} start: model={job.model} effort={job.effort} run={m.state.runs}")
+    hooks.log(
+        f"{phase} start: model={job.model} effort={job.effort} run={m.state.runs}{_limits_text(m)}"
+    )
     try:
         if phase == "explore":
             result = await _explore(job, files, text, model)
@@ -947,5 +1102,16 @@ async def run_job(
         f"{phase} done: state={result.state} stop={result.stop_reason} "
         f"complete={result.complete} llm_calls={u.llm_calls} tool_calls={u.tool_calls} "
         f"in={u.input_tokens} out={u.output_tokens} cost=${u.cost_usd:.4f} seconds={u.seconds:.1f}"
+        f" rl_waits={u.rate_limit_waits} rl_wait={u.rate_limit_wait_seconds:.0f}s"
     )
     return result
+
+
+def _limits_text(m: hooks.Meter) -> str:
+    """`` run limits: tools close in 12.5 min, stop in 17.5 min`` (empty without limits)."""
+    if m.limits is None:
+        return ""
+    now = m.clock()
+    tools_min = (m.limits.wind_down_epoch - now) / 60
+    stop_min = (m.limits.stop_epoch - now) / 60
+    return f" run limits: tools close in {tools_min:.1f} min, stop in {stop_min:.1f} min"

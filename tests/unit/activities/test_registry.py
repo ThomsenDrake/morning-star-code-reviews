@@ -13,7 +13,7 @@ import pytest
 from mistralai.workflows import get_workflow_definition
 
 from morning_star_review import activities
-from morning_star_review.core import contract
+from morning_star_review.core import contract, runclock
 from morning_star_review.core.contract import AgentBudgets, ResolvedBudgets
 from morning_star_review.workflow import (
     EXECUTION_TIMEOUT,
@@ -24,17 +24,23 @@ from morning_star_review.workflow import (
 
 ACTIVITIES_DIR = Path(activities.__file__).resolve().parent
 
+# Rate limits make a run slow, they do not kill it: the agent activities may run as
+# long as the longest allowed deadline; liveness is the heartbeat.
+CEILING = timedelta(minutes=runclock.MAX_DEADLINE_MINUTES + 10)
+HEARTBEAT = timedelta(seconds=60)
+
 # name -> (start_to_close, heartbeat, max attempts, backoff)
 EXPECTED = {
-    "msreview_fetch_pr": (timedelta(minutes=3), None, 6, 3.0),
-    "msreview_prepare": (timedelta(minutes=10), timedelta(seconds=60), 3, 2.0),
-    "msreview_explore": (timedelta(minutes=35), timedelta(seconds=60), 2, 2.0),
-    "msreview_structure": (timedelta(minutes=8), timedelta(seconds=60), 3, 2.0),
+    "msreview_fetch_pr": (timedelta(minutes=20), None, 6, 3.0),
+    "msreview_prepare": (timedelta(minutes=10), HEARTBEAT, 3, 2.0),
+    "msreview_explore": (CEILING, HEARTBEAT, 2, 2.0),
+    "msreview_structure": (CEILING, HEARTBEAT, 3, 2.0),
     "msreview_merge": (timedelta(minutes=2), None, 2, 2.0),
-    "msreview_verify": (timedelta(minutes=40), timedelta(seconds=60), 2, 2.0),
+    "msreview_verify": (CEILING, HEARTBEAT, 2, 2.0),
     "msreview_finalize": (timedelta(minutes=2), None, 2, 2.0),
-    "msreview_publish": (timedelta(minutes=5), None, 6, 3.0),
-    "msreview_report_failure": (timedelta(minutes=2), None, 3, 2.0),
+    # GitHub rate-limit waits (up to 15 minutes per request) fit inside.
+    "msreview_publish": (timedelta(minutes=20), None, 6, 3.0),
+    "msreview_report_failure": (timedelta(minutes=20), None, 3, 2.0),
 }
 
 
@@ -50,19 +56,42 @@ def test_registry_names_and_policies() -> None:
         assert params["retry_policy_backoff_coefficient"] == backoff, fn.__name__
 
 
+def test_the_ceiling_sits_above_every_allowed_deadline() -> None:
+    assert runclock.ACTIVITY_CEILING == CEILING == timedelta(minutes=310)
+    longest = timedelta(minutes=runclock.MAX_DEADLINE_MINUTES)
+    for name in ("msreview_explore", "msreview_structure", "msreview_verify"):
+        assert EXPECTED[name][0] > longest, name
+    # The workflow outlives its longest activities (plus the steps around them).
+    assert CEILING + timedelta(minutes=10) < EXECUTION_TIMEOUT
+
+
 def test_activity_timeouts_cover_the_agent_budgets() -> None:
-    from morning_star_review.core.contract import ResolvedBudgets
+    from morning_star_review.activities.common import launch_timeout
 
     caps = ResolvedBudgets(explorer_minutes=25, verifier_minutes=25)
     worst = 25 * 60 + caps.grace_seconds + caps.rescue_seconds + 90
     assert worst < EXPECTED["msreview_explore"][0].total_seconds()
     assert worst < EXPECTED["msreview_verify"][0].total_seconds()
+    budgets = AgentBudgets(
+        max_tool_calls=60,
+        max_llm_calls=90,
+        grace_llm_calls=2,
+        explore_seconds=25 * 60,
+        grace_seconds=caps.grace_seconds,
+        rescue_seconds=caps.rescue_seconds,
+        max_context_tokens=1000,
+        auto_compact_threshold=1000,
+        max_tool_output_chars=1000,
+        max_cost_usd=1.0,
+    )
+    # The base allowance is no longer cut to the activity; rate-limit waits extend it.
+    assert launch_timeout(budgets) == worst
 
 
 def test_verify_fits_the_verifier_and_its_formatter() -> None:
     """At the 25-minute cap the verifier, then a verify formatter run, end in time."""
     from morning_star_review.activities.common import launch_timeout
-    from morning_star_review.activities.structure import FORMAT_SECONDS, STRUCTURE_TIMEOUT
+    from morning_star_review.activities.structure import FORMAT_SECONDS
     from morning_star_review.activities.verify import ACTIVITY_MARGIN, VERIFY_TIMEOUT
 
     caps = ResolvedBudgets(explorer_minutes=25, verifier_minutes=25)
@@ -79,7 +108,7 @@ def test_verify_fits_the_verifier_and_its_formatter() -> None:
         max_tool_output_chars=1000,
         max_cost_usd=1.0,
     )
-    formatter = launch_timeout(fmt_budgets, STRUCTURE_TIMEOUT)
+    formatter = launch_timeout(fmt_budgets)
     assert verifier + formatter + ACTIVITY_MARGIN <= VERIFY_TIMEOUT.total_seconds()
 
 
@@ -87,13 +116,10 @@ def test_workflow_definition() -> None:
     d = get_workflow_definition(CodeReviewWorkflow)
     assert d is not None
     assert d.name == WF_NAME == "morning-star-code-review"
-    assert d.execution_timeout == EXECUTION_TIMEOUT == timedelta(minutes=90)
-    # Explorers then the verifier at their 25-minute caps, a formatter after each, and
-    # ten minutes for the deterministic steps fit in one execution.
-    budgets = ResolvedBudgets(explorer_minutes=25, verifier_minutes=25)
-    agents = 2 * (25 * 60 + budgets.grace_seconds + budgets.rescue_seconds + 90)
-    formatters = 2 * (240 + 30 + 60)
-    assert agents + formatters + 10 * 60 < EXECUTION_TIMEOUT.total_seconds()
+    assert d.execution_timeout == EXECUTION_TIMEOUT == timedelta(minutes=330)
+    assert EXECUTION_TIMEOUT == runclock.EXECUTION_TIMEOUT
+    # The longest allowed deadline (the driver ends the run by then) fits with room.
+    assert timedelta(minutes=runclock.MAX_DEADLINE_MINUTES) < EXECUTION_TIMEOUT
     assert SEARCH_KEYS == ["pr_url", "repo"]
 
 

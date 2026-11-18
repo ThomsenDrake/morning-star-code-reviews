@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from morning_star_review.core.contract import FinalFinding, FindingState, ResolvedPrior
+from morning_star_review.core.runclock import RUN_DEADLINE_STOP
 from morning_star_review.review.verdict import (
     MAX_REASONS,
     Assessment,
@@ -498,3 +499,188 @@ def test_outcome_counts_possible_issues_like_the_verdict() -> None:
     # Round trip (outcome.json) and an explicit count are kept as they are.
     assert ReviewOutcome.model_validate_json(outcome.model_dump_json()) == outcome
     assert ReviewOutcome(**base, findings=findings, possible_issues=7).possible_issues == 7
+
+
+# --- run time limit (wind-down) and rate-limit waits -----------------------------------
+
+LIMIT_90 = "the review was finished early to stay within its 90-minute time limit"
+
+
+def skipped_verifier(make, ids: tuple[str, ...] = ("c1",)):
+    """The verifier the workflow skips after the wind-down (no agent ran)."""
+    return make.verify(
+        [],
+        source="empty",
+        state="NotRun",
+        stop_reason=RUN_DEADLINE_STOP,
+        complete=False,
+        budget_exhausted=True,
+        exhausted_by=["deadline"],
+        opened_paths=[],
+        unaddressed=list(ids),
+    )
+
+
+@pytest.mark.parametrize(
+    ("deadline", "waited", "reason"),
+    [
+        (90, 0.0, LIMIT_90),
+        (90, 59.9, LIMIT_90),
+        (90, 60.0, LIMIT_90 + "; models were rate-limited for 1 min in total"),
+        (90, 13 * 60 + 40, LIMIT_90 + "; models were rate-limited for 14 min in total"),
+        (None, 0.0, "the review was finished early to stay within its time limit"),
+    ],
+)
+def test_run_limit_reached_blocks_clean(make, deadline, waited, reason) -> None:
+    a = ensemble(
+        make,
+        run_limit_reached=True,
+        deadline_minutes=deadline,
+        rate_limit_wait_seconds=waited,
+    )
+    assert (a.verdict, a.reasons, a.complete) == ("incomplete", [reason], False)
+    reasons = incomplete_reasons(
+        **{k: v for k, v in kwargs(make).items() if k not in ("findings", "priors")},
+        run_limit_reached=True,
+        deadline_minutes=deadline,
+        rate_limit_wait_seconds=waited,
+    )
+    assert reasons == [reason]
+
+
+def test_run_limit_reason_comes_first_and_findings_still_win(make) -> None:
+    unfinished = make.explore(LARGE, complete=False, state="Error")
+    explores = [make.explore(GLM), unfinished, make.explore(DEEP)]
+    a = ensemble(
+        make,
+        explores=explores,
+        findings=[finding()],
+        run_limit_reached=True,
+        deadline_minutes=90,
+        rate_limit_wait_seconds=600.0,
+    )
+    assert a.verdict == "findings" and not a.complete
+    assert a.reasons[0] == LIMIT_90 + "; models were rate-limited for 10 min in total"
+    assert a.reasons[1:] == ["the mistral-large-4 explorer did not finish its review; state Error"]
+
+
+def test_rate_limit_waits_alone_do_not_block_clean(make) -> None:
+    a = ensemble(make, deadline_minutes=90, rate_limit_wait_seconds=20 * 60.0)
+    assert (a.verdict, a.reasons, a.complete) == ("clean", [], True)
+
+
+def test_runs_that_reused_a_review_get_no_time_limit_blocker(make) -> None:
+    prior = make.prior_state([], complete=True, verdict="clean")
+    a = check(
+        make,
+        scope="carry_over",
+        explores=[],
+        drafts=[],
+        prior_state=prior,
+        run_limit_reached=True,
+        deadline_minutes=90,
+    )
+    assert (a.verdict, a.reasons) == ("clean", [])
+
+
+def test_skipped_verifier_is_a_blocker_not_nothing_to_verify(make) -> None:
+    a = ensemble(
+        make,
+        verify=skipped_verifier(make),
+        findings=[possible()],
+        run_limit_reached=True,
+        deadline_minutes=25,
+    )
+    assert (a.verdict, a.complete) == ("incomplete", False)
+    assert a.reasons == [
+        "the review was finished early to stay within its 25-minute time limit",
+        "the verifier did not run: the run reached its time limit",
+    ]
+
+
+def test_verifier_cut_short_by_the_run_limit(make) -> None:
+    cut = make.verify(
+        [],
+        state="Error",
+        stop_reason=RUN_DEADLINE_STOP,
+        complete=False,
+        budget_exhausted=True,
+        exhausted_by=["deadline"],
+    )
+    a = ensemble(make, verify=cut)
+    assert a.reasons == ["the verifier did not finish: the run reached its time limit"]
+
+
+def test_explorer_stopped_at_the_run_limit_says_so(make) -> None:
+    stopped = {
+        "state": "Error",
+        "stop_reason": RUN_DEADLINE_STOP,
+        "complete": False,
+        "budget_exhausted": True,
+        "exhausted_by": ["deadline"],
+    }
+    explores = [make.explore(GLM), make.explore(LARGE, **stopped), make.explore(DEEP)]
+    drafts = [make.review_draft([], model=m) for m in (GLM, DEEP)]
+    a = ensemble(
+        make,
+        explores=explores,
+        drafts=drafts,
+        structured=2,
+        verify=skipped_verifier(make),
+        run_limit_reached=True,
+        deadline_minutes=25,
+        rate_limit_wait_seconds=1200.0,
+    )
+    assert (a.verdict, a.complete) == ("incomplete", False)
+    assert a.reasons == [
+        "the review was finished early to stay within its 25-minute time limit; "
+        "models were rate-limited for 20 min in total",
+        "the mistral-large-4 explorer did not finish its review: the run reached its time limit",
+        "the notes of 1 explorer were not turned into findings",
+        "the verifier did not run: the run reached its time limit",
+    ]
+
+
+def test_rate_limited_explorer_that_ran_out_of_time_says_so(make) -> None:
+    # The runner's retries had no time left before the run's stop: state Failed, stop
+    # reason run_deadline. The blocker names the time limit and the agent's own waits.
+    gave_up = make.explore(
+        LARGE,
+        notes="",
+        state="Failed",
+        stop_reason=RUN_DEADLINE_STOP,
+        complete=False,
+        budget_exhausted=True,
+        exhausted_by=["deadline"],
+        usage=make.usage(LARGE, rate_limit_waits=6, rate_limit_wait_seconds=283.0),
+    )
+    explores = [make.explore(GLM), gave_up, make.explore(DEEP)]
+    drafts = [make.review_draft([], model=m) for m in (GLM, DEEP)]
+    a = ensemble(make, explores=explores, drafts=drafts, structured=2)
+    assert (a.verdict, a.complete) == ("incomplete", False)
+    assert a.reasons[0] == (
+        "the mistral-large-4 explorer did not finish its review: the run reached its time "
+        "limit; it was rate-limited for 5 min"
+    )
+    assert not any("state Failed" in r for r in a.reasons)
+
+
+@pytest.mark.parametrize(
+    ("waited", "suffix"),
+    [
+        (0.0, ""),
+        (59.0, ""),
+        (60.0, "; it was rate-limited for 1 min"),
+        (150.0, "; it was rate-limited for 2 min"),
+    ],
+)
+def test_verifier_out_of_time_names_its_rate_limit_wait(make, waited, suffix) -> None:
+    cut = make.verify(
+        [],
+        state="Failed",
+        stop_reason=RUN_DEADLINE_STOP,
+        complete=False,
+        usage=make.usage(GLM, rate_limit_wait_seconds=waited),
+    )
+    a = ensemble(make, verify=cut)
+    assert a.reasons == ["the verifier did not finish: the run reached its time limit" + suffix]

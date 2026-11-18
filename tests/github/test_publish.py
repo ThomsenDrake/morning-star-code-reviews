@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,14 +25,17 @@ from builders import (
 from fakegh import BOT, FakeGitHub
 
 from morning_star_review.core.contract import FinalReview, PrSnapshot, ResolvedPrior
+from morning_star_review.core.runctx import TokenBox
 from morning_star_review.github import state as st
 from morning_star_review.github.http import GitHubHttp, GitHubTransient
 from morning_star_review.github.labels import LABEL_SPECS
 from morning_star_review.github.publish import (
     MAX_COMMENT_CHARS,
     REPORT_REASONS,
+    fresh_write_client,
     publish,
     summary_body,
+    write_client,
     write_failure_header,
 )
 
@@ -411,3 +415,75 @@ async def test_label_created_concurrently(fake: FakeGitHub, tmp_path: Path) -> N
     fake.rules.append(created_meanwhile)
     async with GitHubHttp("ghs_t0123456789", transport=fake.transport, sleep=no_sleep) as gh:
         await ensure_label(gh, "octo-org", "widgets", "msreview: clean")  # no exception
+
+
+# ----------------------------------------------------------------------------- token refresh
+
+
+OLD, NEW = "ghs_old0123456789abcdef", "ghs_new0123456789abcdef"
+
+
+def boxed_ctx(tmp_path: Path, age_s: float, new: str | None) -> tuple[Any, list[int]]:
+    calls: list[int] = []
+
+    async def refresh() -> str | None:
+        calls.append(1)
+        return new
+
+    box = TokenBox(token=OLD, minted_epoch=time.time() - age_s, refresh=refresh)
+    return make_ctx(tmp_path, token=OLD, token_box=box), calls
+
+
+async def test_write_client_uses_the_current_token(tmp_path: Path) -> None:
+    ctx, _ = boxed_ctx(tmp_path, 0, NEW)
+    assert ctx.token_box is not None
+    ctx.token_box.token = NEW  # a re-mint replaced it
+    gh = write_client(ctx)
+    assert gh is not None and gh._token == NEW
+    await gh.aclose()
+    assert write_client(make_ctx(tmp_path, token=None)) is None
+
+
+async def test_fresh_write_client_remints_an_old_token(tmp_path: Path) -> None:
+    ctx, calls = boxed_ctx(tmp_path, 50 * 60, NEW)  # 10 minutes left: re-mint
+    gh = await fresh_write_client(ctx)
+    assert gh is not None and gh._token == NEW and calls == [1]
+    await gh.aclose()
+    gh = await fresh_write_client(ctx)  # the new token is fresh: no second mint
+    assert gh is not None and gh._token == NEW and calls == [1]
+    await gh.aclose()
+    assert OLD in ctx.secrets() and NEW in ctx.secrets()  # both stay redacted
+
+
+async def test_fresh_write_client_keeps_a_valid_token_when_the_remint_fails(
+    tmp_path: Path,
+) -> None:
+    ctx, calls = boxed_ctx(tmp_path, 50 * 60, None)
+    gh = await fresh_write_client(ctx)
+    assert gh is not None and gh._token == OLD and calls == [1]
+    await gh.aclose()
+
+
+async def test_fresh_write_client_refuses_an_expired_token(tmp_path: Path) -> None:
+    ctx, calls = boxed_ctx(tmp_path, 3590, None)  # expired and the re-mint failed
+    assert await fresh_write_client(ctx) is None
+    assert calls == [1]
+    # Without a box the token is used as is (the Action's tokens are not re-minted).
+    gh = await fresh_write_client(make_ctx(tmp_path, token=OLD))
+    assert gh is not None and gh._token == OLD
+    await gh.aclose()
+
+
+async def test_no_post_reason_names_the_expired_token(fake: FakeGitHub, tmp_path: Path) -> None:
+    ctx = make_ctx(tmp_path)
+    reason = REPORT_REASONS["token_expired"]
+    snap = make_snap(tmp_path)
+    outcome = await publish(make_req(), snap, standard_final(), ctx, None, no_post_reason=reason)
+    assert outcome.status == "report" and outcome.reason == reason
+    # A snapshot that could not post keeps its own reason.
+    report_snap = make_snap(tmp_path, can_post=False, cannot_post_reason="Not posted: x.")
+    outcome = await publish(
+        make_req(), report_snap, standard_final(), ctx, None, no_post_reason=reason
+    )
+    assert outcome.reason == "Not posted: x."
+    assert fake.requests == []

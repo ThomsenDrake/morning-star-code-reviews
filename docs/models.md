@@ -113,6 +113,28 @@ The time budget is the real guard. When an agent reaches a limit, it gets a shor
 period to write up what it found. The verdict then explains what was not finished.
 Secondary explorers in an ensemble that run out of budget do not block a `clean`
 verdict, provided that their notes were complete and the primary explorer finished.
+Time that an agent spends waiting on a rate limit does not count against its minutes.
+The whole run has its own limit, `deadline-minutes` (default 90).
+
+### Rate limits
+
+Mistral limits the requests and tokens per minute for each model, and the limits apply
+to the whole workspace. Everything that uses the workspace shares them: reviews of
+other PRs that run at the same time, the agents of one review, and any other use of
+the workspace's keys. In `best`, three explorers run at the same time on three
+different models, and the verifier then uses `zai-glm-5-3` again.
+
+When a model refuses a call with a rate limit, the agent waits and tries again, and
+the review only takes longer (see
+[operations.md](operations.md#rate-limits-and-the-time-limit)). Agents of one review
+that use the same model share the wait, so they do not retry a limited model all at
+once.
+
+In our test runs, `mistral-large-4` was the model that was rate-limited most often,
+and its explorer sometimes waited more than 10 minutes in total. If that happens often
+in your workspace, ask Mistral for higher limits, run fewer reviews at the same time,
+or choose explorers without `mistral-large-4` (for example `single`, or
+`explorers: zai-glm-5-3,deepseek-v4-1-flash-1017`).
 
 ## Choosing a preset
 

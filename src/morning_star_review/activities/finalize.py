@@ -2,8 +2,9 @@
 
 Deterministic: ``review.finalize`` over the sealed payloads, the anchor map (digest
 checked) and head file contents read from the checkout (confined to it). The only
-inputs from outside the payloads are the clock (review time and duration) and the
-tool version.
+inputs from outside the payloads are the clock (review time, duration and whether the
+run's wind-down had started, from the run clock in the ``RunContext``) and the tool
+version.
 
 Every explorer's result and draft reaches this activity by seal (``FinalizeInput``):
 ``explore`` and ``structure`` save a copy of what they return in the run directory
@@ -30,6 +31,7 @@ from morning_star_review.activities.common import (
     started_epoch,
 )
 from morning_star_review.activities.merge import load_anchors
+from morning_star_review.core import runclock
 from morning_star_review.core.contract import (
     ExploreResult,
     FinalizeInput,
@@ -40,6 +42,7 @@ from morning_star_review.core.contract import (
 from morning_star_review.core.errors import MsreviewSealInvalid
 from morning_star_review.core.guard import guard
 from morning_star_review.core.jsonio import FileTooLarge, read_bytes, write_model
+from morning_star_review.core.runctx import RunContext
 from morning_star_review.core.seal import seal
 from morning_star_review.review import RunInfo
 from morning_star_review.review import finalize as review_finalize
@@ -51,6 +54,7 @@ __all__ = [
     "keep_for_finalize",
     "load_kept",
     "primary_prior_claims_win",
+    "rate_limit_wait_seconds",
     "run_info",
 ]
 
@@ -115,14 +119,47 @@ def primary_prior_claims_win(drafts: Sequence[ReviewDraft], primary: str) -> lis
     ]
 
 
-def run_info(inp: FinalizeInput, execution_id: str, now: float) -> RunInfo:
+def rate_limit_wait_seconds(
+    inp: FinalizeInput, explores: Sequence[ExploreResult], drafts: Sequence[ReviewDraft]
+) -> float:
+    """Time every agent of the run waited on model rate limits, in total."""
+    usages = [e.usage for e in explores]
+    usages += [d.formatter_usage for d in drafts if d.formatter_usage is not None]
+    if inp.verify is not None:
+        usages.append(inp.verify.usage)
+        if inp.verify.formatter_usage is not None:
+            usages.append(inp.verify.formatter_usage)
+    return sum(u.rate_limit_wait_seconds for u in usages)
+
+
+def run_info(
+    inp: FinalizeInput,
+    execution_id: str,
+    now: float,
+    *,
+    ctx: RunContext | None = None,
+    explores: Sequence[ExploreResult] = (),
+    drafts: Sequence[ReviewDraft] = (),
+) -> RunInfo:
+    """Run facts for ``review.finalize``; the run clock comes from ``ctx`` when set.
+
+    ``run_limit_reached`` is True when finalize runs at or after the run's wind-down
+    (with a verifier: the explorers' earlier wind-down): the run was finished early
+    with what it had.
+    """
     started = started_epoch(Path(inp.snap.run_dir))
+    clock = runclock.from_context(ctx) if ctx is not None else None
     return RunInfo(
         execution_id=execution_id,
         run_label=inp.req.run_label,
         tool_version=__version__,
         reviewed_at=datetime.fromtimestamp(now, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         duration_seconds=round(now - started, 1) if started is not None else None,
+        run_limit_reached=(
+            clock is not None and clock.wound_down(now, verify=inp.prep.roles.verify_enabled)
+        ),
+        deadline_minutes=clock.deadline_minutes if clock is not None else None,
+        rate_limit_wait_seconds=round(rate_limit_wait_seconds(inp, explores, drafts), 1),
     )
 
 
@@ -131,6 +168,8 @@ def finalize_sync(
     execution_id: str,
     explores: Sequence[ExploreResult],
     drafts: Sequence[ReviewDraft],
+    *,
+    ctx: RunContext | None = None,
 ) -> FinalReview:
     """The deterministic finalize step over the loaded payloads (unsealed result)."""
     require_dir(inp.prep.job_root)
@@ -142,7 +181,7 @@ def finalize_sync(
         None,
         anchors,
         head_text_reader(inp.prep.repo_dir),
-        run_info(inp, execution_id, time.time()),
+        run_info(inp, execution_id, time.time(), ctx=ctx, explores=explores, drafts=drafts),
         explores=explores,
         drafts=primary_prior_claims_win(drafts, inp.prep.roles.explorer_model),
         merge=inp.merge,
@@ -165,6 +204,7 @@ async def finalize(inp: FinalizeInput) -> FinalReview:
         drafts = [load_kept(run_dir, ReviewDraft, s) for s in inp.draft_seals]
         guard(inp.req, *explores, *drafts)  # each loaded payload carries this run's seal
         final = await blocking(
-            lambda: finalize_sync(inp, ctx.execution_id, explores, drafts), {"stage": "finalize"}
+            lambda: finalize_sync(inp, ctx.execution_id, explores, drafts, ctx=ctx),
+            {"stage": "finalize"},
         )
         return seal(final, ctx)

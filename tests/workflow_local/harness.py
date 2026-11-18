@@ -93,7 +93,9 @@ class Harness:
         token: str | None = TOKEN,
         read_token: str | None = None,
         cannot_post_reason: str | None = None,
+        **extra: Any,
     ) -> RunContext:
+        """The run context of a local run; ``extra`` sets more fields (run clock epochs)."""
         ref = parse_pr_url(req.pr_url)
         return RunContext(
             execution_id=execution_id("local", ref, self.repo.head, secrets.token_hex(4)),
@@ -108,6 +110,7 @@ class Harness:
             mistral_api_key=MISTRAL_KEY,
             agent_python=str(self.agent_python),
             cannot_post_reason=cannot_post_reason,
+            **extra,
         )
 
     async def run(self, req: ReviewRequest | None = None, **ctx_kw: Any) -> ReviewOutcome:

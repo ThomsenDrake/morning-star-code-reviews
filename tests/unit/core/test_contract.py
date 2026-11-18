@@ -364,6 +364,46 @@ def test_usage_plus() -> None:
     assert (s.llm_calls, s.input_tokens, s.output_tokens) == (3, 10, 5)
     assert s.cost_usd == pytest.approx(0.75)
     assert s.finish_reasons == ["stop", "length"]
+    assert (s.rate_limit_waits, s.rate_limit_wait_seconds) == (0, 0.0)
+
+
+def test_usage_rate_limit_defaults_and_plus() -> None:
+    u = usage()
+    assert u.rate_limit_waits == 0
+    assert u.rate_limit_wait_seconds == 0.0
+    a = usage(rate_limit_waits=3, rate_limit_wait_seconds=105.5)
+    b = usage(rate_limit_waits=2, rate_limit_wait_seconds=30.25)
+    s = a.plus(b)
+    assert s.rate_limit_waits == 5
+    assert s.rate_limit_wait_seconds == pytest.approx(135.75)
+    assert a.plus(usage()) == a
+
+
+@pytest.mark.parametrize(
+    "kw", [{"rate_limit_waits": -1}, {"rate_limit_wait_seconds": -0.5}], ids=str
+)
+def test_usage_rate_limit_fields_are_not_negative(kw: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        usage(**kw)
+
+
+def test_usage_json_without_rate_limit_keys_still_loads() -> None:
+    old = {
+        "model": "mistral-large-4",
+        "llm_calls": 4,
+        "tool_calls": 7,
+        "input_tokens": 100,
+        "cached_input_tokens": 0,
+        "output_tokens": 20,
+        "reasoning_tokens": 0,
+        "cost_usd": 0.01,
+        "seconds": 12.5,
+        "finish_reasons": ["stop"],
+    }
+    u = c.Usage.model_validate_json(json.dumps(old))
+    assert (u.rate_limit_waits, u.rate_limit_wait_seconds) == (0, 0.0)
+    # The new keys come after the old ones, so the old JSON is a prefix of the new.
+    assert list(u.model_dump())[: len(old)] == list(old)
 
 
 # --------------------------------------------------------------------------------------
@@ -479,6 +519,114 @@ def test_agent_job_and_result_accept_verify_phase() -> None:
     assert fmt.draft == {"entries": []}
 
 
+# job.json and result.json as 0.1.0 wrote them (no run limits, no rate-limit usage).
+OLD_JOB_JSON: dict[str, Any] = {
+    "schema_version": 1,
+    "phase": "explore",
+    "execution_id": "msreview-cli-o-r-pr1-aaaaaaa-1234abcd",
+    "repo_dir": "/tmp/run/repo",
+    "head_sha": SHA,
+    "merge_base_sha": SHA,
+    "input_path": "/tmp/run/explore-m/prompt.txt",
+    "input_sha256": "0" * 64,
+    "variant": "full",
+    "model": "mistral-large-4",
+    "effort": "high",
+    "budgets": {
+        "max_tool_calls": 60,
+        "max_llm_calls": 90,
+        "grace_llm_calls": 2,
+        "explore_seconds": 900,
+        "grace_seconds": 120,
+        "rescue_seconds": 180,
+        "max_context_tokens": 140000,
+        "auto_compact_threshold": 200000,
+        "max_tool_output_chars": 24000,
+        "max_cost_usd": 2.0,
+    },
+    "price_in_per_m": 0.7,
+    "price_out_per_m": 2.1,
+    "changed_files": [
+        {"path": "a.py", "previous_path": None, "status": "modified", "diff_file": None}
+    ],
+    "meter_path": "/tmp/run/explore-m/meter.json",
+    "coverage_path": "/tmp/run/explore-m/coverage.json",
+    "result_path": "/tmp/run/explore-m/result.json",
+    "partial_notes_path": "/tmp/run/explore-m/notes.partial.txt",
+    "format_target": "review",
+}
+
+OLD_RESULT_JSON: dict[str, Any] = {
+    "phase": "explore",
+    "state": "Completed",
+    "stop_reason": None,
+    "notes": "EXPLORATION COMPLETE",
+    "draft": None,
+    "rescued": False,
+    "complete": True,
+    "budget_exhausted": False,
+    "exhausted_by": [],
+    "opened_paths": ["a.py"],
+    "usage": {
+        "model": "mistral-large-4",
+        "llm_calls": 3,
+        "tool_calls": 2,
+        "input_tokens": 10,
+        "cached_input_tokens": 0,
+        "output_tokens": 5,
+        "reasoning_tokens": 0,
+        "cost_usd": 0.001,
+        "seconds": 30.0,
+        "finish_reasons": ["stop"],
+    },
+    "error": None,
+}
+
+
+def test_old_agent_job_and_result_json_still_validate() -> None:
+    job = c.AgentJob.model_validate_json(json.dumps(OLD_JOB_JSON))
+    assert job.run_limits is None
+    assert job.cooldown_path is None
+    res = c.AgentRunResult.model_validate_json(json.dumps(OLD_RESULT_JSON))
+    assert res.usage.rate_limit_waits == 0
+    assert res.usage.rate_limit_wait_seconds == 0.0
+
+
+def test_agent_job_round_trips_run_limits_and_cooldown_path() -> None:
+    data = {
+        **OLD_JOB_JSON,
+        "run_limits": {"wind_down_epoch": 1000.0, "stop_epoch": 1300.0},
+        "cooldown_path": "/tmp/run/cooldown-mistral-large-4.json",
+    }
+    job = c.AgentJob.model_validate(data)
+    assert job.run_limits == c.RunLimits(wind_down_epoch=1000.0, stop_epoch=1300.0)
+    assert job.cooldown_path == "/tmp/run/cooldown-mistral-large-4.json"
+    assert c.AgentJob.model_validate_json(job.model_dump_json()) == job
+    res = c.AgentRunResult.model_validate(
+        {
+            **OLD_RESULT_JSON,
+            "usage": {
+                **OLD_RESULT_JSON["usage"],
+                "rate_limit_waits": 4,
+                "rate_limit_wait_seconds": 271.5,
+            },
+        }
+    )
+    assert (res.usage.rate_limit_waits, res.usage.rate_limit_wait_seconds) == (4, 271.5)
+
+
+def test_run_limits_validator() -> None:
+    assert c.RunLimits(wind_down_epoch=5.0, stop_epoch=5.0).stop_epoch == 5.0
+    assert c.RunLimits(wind_down_epoch=5.0, stop_epoch=9.5).wind_down_epoch == 5.0
+    with pytest.raises(ValidationError, match="stop_epoch"):
+        c.RunLimits(wind_down_epoch=10.0, stop_epoch=9.0)
+    for bad in (float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            c.RunLimits(wind_down_epoch=1.0, stop_epoch=bad)
+    with pytest.raises(ValidationError):
+        c.RunLimits.model_validate({"wind_down_epoch": 1.0, "stop_epoch": 2.0, "extra": 1})
+
+
 def test_explore_input_explorer_is_optional() -> None:
     assert "explorer" in c.ExploreInput.model_fields
     assert c.ExploreInput.model_fields["explorer"].default is None
@@ -507,6 +655,8 @@ def max_usage(role: str) -> c.Usage:
         cost_usd=1e6,
         seconds=1e6,
         finish_reasons=[x(20)] * 200,
+        rate_limit_waits=10**6,
+        rate_limit_wait_seconds=1e6,
     )
 
 

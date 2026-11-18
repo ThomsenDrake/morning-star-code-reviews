@@ -189,9 +189,10 @@ async def no_skip(req: Any, secrets: Any) -> None:
     """The GitHub pre-check: nothing to skip (no network in these tests)."""
 
 
-def hooks(platform: FakePlatform, worker: Worker, **kw: Any) -> driver.Hooks:
+def hooks(platform: FakePlatform, worker: Any, **kw: Any) -> driver.Hooks:
     kw.setdefault("precheck", no_skip)
-    return driver.Hooks(platform=platform, worker=worker, timing=FAST, install_signals=False, **kw)
+    kw.setdefault("timing", FAST)
+    return driver.Hooks(platform=platform, worker=worker, install_signals=False, **kw)
 
 
 SECRETS = driver.DriverSecrets(mistral_api_key=KEY)
@@ -828,3 +829,306 @@ async def test_a_worker_that_registered_before_ours_is_not_shared(tmp_path: Path
     assert code == 0
     assert w.starts == 1  # moved before our worker started
     assert p.started_on and "-x" in p.started_on[0]
+
+
+# ----------------------------------------------------------------------------- slow, not dead
+# Workflows API rate limits and server errors make the run wait; they do not end it.
+
+
+class FakeClock:
+    """The driver's monotonic clock (``driver._now``); only the hooks' sleeps advance it."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+        self.sleeps: list[float] = []
+
+    def now(self) -> float:
+        return self.t
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.t += seconds
+        await asyncio.sleep(0)  # let the worker task run
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    c = FakeClock()
+    monkeypatch.setattr(driver, "_now", c.now)
+    return c
+
+
+def rate_limited(what: str = "get_workflow_execution") -> PlatformError:
+    return PlatformError(f"{what} failed (HTTP 429)", 429)
+
+
+class RateLimitedPolls(FakePlatform):
+    """``execution`` answers 429 for ``seconds`` (fake time) from the first poll."""
+
+    def __init__(self, clock: FakeClock, seconds: float) -> None:
+        super().__init__()
+        self.clock = clock
+        self.seconds = seconds
+        self.until: float | None = None
+        self.refused = 0
+
+    async def execution(self, execution_id: str) -> ExecutionState:
+        if self.until is None:
+            self.until = self.clock.t + self.seconds
+        if self.clock.t < self.until:
+            self.calls.append(("execution", execution_id))
+            self.refused += 1
+            raise rate_limited()
+        return await super().execution(execution_id)
+
+
+async def test_polling_waits_out_five_minutes_of_rate_limits(
+    tmp_path: Path, clock: FakeClock, capsys: pytest.CaptureFixture[str]
+) -> None:
+    p = RateLimitedPolls(clock, 300.0)
+    h = hooks(p, Worker(p), sleep=clock.sleep)
+    outcome, code = await driver.run_review(make_cfg(tmp_path, deadline_s=3600), SECRETS, h)
+    assert code == 0 and outcome.status == "posted"
+    assert p.refused >= 10 and p.terminated == []
+    assert p.until is not None and clock.t >= p.until  # five fake minutes went by
+    polls = clock.sleeps[-(p.refused + 2) :]
+    # The interval backs off to the cap while the errors last, then returns to poll_s.
+    assert max(polls) == FAST.api_backoff_max_s == 30.0
+    assert polls[0] == FAST.poll_s * 2**0 and polls[1] == FAST.poll_s * 2
+    assert polls[-2:] == [FAST.poll_s, FAST.poll_s]
+    err = capsys.readouterr().err
+    assert "still waiting, with a backoff" in err
+    assert f"answers again after {p.refused} errors" in err
+
+
+async def test_polling_stops_at_the_hard_deadline_while_rate_limited(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    p = RateLimitedPolls(clock, 10_000.0)
+    h = hooks(p, Worker(p), sleep=clock.sleep)
+    outcome, code = await driver.run_review(make_cfg(tmp_path, deadline_s=1200), SECRETS, h)
+    assert code == driver.EXIT_FAILED and "20-minute deadline" in (outcome.reason or "")
+    assert p.terminated == [outcome.execution_id]
+    assert clock.t <= 1000.0 + 1200 + 1e-6  # no sleep runs past the deadline
+
+
+class BrokenPolls(FakePlatform):
+    async def execution(self, execution_id: str) -> ExecutionState:
+        self.calls.append(("execution", execution_id))
+        raise PlatformError("get_workflow_execution failed (HTTP 404)", 404)
+
+
+async def test_a_poll_error_that_will_not_pass_fails_as_before(tmp_path: Path) -> None:
+    p = BrokenPolls()
+    outcome, code = await driver.run_review(make_cfg(tmp_path), SECRETS, hooks(p, Worker(p)))
+    assert code == driver.EXIT_FAILED and outcome.status == "failed"
+    assert "Workflows API error" in (outcome.reason or "") and "HTTP 404" in (outcome.reason or "")
+    assert [c[0] for c in p.calls].count("execution") == 1
+    assert p.terminated == [outcome.execution_id]
+
+
+class FlakyWhoami(FakePlatform):
+    def __init__(self, errors: list[PlatformError]) -> None:
+        super().__init__()
+        self.errors = errors
+
+    async def whoami(self) -> Whoami:
+        if self.errors:
+            self.calls.append(("whoami", None))
+            raise self.errors.pop(0)
+        return await super().whoami()
+
+
+SLOW_BACKOFF = driver.Timing(**{**FAST.__dict__, "start_retry_s": 2.0})
+
+
+async def test_preflight_waits_out_rate_limits(tmp_path: Path, clock: FakeClock) -> None:
+    p = FlakyWhoami([rate_limited("whoami") for _ in range(3)])
+    h = hooks(p, Worker(p), sleep=clock.sleep, timing=SLOW_BACKOFF)
+    outcome, code = await driver.run_review(make_cfg(tmp_path), SECRETS, h)
+    assert code == 0 and outcome.status == "posted"
+    assert [c[0] for c in p.calls].count("whoami") == 4
+    assert clock.sleeps[:3] == [2.0, 4.0, 8.0]  # 2 s doubling
+
+
+async def test_preflight_gives_up_after_its_retry_budget(tmp_path: Path, clock: FakeClock) -> None:
+    p = FlakyWhoami([rate_limited("whoami") for _ in range(1000)])
+    w = Worker(p)
+    h = hooks(p, w, sleep=clock.sleep, timing=SLOW_BACKOFF)
+    with pytest.raises(driver.DriverError, match="cannot reach the Mistral Workflows API"):
+        await driver.run_review(make_cfg(tmp_path, deadline_s=3600), SECRETS, h)
+    assert 270.0 <= sum(clock.sleeps) <= SLOW_BACKOFF.preflight_retry_s == 300.0
+    assert max(clock.sleeps) == 30.0  # the backoff cap
+    assert w.starts == 0
+
+
+async def test_start_waits_out_rate_limits_with_the_same_id(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    p = FakePlatform()
+    p.start_errors = [rate_limited("execute_workflow") for _ in range(4)]
+    h = hooks(p, Worker(p), sleep=clock.sleep, timing=SLOW_BACKOFF)
+    outcome, code = await driver.run_review(make_cfg(tmp_path, deadline_s=3600), SECRETS, h)
+    assert code == 0 and outcome.status == "posted"
+    ids = [c[1] for c in p.calls if c[0] == "start"]
+    assert len(ids) == 5 and set(ids) == {outcome.execution_id}
+    assert [s for s in clock.sleeps if s >= 2.0][:4] == [2.0, 4.0, 8.0, 16.0]
+
+
+async def test_start_gives_up_after_its_retry_budget(tmp_path: Path, clock: FakeClock) -> None:
+    p = FakePlatform()
+    p.start_errors = [rate_limited("execute_workflow") for _ in range(1000)]
+    h = hooks(p, Worker(p), sleep=clock.sleep, timing=SLOW_BACKOFF)
+    outcome, code = await driver.run_review(make_cfg(tmp_path, deadline_s=3600), SECRETS, h)
+    assert code == driver.EXIT_FAILED and "HTTP 429" in (outcome.reason or "")
+    assert 570.0 <= sum(s for s in clock.sleeps if s >= 2.0) <= 600.0
+    assert p.terminated == [outcome.execution_id]  # the start may have reached the server
+
+
+class RateLimitedSweepReads(FakePlatform):
+    """Other runs' executions; reads about some of them are refused."""
+
+    def __init__(self, refuse: dict[str, PlatformError]) -> None:
+        super().__init__()
+        self.refuse = refuse
+
+    async def execution(self, execution_id: str) -> ExecutionState:
+        if execution_id in self.refuse:
+            self.calls.append(("execution", execution_id))
+            raise self.refuse[execution_id]
+        return await super().execution(execution_id)
+
+    async def deployment(self, name: str) -> DeploymentState | None:
+        if name in self.refuse:
+            self.calls.append(("deployment", name))
+            raise self.refuse[name]
+        return await super().deployment(name)
+
+
+async def test_sweep_does_not_terminate_when_a_read_is_rate_limited() -> None:
+    prefix = "msreview-ci-octo-org-widgets-pr7-abcdef1-"
+    slow, busy, gone, orphan = (prefix + x for x in ("0a0b0c0d", "1a1b1c1d", "2a2b2c2d", "3a3b"))
+    p = RateLimitedSweepReads(
+        {
+            "dep-slow": rate_limited("get_deployment"),  # the deployment read is refused
+            busy: PlatformError("get_workflow_execution failed (HTTP 503)", 503),
+            "dep-gone": PlatformError("get_deployment failed (HTTP 400)", 400),
+        }
+    )
+    p.running = [slow, busy, gone, orphan]
+    p.foreign = {slow: "dep-slow", gone: "dep-gone", orphan: "dep-orphan"}
+    terminated = await driver.sweep_orphans(p, REF, PR, FAST)
+    # A rate limit or a server error proves nothing: that run may be alive and slow.
+    assert terminated == p.terminated == [gone, orphan]
+
+
+async def test_run_context_carries_the_clock_and_the_token_box(tmp_path: Path) -> None:
+    from morning_star_review.core.runctx import RunContext, run_context
+
+    seen: list[RunContext] = []
+
+    async def runner(req: Any) -> Any:
+        seen.append(run_context())
+        return outcome_dict(seen[0].execution_id)
+
+    async def refresh() -> str | None:
+        return "ghs_refreshed_token_abcdefghijklmnop"
+
+    secrets = driver.DriverSecrets(
+        mistral_api_key=KEY,
+        github_token="ghs_first_token_abcdefghijklmnopqr",
+        github_token_refresh=refresh,
+        github_token_minted_epoch=999_000.0,
+    )
+    cfg = make_cfg(
+        tmp_path,
+        mode="local",
+        deadline_s=5400,
+        wind_down_after_s=600.0,
+        defer_publish_dir=tmp_path / "plans",
+    )
+    h = driver.Hooks(
+        local_runner=runner, timing=FAST, install_signals=False, wall_clock=lambda: 1_000_000.0
+    )
+    outcome, code = await driver.run_review(cfg, secrets, h)
+    assert code == 0 and outcome.status == "posted"
+    ctx = seen[0]
+    assert (ctx.run_started_epoch, ctx.wind_down_epoch, ctx.hard_epoch) == (
+        1_000_000.0,
+        1_000_600.0,
+        1_005_400.0,
+    )
+    assert ctx.defer_publish is True
+    box = ctx.token_box
+    assert box is not None and box.refresh is refresh and box.minted_epoch == 999_000.0
+    assert ctx.current_github_token() == "ghs_first_token_abcdefghijklmnopqr"
+    assert "ghs_first_token_abcdefghijklmnopqr" not in repr(ctx)
+
+    # No refresh (ci mode, or no App): no box; no defer dir: posting is not deferred.
+    seen.clear()
+    plain = driver.DriverSecrets(mistral_api_key=KEY, github_token="ghs_plain_token_abcdefghijk")
+    await driver.run_review(make_cfg(tmp_path, mode="local", deadline_s=5400), plain, h)
+    assert seen[0].token_box is None and seen[0].defer_publish is False
+    assert seen[0].current_github_token() == "ghs_plain_token_abcdefghijk"
+    assert seen[0].hard_epoch == 1_005_400.0 and seen[0].wind_down_epoch == 1_004_500.0
+
+
+async def test_the_wind_down_is_announced_at_w(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    now = [1_000_000.0]
+    before: list[str] = []
+
+    async def runner(req: Any) -> Any:
+        await asyncio.sleep(0.05)
+        before.append(capsys.readouterr().err)
+        now[0] += 301.0  # past W (5 minutes after the start)
+        await asyncio.sleep(0.1)
+        return outcome_dict("e")
+
+    timing = driver.Timing(**{**FAST.__dict__, "wind_down_check_s": 0.01})
+    h = driver.Hooks(
+        local_runner=runner, timing=timing, install_signals=False, wall_clock=lambda: now[0]
+    )
+    cfg = make_cfg(tmp_path, mode="local", deadline_s=5400, wind_down_after_s=300.0)
+    await driver.run_review(cfg, SECRETS, h)
+    after = capsys.readouterr().err
+    assert "msreview: deadline 90 min; wind-down at 5 min" in before[0]
+    line = "msreview: wind-down: 5 of 90 minutes used; finishing the review with what it has"
+    assert line not in before[0]
+    assert after.count(line) == 1
+
+
+async def test_the_wind_down_announcer_stops_with_the_run(tmp_path: Path) -> None:
+    p = FakePlatform()
+    h = hooks(p, Worker(p))
+    before = {t for t in asyncio.all_tasks() if not t.done()}
+    outcome, code = await driver.run_review(make_cfg(tmp_path, deadline_s=5400), SECRETS, h)
+    assert code == 0 and outcome.status == "posted"
+    await asyncio.sleep(0)
+    left = {t for t in asyncio.all_tasks() if not t.done()} - before
+    assert left <= {asyncio.current_task()}
+
+
+class RateLimitedTerminate(FakePlatform):
+    def __init__(self, refusals: int) -> None:
+        super().__init__()
+        self.refusals = refusals
+
+    async def terminate(self, execution_id: str) -> None:
+        if self.refusals:
+            self.refusals -= 1
+            self.calls.append(("terminate", execution_id))
+            raise rate_limited("terminate_workflow_execution")
+        await super().terminate(execution_id)
+
+
+async def test_a_rate_limited_terminate_is_tried_again(tmp_path: Path) -> None:
+    p = RateLimitedTerminate(2)
+    p.statuses = ["RUNNING"]
+    outcome, code = await driver.run_review(
+        make_cfg(tmp_path, deadline_s=1), SECRETS, hooks(p, Worker(p))
+    )
+    assert code == driver.EXIT_FAILED and "deadline" in (outcome.reason or "")
+    assert [c[0] for c in p.calls].count("terminate") == 3
+    assert p.terminated == [outcome.execution_id]

@@ -30,6 +30,7 @@ from morning_star_review.activities.verify import (
     verify_result,
 )
 from morning_star_review.core import contract as c
+from morning_star_review.core import runclock
 from morning_star_review.core.config import resolve
 from morning_star_review.core.errors import (
     MsreviewBadRequest,
@@ -82,9 +83,7 @@ def test_cap_bytes_and_paths() -> None:
     assert common.cap_paths(["a", "b"], known, 10, 6) == ["a"]
 
 
-def test_launch_timeout_stays_inside_the_activity() -> None:
-    from datetime import timedelta
-
+def test_launch_timeout_is_the_runner_budget_plus_overhead() -> None:
     b = c.AgentBudgets(
         max_tool_calls=60,
         max_llm_calls=90,
@@ -97,9 +96,13 @@ def test_launch_timeout_stays_inside_the_activity() -> None:
         max_tool_output_chars=24_000,
         max_cost_usd=2.0,
     )
-    assert common.launch_timeout(b, timedelta(minutes=35)) == 900 + 120 + 180 + 90
+    assert common.launch_timeout(b) == 900 + 120 + 180 + 90
+    # No activity cap any more: the activities sit above every allowed deadline, and
+    # the launcher bounds the process by the run's limits instead.
     long = b.model_copy(update={"explore_seconds": 3600})
-    assert common.launch_timeout(long, timedelta(minutes=35)) == 35 * 60 - 60
+    assert common.launch_timeout(long) == 3600 + 120 + 180 + 90
+    tiny = b.model_copy(update={"explore_seconds": 1, "grace_seconds": 0, "rescue_seconds": 0})
+    assert common.launch_timeout(tiny) == 91
 
 
 def test_head_text_reader_is_confined(tmp_path: Path) -> None:
@@ -442,9 +445,20 @@ async def test_formatter_never_outlives_the_calling_activity(
     from morning_star_review.activities.agent_launcher import AgentTimedOut
 
     seen: list[float] = []
+    latest: list[float | None] = []
 
-    async def fake_run_agent(phase: str, job_dir: Path, ctx: Any, timeout_s: float) -> Any:
+    async def fake_run_agent(
+        phase: str,
+        job_dir: Path,
+        ctx: Any,
+        timeout_s: float,
+        *,
+        latest_epoch: float | None = None,
+        model: str | None = None,
+    ) -> Any:
         seen.append(timeout_s)
+        latest.append(latest_epoch)
+        assert model == prep.roles.formatter_model
         raise AgentTimedOut("stopped")
 
     monkeypatch.setattr(structure, "run_agent", fake_run_agent)
@@ -468,6 +482,72 @@ async def test_formatter_never_outlives_the_calling_activity(
     # No limit given: the usual allowance (runner budget plus overhead).
     await structure.run_formatter(ctx, prep, job_dir=tmp_path / "c", **kw)
     assert seen[-1] == structure.FORMAT_SECONDS + 30 + 90
+    assert latest == [None, None]
+
+
+async def test_formatter_follows_the_run_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    import time
+    from types import SimpleNamespace
+    from typing import Any
+
+    from morning_star_review.activities import structure
+    from morning_star_review.activities.agent_launcher import AgentTimedOut
+
+    calls: list[dict[str, Any]] = []
+
+    async def fake_run_agent(
+        phase: str, job_dir: Path, ctx: Any, timeout_s: float, **kw: Any
+    ) -> Any:
+        calls.append(
+            {"timeout": timeout_s, **kw, "job": json.loads((job_dir / "job.json").read_text())}
+        )
+        (job_dir / "meter.json").write_text(
+            json.dumps(
+                {
+                    "phase": "format",
+                    "model": "x",
+                    "llm_calls": 2,
+                    "rl_waits": 3,
+                    "rl_wait_seconds": 250.5,
+                    "cost_usd": 0.01,
+                }
+            )
+        )
+        raise AgentTimedOut("stopped")
+
+    monkeypatch.setattr(structure, "run_agent", fake_run_agent)
+    ctx: Any = SimpleNamespace(execution_id="msreview-x", secrets=list)
+    prep: Any = SimpleNamespace(
+        roles=_roles("best"), budgets=c.ResolvedBudgets(), repo_dir=str(tmp_path)
+    )
+    kw: dict[str, Any] = {"head_sha": "", "merge_base_sha": "", "notes": "n", "target": "review"}
+    now = time.time()
+
+    # Less than MIN_FORMAT_SECONDS before the run's stop: not started at all.
+    near = c.RunLimits(wind_down_epoch=now + 30, stop_epoch=now + 30)
+    skipped = await structure.run_formatter(ctx, prep, job_dir=tmp_path / "a", limits=near, **kw)
+    assert skipped.draft is None and calls == []
+    assert skipped.error == "no time left before the run's time limit for the formatter"
+    assert not (tmp_path / "a").exists()
+
+    # Enough time: the job carries the limits and the shared cooldown file, the launcher
+    # gets the stop epoch; a stopped formatter keeps its metered usage.
+    limits = c.RunLimits(wind_down_epoch=now + 600, stop_epoch=now + 600)
+    out = await structure.run_formatter(
+        ctx, prep, job_dir=tmp_path / "format-m", limits=limits, **kw
+    )
+    (call,) = calls
+    assert call["latest_epoch"] == limits.stop_epoch
+    assert call["timeout"] == structure.FORMAT_SECONDS + 30 + 90
+    assert call["job"]["run_limits"] == limits.model_dump(mode="json")
+    model = prep.roles.formatter_model
+    assert call["job"]["cooldown_path"] == str(runclock.cooldown_path(tmp_path, model))
+    assert out.draft is None and "AgentTimedOut" in (out.error or "")
+    assert out.usage is not None and out.usage.model == model
+    assert out.usage.rate_limit_waits == 3 and out.usage.rate_limit_wait_seconds == 250.5
 
 
 def test_verify_time_left_counts_from_the_attempt_start() -> None:
@@ -476,3 +556,89 @@ def test_verify_time_left_counts_from_the_attempt_start() -> None:
     limit = v.VERIFY_TIMEOUT.total_seconds() - v.ACTIVITY_MARGIN
     assert v.time_left(100.0, now=100.0) == limit
     assert v.time_left(100.0, now=700.0) == limit - 600
+
+
+# ------------------------------------------------------------------------ rate-limit waits
+
+
+def test_agent_line_ends_with_the_rate_limit_wait() -> None:
+    from typing import Any
+
+    kw: dict[str, Any] = {
+        "complete": True,
+        "rescued": False,
+        "budget_exhausted": False,
+        "exhausted_by": [],
+        "stop_reason": None,
+        "state": "Completed",
+    }
+    assert common.agent_line("explore", "m", **kw).endswith(" stop_reason=- rl_wait=0")
+    line = common.agent_line("explore", "m", rl_wait=430.9, **kw)
+    assert line.endswith(" rl_wait=431")
+    assert common.agent_line("verify", "m", rl_wait=float("nan"), **kw).endswith(" rl_wait=0")
+
+
+def test_meter_usage_reads_counts_and_waits(tmp_path: Path) -> None:
+    import json
+
+    assert common.meter_usage(tmp_path, "m") is None  # no meter yet
+    meter = {
+        "phase": "explore",
+        "model": "other",
+        "llm_calls": 5,
+        "tool_calls": True,  # not an int count
+        "input_tokens": -3,
+        "cost_usd": 0.1234567,
+        "seconds": float("inf"),
+        "finish_reasons": ["stop", "x" * 50],
+        "rl_waits": 4,
+        "rl_wait_seconds": 431.25,
+        "rl_until_epoch": None,
+    }
+    (tmp_path / "meter.json").write_text(json.dumps(meter))
+    u = common.meter_usage(tmp_path, "mistral-large-4")
+    assert u is not None and u.model == "mistral-large-4"
+    assert (u.llm_calls, u.tool_calls, u.input_tokens) == (5, 0, 0)
+    assert u.cost_usd == 0.123457 and u.seconds == 0.0
+    assert u.finish_reasons == ["stop", "x" * 20]
+    assert u.rate_limit_waits == 4 and u.rate_limit_wait_seconds == 431.25
+    (tmp_path / "meter.json").write_text(json.dumps({"rl_waits": -1, "rl_wait_seconds": "1"}))
+    u = common.meter_usage(tmp_path, "m")
+    assert u is not None and u.rate_limit_waits == 0 and u.rate_limit_wait_seconds == 0.0
+    (tmp_path / "meter.json").write_text("[]")
+    assert common.meter_usage(tmp_path, "m") is None
+    (tmp_path / "meter.json").write_text(" " * (common.METER_MAX_BYTES + 1))
+    assert common.meter_usage(tmp_path, "m") is None
+
+
+def test_meter_reader_refuses_symlinks(tmp_path: Path) -> None:
+    (tmp_path / "elsewhere.json").write_text('{"llm_calls": 3}')
+    (tmp_path / "meter.json").symlink_to(tmp_path / "elsewhere.json")
+    assert common.read_meter(tmp_path) is None
+
+
+def test_deadline_run_result_keeps_the_metered_usage(tmp_path: Path) -> None:
+    import json
+
+    (tmp_path / "meter.json").write_text(json.dumps({"llm_calls": 2, "rl_wait_seconds": 90}))
+    (tmp_path / "coverage.json").write_text(json.dumps(["a.py", 3, "b.py"]))
+    res = common.deadline_run_result("explore", tmp_path, "m")
+    assert res.state == "Error" and res.stop_reason == runclock.RUN_DEADLINE_STOP
+    assert not res.complete and res.budget_exhausted and res.exhausted_by == ["deadline"]
+    assert res.opened_paths == ["a.py", "b.py"]
+    assert res.usage.llm_calls == 2 and res.usage.rate_limit_wait_seconds == 90
+    assert res.error == "the explorer was stopped at the run's time limit"
+    bare = common.deadline_run_result("verify", tmp_path / "missing", "v")
+    assert bare.usage == c.Usage(model="v") and bare.opened_paths == []
+    result = explore_result(bare, "v", set(), [], partial="FINDING ...")
+    assert result.notes == "FINDING ..." and not result.complete
+
+
+def test_a_skipped_verifier_leaves_every_candidate_unaddressed() -> None:
+    from morning_star_review.activities.verify import skipped_verify_result
+
+    res = skipped_verify_result("zai-glm-5-3", ["c1", "c2"])
+    assert res.unaddressed == ["c1", "c2"] and res.entries == []
+    assert res.state == "NotRun" and res.stop_reason == runclock.RUN_DEADLINE_STOP
+    assert not res.complete and res.budget_exhausted and res.exhausted_by == ["deadline"]
+    assert res.source == "empty" and res.usage == c.Usage(model="zai-glm-5-3")

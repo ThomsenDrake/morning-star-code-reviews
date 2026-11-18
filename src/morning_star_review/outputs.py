@@ -29,6 +29,7 @@ __all__ = [
     "StopCommands",
     "copy_reports",
     "emit",
+    "emit_published",
     "escape_command",
     "open_findings",
     "result_line",
@@ -38,6 +39,7 @@ __all__ = [
 ]
 
 REPORT_FILES = ("report.md", "findings.json", "run.json")
+DEFERRED_NOTE = "posting in the next step"
 STEP_SUMMARY_LIMIT = 900_000  # GitHub's limit is 1 MiB per step
 
 
@@ -51,20 +53,36 @@ def open_findings(outcome: ReviewOutcome) -> int:
 
 
 def usage_line(outcome: ReviewOutcome) -> str:
-    """``msreview usage: <role:model> llm=.. tools=.. in=.. cached=.. out=.. reasoning=..``."""
+    """``msreview usage: <role:model> llm=.. tools=.. in=.. cached=.. out=.. reasoning=..``.
+
+    ``rl_wait=<s>`` follows a model's cost when it waited on rate limits.
+    """
     parts = []
     for key in sorted(outcome.usage):
         u = outcome.usage[key]
-        parts.append(
+        part = (
             f"{key} llm={u.llm_calls} tools={u.tool_calls} in={u.input_tokens} "
             f"cached={u.cached_input_tokens} out={u.output_tokens} "
             f"reasoning={u.reasoning_tokens} cost=${u.cost_usd:.4f}"
         )
+        if u.rate_limit_wait_seconds > 0:
+            part += f" rl_wait={round(u.rate_limit_wait_seconds)}"
+        parts.append(part)
     body = "; ".join(parts) if parts else "none"
     return f"msreview usage: {body}; est_cost=${outcome.cost_usd:.2f}"
 
 
-def result_line(outcome: ReviewOutcome) -> str:
+def result_line(outcome: ReviewOutcome, *, deferred: bool = False) -> str:
+    """``msreview result: status=.. verdict=.. findings=.. review=..``.
+
+    ``deferred``: the review step of the Action, whose publish step posts the review.
+    """
+    if deferred:
+        status = "failed" if outcome.status == "failed" else "deferred"
+        return (
+            f"msreview result: status={status} verdict={outcome.verdict or '-'} "
+            f"findings={open_findings(outcome)}; {DEFERRED_NOTE}"
+        )
     review = outcome.review_url or outcome.summary_url or "-"
     return (
         f"msreview result: status={outcome.status} verdict={outcome.verdict or '-'} "
@@ -108,7 +126,7 @@ def _fallback_report(outcome: ReviewOutcome) -> str:
     return "\n".join(lines)
 
 
-def copy_reports(run_dir: Path, out_dir: Path, outcome: ReviewOutcome) -> Path:
+def copy_reports(run_dir: Path | None, out_dir: Path, outcome: ReviewOutcome) -> Path:
     """Put ``report.md``, ``findings.json`` and ``run.json`` into ``out_dir``.
 
     ``publish`` writes them into the run dir; any file it did not write (the run failed
@@ -116,10 +134,10 @@ def copy_reports(run_dir: Path, out_dir: Path, outcome: ReviewOutcome) -> Path:
     from an earlier review next to this one's.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    src = run_dir / "report"
+    src = run_dir / "report" if run_dir is not None else None
     for name in REPORT_FILES:
-        path = src / name
-        if path.is_file() and not path.is_symlink():
+        path = src / name if src is not None else None
+        if path is not None and path.is_file() and not path.is_symlink():
             # Atomic replace: a symlink at the destination (for example one shipped in
             # a PR checkout's msreview-reports/) is replaced, never followed.
             write_bytes_atomic(out_dir / name, path.read_bytes(), mode=0o644)
@@ -186,6 +204,44 @@ def _annotation(outcome: ReviewOutcome) -> str:
     return f"::notice title=Morning Star Code Review::{escape_command(head)}"
 
 
+def _export_plan(cfg: DriverConfig, run_dir: Path) -> Path | None:
+    """Deferred publish: copy the run's plan to ``cfg.defer_publish_dir`` (None: no plan)."""
+    dest = getattr(cfg, "defer_publish_dir", None)
+    if dest is None:
+        return None
+    from morning_star_review import deferred  # lazy: imports the GitHub client
+
+    return deferred.export_plan(run_dir, dest)
+
+
+def _ci_results(
+    outcome: ReviewOutcome,
+    report_path: Path | None,
+    src: Mapping[str, str],
+    stop: object,
+    deployment: str | None,
+) -> None:
+    """``$GITHUB_OUTPUT``, the step summary and the annotation of a finished outcome."""
+    out = src.get("GITHUB_OUTPUT", "")
+    if out:
+        values = {
+            "status": outcome.status,
+            "verdict": outcome.verdict or "",
+            "findings": str(open_findings(outcome)),
+            "execution-id": outcome.execution_id,
+            "report-path": str(report_path) if report_path else "",
+        }
+        if deployment is not None:
+            values["deployment"] = deployment
+        write_github_output(out, values)
+    summary = src.get("GITHUB_STEP_SUMMARY", "")
+    if summary:
+        write_step_summary(summary, _fallback_report(outcome))
+    if isinstance(stop, StopCommands):
+        stop.resume()
+    print(_annotation(outcome), flush=True)
+
+
 def emit(
     cfg: DriverConfig,
     outcome: ReviewOutcome,
@@ -194,33 +250,60 @@ def emit(
     deployment: str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> Path | None:
-    """Print the usage and result lines; write reports; set CI outputs (ci mode)."""
+    """Print the usage and result lines; write reports; set CI outputs (ci mode).
+
+    Deferred publish (``cfg.defer_publish_dir`` set and a plan in the run directory):
+    the plan is copied there first and the outputs only name it (``publish-plan``,
+    ``execution-id``, ``deployment``). Status, step summary and annotation come from
+    ``msreview ci-publish`` (``emit_published``) after it posted.
+    """
     src = os.environ if env is None else env
-    _say(usage_line(outcome))
-    _say(result_line(outcome))
+    plan = _export_plan(cfg, run_dir)
+    if plan is not None:
+        _say(f"{usage_line(outcome)}; {DEFERRED_NOTE}")
+        _say(result_line(outcome, deferred=True))
+    else:
+        _say(usage_line(outcome))
+        _say(result_line(outcome))
     report_path: Path | None = None
     if cfg.out_dir is not None:
         report_path = copy_reports(run_dir, cfg.out_dir, outcome)
     if cfg.mode != "ci":
         return report_path
-    out = src.get("GITHUB_OUTPUT", "")
-    if out:
-        write_github_output(
-            out,
-            {
-                "status": outcome.status,
-                "verdict": outcome.verdict or "",
-                "findings": str(open_findings(outcome)),
-                "execution-id": outcome.execution_id,
-                "report-path": str(report_path) if report_path else "",
-                "deployment": deployment or "",
-            },
-        )
-    summary = src.get("GITHUB_STEP_SUMMARY", "")
-    if summary:
-        write_step_summary(summary, _fallback_report(outcome))
+    if plan is not None:
+        out = src.get("GITHUB_OUTPUT", "")
+        if out:
+            write_github_output(
+                out,
+                {
+                    "publish-plan": str(plan),
+                    "execution-id": outcome.execution_id,
+                    "deployment": deployment or "",
+                },
+            )
+        return report_path
     stop = getattr(cfg, "stop_commands", None)
-    if isinstance(stop, StopCommands):
-        stop.resume()
-    print(_annotation(outcome), flush=True)
+    _ci_results(outcome, report_path, src, stop, deployment or "")
+    return report_path
+
+
+def emit_published(
+    outcome: ReviewOutcome,
+    report_dir: Path | None,
+    env: Mapping[str, str] | None = None,
+    *,
+    run_dir: Path | None = None,
+    stop: StopCommands | None = None,
+) -> Path | None:
+    """``msreview ci-publish``: the lines, report files and Actions outputs after posting.
+
+    Report files come from ``<run_dir>/report`` when ``publish`` wrote them, else from
+    the outcome. Writes the same outputs as ``emit`` in ci mode (without ``deployment``,
+    which the review step set).
+    """
+    src = os.environ if env is None else env
+    _say(usage_line(outcome))
+    _say(result_line(outcome))
+    report_path = copy_reports(run_dir, report_dir, outcome) if report_dir is not None else None
+    _ci_results(outcome, report_path, src, stop, None)
     return report_path

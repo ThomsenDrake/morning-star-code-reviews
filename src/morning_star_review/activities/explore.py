@@ -3,20 +3,31 @@
 One activity per explorer model, each with its own job directory
 (``<run_dir>/explore-<model>/``). With an ensemble the workflow runs them in parallel;
 each later explorer starts ``STAGGER_SECONDS`` after the previous one so the first model
-calls do not all hit the API at the same moment. A model call refused with HTTP 429 is
-retried by the SDK, and a turn that still fails is retried by the runner with a longer
-backoff while the explorer's deadline and cost share allow (``agent.runner``).
+calls do not all hit the API at the same moment.
+
+Rate limits slow an explorer down, they never drop it. A model call refused with HTTP
+429 (or capacity / 5xx) is retried by the SDK a few times; a turn that still fails is
+retried by the runner with an exponential backoff for as long as the run allows, and
+the explorer's own clocks pause while it waits (``agent.runner``, ``agent.ratelimit``).
+The launcher extends the process allowance by the same waits. Only the run's limits
+(``RunClock.limits("explore")``: tools close at the wind-down, the last call ends at
+``stop_epoch``) bound the waiting. In a run with a verifier these limits come earlier,
+so a rate-limited explorer cannot crowd out the verifier's reserved window. An agent
+process stopped at that limit still gives a result: its partial notes and metered
+usage (state ``Error``, stop reason ``run_deadline``), so the explorer stays in the
+ensemble.
 """
 
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import timedelta
 from pathlib import Path
 
 from mistralai import workflows
 
-from morning_star_review.activities.agent_launcher import run_agent
+from morning_star_review.activities.agent_launcher import AgentTimedOut, run_agent
 from morning_star_review.activities.common import (
     JOB_JSON,
     activity_errors,
@@ -27,6 +38,7 @@ from morning_star_review.activities.common import (
     cap_bytes,
     cap_paths,
     cost_share,
+    deadline_run_result,
     exhaust_reasons,
     job_dir_name,
     launch_timeout,
@@ -39,6 +51,7 @@ from morning_star_review.activities.common import (
 )
 from morning_star_review.activities.finalize import keep_for_finalize
 from morning_star_review.activities.prepare import PROMPT_TXT
+from morning_star_review.core import runclock
 from morning_star_review.core.contract import (
     AgentJob,
     AgentRunResult,
@@ -67,8 +80,9 @@ __all__ = [
     "explorer_tool_calls",
 ]
 
-# The longest explorer budget (25 min cap) plus grace, rescue and process overhead.
-EXPLORE_TIMEOUT = timedelta(minutes=35)
+# Above any allowed run deadline: rate-limit waits may stretch an explorer far beyond its
+# own budget. Liveness is the 60 s heartbeat timeout; the run's limits end the waiting.
+EXPLORE_TIMEOUT: timedelta = runclock.ACTIVITY_CEILING
 STAGGER_SECONDS = 2.0
 NOTES_MAX_CHARS = 65_536  # ExploreResult.notes bound
 NOTES_MAX_BYTES = 65_536  # also bounds the payload for non-ASCII notes
@@ -111,6 +125,7 @@ def explore_job(
         seconds=b.explorer_minutes * 60,
         max_cost_usd=cost_share(prep.roles, b.max_cost_usd, "explorer"),
     )
+    clock = runclock.from_context(ctx)
     return agent_job(
         phase="explore",
         execution_id=ctx.execution_id,
@@ -123,6 +138,11 @@ def explore_job(
         role=role,
         budgets=budgets,
         changed_files=refs,
+        # With a verifier, explorers end early enough for it to start (runclock).
+        run_limits=(
+            clock.limits("explore", verify=prep.roles.verify_enabled) if clock is not None else None
+        ),
+        cooldown_path=runclock.cooldown_path(run_dir, role.model) if clock is not None else None,
     )
 
 
@@ -171,7 +191,21 @@ async def explore(inp: ExploreInput) -> ExploreResult:
         job_dir.mkdir(mode=0o700, exist_ok=True)
         job = explore_job(inp, ctx, role, run_dir, job_dir)
         write_model(job_dir / JOB_JSON, job)
-        res = await run_agent("explore", job_dir, ctx, launch_timeout(job.budgets, EXPLORE_TIMEOUT))
+        stop = job.run_limits.stop_epoch if job.run_limits is not None else None
+        try:
+            res = await run_agent(
+                "explore",
+                job_dir,
+                ctx,
+                launch_timeout(job.budgets),
+                latest_epoch=stop,
+                model=role.model,
+            )
+        except AgentTimedOut:
+            if stop is None or time.time() < stop:
+                raise  # retryable: a retry resumes the meter and the deadline
+            # The run's time limit: keep what the explorer has instead of dropping it.
+            res = deadline_run_result("explore", job_dir, role.model)
         known = {f.path for f in inp.snap.files}
         partial = "" if res.notes else read_partial_notes(job_dir)
         result = explore_result(res, role.model, known, ctx.secrets(), partial)
@@ -185,6 +219,7 @@ async def explore(inp: ExploreInput) -> ExploreResult:
                 budget_exhausted=result.budget_exhausted,
                 exhausted_by=result.exhausted_by,
                 stop_reason=result.stop_reason,
+                rl_wait=result.usage.rate_limit_wait_seconds,
             )
         )
         sealed = seal(result, ctx)

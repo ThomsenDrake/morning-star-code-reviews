@@ -443,3 +443,70 @@ def test_reports_carry_no_terminal_control_sequences(make) -> None:
     for text in (render.summary(v), render.report(v, lambda _p: lines)):
         assert not any(ch in text for ch in "\x1b\x07\x9b\r"), repr(text)
         assert "�]52;c;" in text
+
+
+# --- rate-limit waits and the skipped verifier in the run details ----------------------
+
+
+def details_with(make, usage: dict[str, Any], **kw: Any) -> str:
+    details = render.RunDetails(
+        execution_id="msreview-x",
+        run_label="cli:1",
+        roles=make.roles(("zai-glm-5-3", "mistral-large-4"), verifier="zai-glm-5-3"),
+        usage=usage,
+        cost_usd=0.4,
+        duration_seconds=1800.0,
+        **kw,
+    )
+    text = render.summary(view(make, [], details=details))
+    return text.split("<details><summary>Run details</summary>", 1)[1]
+
+
+def table_rows(block: str) -> list[list[str]]:
+    lines = [ln for ln in block.split("\n") if ln.startswith("| ") and "---" not in ln]
+    return [[c.strip() for c in ln.strip("|").split("|")] for ln in lines]
+
+
+def test_rate_limit_column_is_absent_without_waits(make) -> None:
+    usage = {
+        "explorer:zai-glm-5-3": make.usage("zai-glm-5-3"),
+        "explorer:mistral-large-4": make.usage("mistral-large-4"),
+    }
+    block = details_with(make, usage)
+    assert "Rate-limit wait" not in block and "rate-limit waits" not in block
+    header, *rows = table_rows(block)
+    assert header[-1] == "Time" and all(len(r) == len(header) for r in rows)
+    assert "Estimated cost: $0.40 (list prices) · duration 1800 s\n" in block
+
+
+def test_rate_limit_column_and_total_when_a_model_waited(make) -> None:
+    usage = {
+        "explorer:zai-glm-5-3": make.usage(
+            "zai-glm-5-3", rate_limit_waits=1, rate_limit_wait_seconds=45.0
+        ),
+        "explorer:mistral-large-4": make.usage(
+            "mistral-large-4", rate_limit_waits=5, rate_limit_wait_seconds=430.4
+        ),
+        "verifier:zai-glm-5-3": make.usage("zai-glm-5-3"),
+    }
+    block = details_with(make, usage)
+    header, *rows = table_rows(block)
+    assert header[-2:] == ["Time", "Rate-limit wait"]
+    waits = {(r[0], r[1]): r[-1] for r in rows}
+    assert waits == {
+        ("explorer", "zai-glm-5-3"): "45s (1x)",
+        ("explorer", "mistral-large-4"): "7m 10s (5x)",
+        ("verifier", "zai-glm-5-3"): "-",
+    }
+    assert "· duration 1800 s · rate-limit waits 7m 55s\n" in block
+
+
+def test_skipped_verifier_is_not_shown_as_nothing_to_verify(make) -> None:
+    usage = {"explorer:zai-glm-5-3": make.usage("zai-glm-5-3")}
+    ran = details_with(make, usage, verify_counts={"confirmed": 1, "uncertain": 2, "refuted": 1})
+    assert "Verifier: 1 confirmed, 2 not confirmed, 1 refuted and dropped" in ran
+    skipped = details_with(
+        make, usage, verify_counts={"confirmed": 0, "uncertain": 3, "refuted": 0, "not_run": 1}
+    )
+    assert "Verifier: did not run; 3 not confirmed\n" in skipped
+    assert "0 confirmed" not in skipped

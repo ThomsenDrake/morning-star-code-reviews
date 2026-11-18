@@ -7,7 +7,9 @@ no model runs and no key is needed. The captured bodies must show:
 
 - explorer and verifier: exactly our five tools, no ``response_format``;
 - formatter: no tools and a strict ``json_schema`` ``response_format``;
-- ``reasoning_effort`` as configured, and absent for effort ``default``.
+- ``reasoning_effort`` as configured, and absent for effort ``default``;
+- the same request keys with our SDK retry config (``completion=``,
+  ``ratelimit.sdk_completion``) as with the SDK's default config.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from typing import Any, ClassVar
 
 import pytest
 
-from morning_star_review.agent import hooks, runner, tools
+from morning_star_review.agent import hooks, ratelimit, runner, tools
 from morning_star_review.core.contract import AgentBudgets, AgentJob
 
 FIVE = {"list_repo_files", "read_repo_file", "read_base_file", "search_repo", "show_file_diff"}
@@ -155,3 +157,37 @@ async def test_formatter_request(capture: list[dict[str, Any]], tmp_path: Path) 
         assert fmt.get("type") == "json_schema"
         assert fmt.get("json_schema", {}).get("strict") is True
         assert body.get("reasoning_effort") == "low"
+
+
+async def test_sdk_retry_config_keeps_the_request_shape(
+    capture: list[dict[str, Any]], tmp_path: Path
+) -> None:
+    assert ratelimit.sdk_completion("mistral-large-4") is not None
+    cases = (
+        (runner.build_explorer, "high", "review"),
+        (runner.build_verifier, "default", "review"),
+        (runner.build_formatter, "low", "review"),
+        (runner.build_formatter, "default", "verify"),
+    )
+    for build, effort, target in cases:
+        bodies = []
+        for sdk_retry in (True, False):
+            capture.clear()
+            job = _job(tmp_path, effort, target)
+            _install(job)
+            tools.configure(job, tmp_path, None)
+            agent = build(job, sdk_retry=sdk_retry)
+            assert (agent.completion is not None) is sdk_retry
+            await agent.run("<notes>\nNO FINDINGS\n</notes>", timeout=60)
+            assert capture, "no completion request reached the capture server"
+            bodies.append(capture[0])
+        configured, default = bodies
+        assert set(configured) == set(default), (build.__name__, effort, target)
+        for key in ("model", "response_format", "reasoning_effort", "tools"):
+            assert configured.get(key) == default.get(key), key
+        if build is runner.build_formatter:
+            assert (configured.get("response_format") or {}).get("type") == "json_schema"
+        if effort == "default":
+            assert "reasoning_effort" not in configured
+        else:
+            assert configured.get("reasoning_effort") == effort

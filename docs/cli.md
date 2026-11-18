@@ -12,7 +12,7 @@ macOS or Linux.
 ```bash
 uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews
 # or a specific release:
-uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.1.0
+uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.1.1
 
 msreview setup
 ```
@@ -64,7 +64,7 @@ Flags:
 | `--max-cost-usd X` | Cost limit for the whole run (default 10.00, at most 100) |
 | `--max-tool-calls N`, `--explorer-minutes N` | Budget per explorer (defaults 60 and 15; at most 200 and 25). A flash explorer outside `best` gets 25 tool calls unless you set this |
 | `--verifier-max-tool-calls N`, `--verifier-minutes N` | Verifier budget (defaults 30 and 8; at most 200 and 25). A flash verifier gets 25 tool calls unless you set this |
-| `--deadline-minutes N` | Overall time limit (default 45, at most 55: the App token that the run posts with expires after 60 minutes) |
+| `--deadline-minutes N` | Overall time limit for the whole run (default 90, 20 to 300). The run winds down 15 minutes before it and still posts what it has. Rate-limit waits make a run slower, so they count against this limit only (see [operations.md](operations.md#rate-limits-and-the-time-limit)) |
 | `--expected-head-sha SHA` | Skip the review if the PR head is no longer this commit |
 | `--out DIR` | Where to write `report.md`, `findings.json` and `run.json` (default `./msreview-reports`). The files are replaced on each run |
 | `--json` | Print the outcome as JSON instead of Markdown |
@@ -92,6 +92,15 @@ msreview usage: explorer:zai-glm-5-3 llm=6 tools=9 in=… cached=… out=… rea
 msreview result: status=posted verdict=findings findings=4 review=https://github.com/…
 ```
 
+When a model is rate-limited, a progress line says so, for example
+`msreview: mistral-large-4 rate-limited (explore); waiting 60s (total waited 1m 45s)`,
+and the usage line adds `rl_wait=<seconds>` for that model. The review continues.
+
+When the CLI posts as your App, it mints the App token before the review and mints a
+new one before posting if the first is older than 45 minutes (installation tokens
+expire after 60 minutes). Both times, only the short-lived mint process reads the
+private key.
+
 ### `msreview doctor [--models] [--deployments]`
 
 Checks the setup and changes nothing:
@@ -117,10 +126,12 @@ Shows whether your GitHub App is installed on the repository, and which permissi
 grants. The exit code is 1 when the App is not installed or when Pull requests: write
 is missing. It also notes when Issues: write (labels) is missing.
 
-### `msreview ci`
+### `msreview ci` and `msreview ci-publish`
 
-The entry point that the GitHub Action runs. It reads the `MSREVIEW_*` variables that
-`action.yml` sets. You do not normally run it yourself.
+The entry points that the GitHub Action runs. `ci` runs the review, and `ci-publish`
+posts its result with a write token minted after the review (see
+[security.md](security.md#github-app-tokens)). They read the `MSREVIEW_*` variables
+that `action.yml` sets. You do not normally run them yourself.
 
 ## User config file
 
@@ -146,7 +157,7 @@ fail_on = "never"          # never | findings | high | critical
 allowed_models = ["zai-glm-5-3", "mistral-large-4", "zai-glm-5-3-flash", "deepseek-v4-1-flash-1017"]
 
 [agent]
-python = "~/.cache/morning-star-review/agent-0.1.0/bin/python"   # MSREVIEW_AGENT_PYTHON
+python = "~/.cache/morning-star-review/agent-0.1.1/bin/python"   # MSREVIEW_AGENT_PYTHON
 ```
 
 The order for the Mistral key is: `MSREVIEW_MISTRAL_API_KEY_COMMAND`, then

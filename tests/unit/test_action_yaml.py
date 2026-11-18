@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from morning_star_review import cli
+from morning_star_review._version import __version__
 
 ROOT = Path(__file__).resolve().parents[2]
 ACTION = ROOT / "action.yml"
@@ -51,11 +52,17 @@ def test_action_inputs_and_defaults() -> None:
     }  # fmt: skip
     assert set(inputs) == expected
     assert inputs["mistral-api-key"]["required"] is True
-    assert inputs["deadline-minutes"]["default"] == "40"
+    assert inputs["deadline-minutes"]["default"] == "90"
+    assert "20-300" in inputs["deadline-minutes"]["description"]
     assert inputs["labels"]["default"] == "true"
     assert inputs["suggestions"]["default"] == "true"
     assert inputs["preset"]["default"] == ""  # repository file, else the built-in default
     assert set(doc["outputs"]) == {"status", "verdict", "findings", "execution-id", "report-path"}
+    for name, output in doc["outputs"].items():
+        # The publish step's value when it ran, else the review step's (deferred publish).
+        assert output["value"] == (
+            f"${{{{ steps.publish.outputs.{name} || steps.review.outputs.{name} }}}}"
+        )
     assert doc["name"] == "Morning Star Code Review"
 
 
@@ -75,8 +82,12 @@ def test_action_env_matches_the_ci_contract() -> None:
     # Tokens are popped by ci_secrets; the agent python/report/run root are read too.
     popped = {"MSREVIEW_GITHUB_TOKEN", "MSREVIEW_READ_TOKEN"}
     assert env_names - popped <= read
-    missing = read - env_names - {"MSREVIEW_VERBOSE"}
+    # Hidden knobs: verbose output and the wind-down test knob (job env only).
+    missing = read - env_names - {"MSREVIEW_VERBOSE", cli.ENV_WIND_DOWN}
     assert not missing, f"read by msreview ci but not set by action.yml: {missing}"
+    defer = review["env"]["MSREVIEW_DEFER_PUBLISH_DIR"]
+    assert "steps.token-read.conclusion == 'success'" in defer
+    assert "/msreview/publish" in defer and defer.rstrip("} ").endswith("|| ''")
     assert review["env"]["MISTRAL_API_KEY"] == "${{ inputs.mistral-api-key }}"
     # The event's head SHA must not bind a run of another PR (`pr-url` input), and a
     # false condition must not become the string "false".
@@ -85,14 +96,89 @@ def test_action_env_matches_the_ci_contract() -> None:
     assert head.rstrip("} ").endswith("|| ''")
 
 
-def test_token_step_permissions() -> None:
-    token = next(s for s in steps_of(load(ACTION)) if s.get("id") == "token")
-    w = token["with"]
+def step_ids() -> list[str]:
+    return [str(s.get("id") or s.get("uses") or s.get("name")) for s in steps_of(load(ACTION))]
+
+
+def by_id(name: str) -> dict[str, Any]:
+    return next(s for s in steps_of(load(ACTION)) if s.get("id") == name)
+
+
+CREDS = "inputs.client-id != '' && inputs.app-private-key != '' && inputs.post != 'never'"
+
+
+def test_token_steps_read_before_and_write_after_the_review() -> None:
+    ids = step_ids()
+    assert ids.index("token-read") < ids.index("review") < ids.index("token-write")
+    assert ids.index("token-write") < ids.index("publish") < len(ids) - 1
+    assert ids[-1].startswith("actions/upload-artifact@")
+    read, write = by_id("token-read"), by_id("token-write")
+    assert read["uses"] == write["uses"]  # the same pinned action
+    # The review step holds a read-only token (App tokens expire after one hour).
+    r = read["with"]
+    assert r["permission-contents"] == "read"
+    assert r["permission-pull-requests"] == "read"
+    assert r["permission-issues"] == "${{ inputs.labels == 'true' && 'read' || '' }}"
+    assert not any("write" in str(v) for k, v in r.items() if k.startswith("permission-"))
+    w = write["with"]
     assert w["permission-contents"] == "read"
     assert w["permission-pull-requests"] == "write"
-    assert "labels" in w["permission-issues"]  # issues: write only when labels are on
-    assert token["continue-on-error"] is True
-    assert "inputs.post != 'never'" in token["if"]
+    assert w["permission-issues"] == "${{ inputs.labels == 'true' && 'write' || '' }}"
+    for step in (read, write):
+        assert step["continue-on-error"] is True
+        assert CREDS in step["if"]
+    assert not read["if"].startswith("${{ always()")
+    # After a failed or cancelled review too: failure plans and the label removal.
+    for step in (write, by_id("publish")):
+        assert step["if"] == f"${{{{ always() && {CREDS} }}}}"
+
+
+def test_private_key_only_in_the_token_steps() -> None:
+    for step in steps_of(load(ACTION)):
+        if step.get("id") in ("token-read", "token-write"):
+            assert step["with"]["private-key"] == "${{ inputs.app-private-key }}"
+            continue
+        # Elsewhere it may only be tested for emptiness in a condition.
+        rest = {k: v for k, v in step.items() if k != "if"}
+        assert "app-private-key" not in repr(rest), step.get("id") or step.get("name")
+        assert (
+            re.sub(r"inputs\.app-private-key != ''", "", str(step.get("if", ""))).find(
+                "app-private-key"
+            )
+            == -1
+        )
+
+
+def test_publish_step_env_matches_ci_publish() -> None:
+    publish = by_id("publish")
+    env = publish["env"]
+    assert env["MSREVIEW_GITHUB_TOKEN"] == "${{ steps.token-write.outputs.token }}"
+    assert env["MSREVIEW_APP_SLUG"] == "${{ steps.token-write.outputs.app-slug }}"
+    assert env["MSREVIEW_TOKEN_STEP"] == "${{ steps.token-write.outcome || 'skipped' }}"
+    assert env["MSREVIEW_PUBLISH_PLAN"] == "${{ steps.review.outputs.publish-plan }}"
+    assert env["MSREVIEW_REPORT_DIR"] == by_id("review")["env"]["MSREVIEW_REPORT_DIR"]
+    assert env["MSREVIEW_PR_URL"] == by_id("review")["env"]["MSREVIEW_PR_URL"]
+    assert "MISTRAL_API_KEY" not in env and "MSREVIEW_READ_TOKEN" not in env
+    assert "ci-publish" in publish["run"]
+
+    class Recorder(dict[str, str]):
+        def get(self, key: str, default: Any = None) -> Any:
+            seen.add(key)
+            return ""
+
+        def pop(self, key: str, default: Any = None) -> Any:
+            seen.add(key)
+            return default
+
+    seen: set[str] = set()
+    assert cli.cmd_ci_publish(Recorder()) == 0  # no plan: nothing to post
+    read = {k for k in seen if k.startswith("MSREVIEW_")}
+    assert set(env) <= read, f"set by action.yml but not read: {set(env) - read}"
+    assert read - set(env) <= {"MSREVIEW_READ_TOKEN"}  # popped, never needed
+    # The review step's token is read-only; the plan comes from its outputs.
+    review_env = by_id("review")["env"]
+    assert review_env["MSREVIEW_GITHUB_TOKEN"] == "${{ steps.token-read.outputs.token }}"
+    assert review_env["MSREVIEW_TOKEN_STEP"] == "${{ steps.token-read.outcome || 'skipped' }}"
 
 
 @pytest.mark.parametrize("path", [ACTION, *WORKFLOWS], ids=lambda p: p.name)
@@ -111,6 +197,30 @@ def test_third_party_actions_are_pinned_by_sha(path: Path) -> None:
         assert PINNED.match(uses), uses
 
 
+ACTION_REF = "ThomsenDrake/morning-star-code-reviews@"
+
+
+@pytest.mark.parametrize("path", [EXAMPLE, FORKS], ids=lambda p: p.name)
+def test_example_workflows_pin_the_current_release(path: Path) -> None:
+    # Users copy the examples as they are: the tag must accept the inputs they show
+    # (for example deadline-minutes 90, which 0.1.0 rejected).
+    uses = [s["uses"] for s in steps_of(load(path)) if s.get("uses", "").startswith(ACTION_REF)]
+    assert uses == [f"{ACTION_REF}v{__version__}"]
+    assert "# Pin to the full commit SHA of the release you reviewed." in path.read_text()
+
+
+def test_docs_name_the_current_release() -> None:
+    readme = (ROOT / "README.md").read_text()
+    assert f"- Status: {__version__}, " in readme
+    changelog = (ROOT / "CHANGELOG.md").read_text()
+    assert f"\n## [{__version__}] - " in changelog
+    assert f"\n[{__version__}]: https://github.com/{ACTION_REF[:-1]}/" in changelog
+    cli_md = (ROOT / "docs" / "cli.md").read_text()
+    assert f"{ACTION_REF}v{__version__}\n" in cli_md  # the install example
+    assert f"/agent-{__version__}/bin/python" in cli_md  # the config example
+    assert f"(`@v{__version__}`)" in (ROOT / "docs" / "security.md").read_text()
+
+
 def test_example_workflow_skips_forks() -> None:
     doc = load(EXAMPLE)
     assert doc["on"] == {
@@ -118,7 +228,9 @@ def test_example_workflow_skips_forks() -> None:
     }
     job = doc["jobs"]["review"]
     assert "head.repo.full_name == github.repository" in job["if"]
-    assert job["timeout-minutes"] == 45
+    # Rate limits make a review slower: about 20 above the 90-minute default deadline.
+    assert job["timeout-minutes"] == 110
+    assert 'deadline-minutes: "90"' in EXAMPLE.read_text()
     assert doc["permissions"] == {"contents": "read", "pull-requests": "read"}
     assert "morning-star-code-review-forks.yml" in EXAMPLE.read_text()
 
@@ -133,6 +245,7 @@ def test_fork_workflow_follows_addendum_g() -> None:
     assert doc["permissions"] == {}
     review = doc["jobs"]["review"]
     assert review["permissions"] == {"contents": "read", "pull-requests": "read"}
+    assert review["timeout-minutes"] == 110
     assert "head.repo.full_name != github.repository" in review["if"]
     for assoc in ("OWNER", "MEMBER", "COLLABORATOR"):
         assert assoc in review["if"]

@@ -16,7 +16,7 @@ def test_package_imports() -> None:
 def test_version_is_single_sourced() -> None:
     from morning_star_review._version import __version__
 
-    assert __version__ == "0.1.0"
+    assert __version__ == "0.1.1"
     assert importlib.metadata.version(DIST) == __version__
 
 
