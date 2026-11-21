@@ -43,6 +43,22 @@ It is **never executed**: nothing is installed, built, tested or run from the PR
 - **Payloads carry no secrets.** Tokens and keys stay in the worker's memory (the run
   context), never in workflow inputs or outputs. Tests check that they do not appear in
   outcomes or in child-process environments.
+- **The setup commands** (`msreview enable`, and `status` or `update --all` when they
+  list the App's repositories) are the exception: they read the App private key into
+  their own process, to sign the JWTs that check where the App is installed, and
+  `enable` also holds the Mistral API key. Both stay in memory and are overwritten when
+  the command ends. They reach GitHub only on the standard input of `gh secret set`,
+  never on a command line, in a file or in `gh`'s environment (no `MSREVIEW_*` or
+  `MISTRAL_API_KEY` variable is passed to `gh`). Anyone with write access to a
+  repository can use its Actions secrets in a workflow, so enable the review only
+  on repositories whose collaborators you trust with the keys.
+- **Only msreview's own secret names.** The setup commands set and delete only
+  `MSREVIEW_MISTRAL_API_KEY`, `MSREVIEW_APP_PRIVATE_KEY` and the variable
+  `MSREVIEW_APP_CLIENT_ID`; the code refuses to set or delete any secret whose name does
+  not start with `MSREVIEW_`. A repository's own `MISTRAL_API_KEY` is never
+  overwritten, which would silently give its other workflows msreview's key, and never
+  deleted. Workflow files from 0.1.x that still map `secrets.MISTRAL_API_KEY` keep
+  using that secret until you move them (`msreview update --force`).
 
 ## GitHub App tokens
 
@@ -154,9 +170,10 @@ workflows are often dangerous. The template follows these rules:
 - **The workflow file comes from the base branch.** On `pull_request_target`, a PR
   cannot change the workflow that reviews it.
 - **Pin the action by commit.** Both example workflows refer to the action by a release
-  tag (`@v0.1.1`), with a comment that asks you to pin it. Replace the tag with the full
+  tag (`@v0.2.0`), with a comment that asks you to pin it. Replace the tag with the full
   commit SHA of the release that you reviewed: a tag can be moved to other code, but a
-  commit SHA always names the same code.
+  commit SHA always names the same code. `msreview enable` and `msreview update` write
+  the commit SHA of the release tag for you.
 
 Anyone with write, maintain or admin access can start a paid review by adding the
 label. When someone with less access (for example the triage role) adds it, the run

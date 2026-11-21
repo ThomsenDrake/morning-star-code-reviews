@@ -117,7 +117,8 @@ TERMINATED_ACTIVITY_NOTE = (
 # and GitHub does not enforce `required: true` for composite-action inputs.
 CI_NO_KEY = (
     "no Mistral API key: the Action input `mistral-api-key` is empty (for example, the "
-    "MISTRAL_API_KEY secret is missing, or the workflow does not pass it to the action)"
+    "MSREVIEW_MISTRAL_API_KEY secret is missing (MISTRAL_API_KEY in a 0.1.x workflow), "
+    "or the workflow does not pass it to the action)"
 )
 # ci mode: Actions stops the step with a signal when someone cancels the workflow run.
 CI_CANCELLED = "cancelled (the workflow run was cancelled)"

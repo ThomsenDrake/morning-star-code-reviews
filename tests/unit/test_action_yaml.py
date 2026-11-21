@@ -274,8 +274,12 @@ def test_fork_workflow_follows_addendum_g() -> None:
     text = FORKS.read_text()
     assert "actions/checkout" not in text  # never check out PR code
     # Concurrency groups are repository-wide: the non-fork workflow joins its group even
-    # when it skips a fork PR, so a shared name would cancel the fork review.
-    assert review["concurrency"]["group"] != load(EXAMPLE)["concurrency"]["group"]
+    # when it skips a fork PR, so a shared group would cancel the fork review. Both groups
+    # are keyed by the workflow's name, and the two workflows have different names.
+    example = load(EXAMPLE)
+    assert "github.workflow" in review["concurrency"]["group"]
+    assert "github.workflow" in example["concurrency"]["group"]
+    assert doc["name"] != example["name"]
 
 
 def approval_gate_script() -> str:

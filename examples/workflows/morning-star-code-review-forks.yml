@@ -1,7 +1,9 @@
 # Review pull requests from forks (hardened `pull_request_target` template).
 #
 # Copy to .github/workflows/morning-star-code-review-forks.yml next to the non-fork
-# workflow and set the same secrets and variables.
+# workflow and set the same secrets and variable: secrets.MSREVIEW_MISTRAL_API_KEY,
+# secrets.MSREVIEW_APP_PRIVATE_KEY and vars.MSREVIEW_APP_CLIENT_ID (`msreview enable
+# OWNER/REPO --secrets-only` sets them).
 #
 # How it stays safe:
 # - It never checks out or runs pull request code. The reviewer fetches the PR head
@@ -52,7 +54,7 @@ jobs:
     # own keeps the non-fork workflow (whose run joins its group even when it skips a
     # fork PR) from cancelling this review.
     concurrency:
-      group: morning-star-code-review-forks-${{ github.repository }}-${{ github.event.pull_request.number }}
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     steps:
       # The triage role can add labels, but only write, maintain or admin may approve a
@@ -76,9 +78,9 @@ jobs:
               ;;
           esac
       # Pin to the full commit SHA of the release you reviewed.
-      - uses: ThomsenDrake/morning-star-code-reviews@v0.1.1
+      - uses: ThomsenDrake/morning-star-code-reviews@v0.2.0
         with:
-          mistral-api-key: ${{ secrets.MISTRAL_API_KEY }}
+          mistral-api-key: ${{ secrets.MSREVIEW_MISTRAL_API_KEY }}
           client-id: ${{ vars.MSREVIEW_APP_CLIENT_ID }}
           app-private-key: ${{ secrets.MSREVIEW_APP_PRIVATE_KEY }}
           expected-head-sha: ${{ github.event.pull_request.head.sha }}

@@ -265,7 +265,7 @@ def test_cmd_ci_empty_key_names_the_action_input(
     out = capsys.readouterr().out
     assert out.count("::error title=Morning Star Code Review::") == 1
     assert "the Action input `mistral-api-key` is empty" in out
-    assert "MISTRAL_API_KEY secret is missing" in out
+    assert "the MSREVIEW_MISTRAL_API_KEY secret is missing" in out
     assert "api_key_command" not in out
     text = summary.read_text(encoding="utf-8")
     assert "`mistral-api-key` is empty" in text and "status=failed" in output.read_text()

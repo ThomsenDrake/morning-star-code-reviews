@@ -40,8 +40,9 @@ still produced, but only as the Action's step summary and artifact, or as CLI ou
 5. On the App's page, note the **Client ID** (it looks like `Iv23li…`). msreview
    uses the client ID, not the numeric App ID.
 6. Under **Private keys**, click **Generate a private key**. Your browser downloads a
-   `.pem` file. Keep it secret. You can create a second key and delete the first one at
-   any time, so rotation does not need downtime.
+   `.pem` file. Keep it secret: `msreview enable` reads it once (step 3), and then you
+   delete it. You can generate more keys and delete old ones at any time, so rotation
+   does not need downtime (step 4).
 
 ### Why not Contents: write?
 
@@ -59,9 +60,10 @@ The verdict labels need Issues: write. If the App does not have it:
 
 - **CLI:** labels are skipped, and the outcome records a note. `msreview app-check`
   shows it.
-- **Action:** set the input `labels: "false"`. Otherwise the token steps request a
-  permission that the installation does not have, and GitHub refuses the token. The run
-  then falls back to report mode.
+- **Action:** set the input `labels: "false"` in the workflow file. Otherwise the
+  token steps request a permission that the installation does not have, and GitHub
+  refuses the token. The run then falls back to report mode. `msreview update` keeps
+  this edit.
 
 ## 2. Install the App
 
@@ -69,61 +71,111 @@ On the App's page, click **Install App**. Choose the account, then either **All
 repositories** or **Only select repositories**. You can change this list later in the
 installation's settings.
 
-If a repository is not in the list, the reviewer does not fail. It reports
+`msreview enable` checks that the App is installed on each repository. If it is not,
+it prints a link where you can add the repository, and skips it. If a workflow runs in
+a repository that is not in the list, the reviewer does not fail. It reports
 "Not posted: the GitHub App '<slug>' is not installed on <owner>/<repo>".
 
-## 3. Give the credentials to the Action
+## 3. Enable your repositories
 
-For each repository (Settings → Secrets and variables → Actions) or once for the
-organisation:
-
-| Kind | Name | Value |
-|---|---|---|
-| Secret | `MISTRAL_API_KEY` | A Mistral API key for a workspace with Workflows access |
-| Secret | `MSREVIEW_APP_PRIVATE_KEY` | The full contents of the `.pem` file, including the `-----BEGIN` and `-----END` lines |
-| Variable | `MSREVIEW_APP_CLIENT_ID` | The App's Client ID |
-
-With the GitHub CLI:
+`msreview enable` gives the credentials to each repository and adds the review
+workflow. You need the [GitHub CLI](https://cli.github.com/) `gh`, logged in with the
+scopes `repo` and `workflow` (`gh auth refresh -h github.com -s workflow` adds a
+missing scope).
 
 ```bash
-gh secret set MISTRAL_API_KEY --repo OWNER/REPO            # paste the key when prompted
+uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.2.0
+msreview enable you/repo1 you/repo2 --app-key-file ~/Downloads/<app>.private-key.pem
+```
+
+It asks for the Mistral API key (hidden) and the App's Client ID once, checks them,
+and then, for each repository:
+
+- checks that the App is installed there. If it is not, it prints a link where you
+  can add the repository, and skips it;
+- sets these secrets and this variable:
+
+  | Kind | Name | Value |
+  |---|---|---|
+  | Secret | `MSREVIEW_MISTRAL_API_KEY` | A Mistral API key for a workspace with Workflows access |
+  | Secret | `MSREVIEW_APP_PRIVATE_KEY` | The full contents of the `.pem` file |
+  | Variable | `MSREVIEW_APP_CLIENT_ID` | The App's Client ID |
+
+  The `MSREVIEW_` prefix keeps these apart from the repository's own secrets. A secret
+  named `MISTRAL_API_KEY` that another workflow uses is never set, overwritten or
+  deleted; if the repository has one, msreview prints a note that it was left
+  untouched;
+- commits `.github/workflows/morning-star-code-review.yml` to the default branch
+  (`--pr`: through a pull request). The action is pinned to the full commit SHA of the
+  release. The pull request that `--pr` opens is itself reviewed by the workflow it
+  adds (GitHub runs `pull_request` workflows from the pull request's branch, and the
+  secrets are already set), which is a first end-to-end check of the setup.
+
+The keys are stored only in the repositories' GitHub Actions secrets. Personal
+accounts have no account-wide Actions secrets, so each repository gets its own copy.
+msreview stores nothing on your computer. When it is done, **delete the `.pem` file**.
+All flags are in [cli.md](cli.md#msreview-enable).
+
+In the workflow, the App key is used only by the two `actions/create-github-app-token`
+steps of the Action. Each mints a one-hour installation token for the current
+repository only: a read-only token for the review, and, after the review, the token
+that posts it (Contents: read, Pull requests: write, Issues: write).
+
+### Manual setup with `gh`
+
+If you do not use `msreview enable`, set the values for each repository yourself
+(Settings → Secrets and variables → Actions), or once for an organisation. With the
+GitHub CLI:
+
+```bash
+gh secret set MSREVIEW_MISTRAL_API_KEY --repo OWNER/REPO   # paste the key when prompted
 gh secret set MSREVIEW_APP_PRIVATE_KEY --repo OWNER/REPO < path/to/app.private-key.pem
 gh variable set MSREVIEW_APP_CLIENT_ID --repo OWNER/REPO --body "Iv23li..."
 ```
 
 Then copy [`examples/workflows/morning-star-code-review.yml`](../examples/workflows/morning-star-code-review.yml)
-into `.github/workflows/`. The App key is used only by the
-`actions/create-github-app-token` step. That step mints a one-hour installation token
-for the current repository, with Contents: read, Pull requests: write and Issues: write.
+into `.github/workflows/`. The example uses the release tag: pin the action to the full
+commit SHA of the release that you reviewed.
 
-## 4. Give the credentials to the CLI (optional)
+## 4. Rotate the keys
 
-The CLI needs the App only to post. Choose one way to supply the private key:
+An App can have several active private keys, so you can rotate without downtime:
+
+1. On the App's page, under **Private keys**, generate a new key. For the Mistral key,
+   create a new key in your Mistral workspace.
+2. Set the new values in every enabled repository (`msreview status --app-key-file
+   <new>.pem` lists them):
+
+   ```bash
+   msreview enable --secrets-only you/repo1 you/repo2 --app-key-file ~/Downloads/<app>.private-key.pem
+   ```
+
+   It asks for the Mistral key again: enter the new key, or the current one if you
+   rotate only the App key. A workflow from 0.1.x that still maps
+   `secrets.MISTRAL_API_KEY` does not read the new `MSREVIEW_MISTRAL_API_KEY`:
+   `msreview status` shows it as `legacy secret name MISTRAL_API_KEY`. Move it with
+   `msreview update OWNER/REPO --force` after this step, or rotate its
+   `MISTRAL_API_KEY` yourself.
+3. Delete the old App key on the App's page, or revoke the old Mistral key. Delete the
+   new `.pem` file.
+
+## 5. Post from the CLI (optional)
+
+The CLI needs the App only to post the reviews that you start on your computer.
+Without it, `msreview review` produces a report, and the enabled repositories still get
+their reviews posted by the workflow. If you want the CLI to post, generate a separate
+private key for this use and follow [cli.md](cli.md#posting-as-your-app). Only a
+short-lived child process reads that key. The key never reaches the review process,
+the Workflows worker or the agents.
+
+## 6. Check the setup
 
 ```bash
-# A file that only you can read (msreview refuses keys that group or others can read)
-mkdir -p ~/.config/morning-star-review
-install -m 600 path/to/app.private-key.pem ~/.config/morning-star-review/app.pem
-export MSREVIEW_APP_CLIENT_ID=Iv23li...
-export MSREVIEW_APP_PRIVATE_KEY_PATH=~/.config/morning-star-review/app.pem
-
-# Or a command that prints the PEM (nothing on disk)
-export MSREVIEW_APP_PRIVATE_KEY_COMMAND='op read "op://Private/msreview-app/private-key"'
+msreview status OWNER/REPO      # the workflow, secrets, variable and last run of a repository
+msreview app-check OWNER/REPO   # is the App installed, with which permissions?
 ```
 
-The same settings can go into the `[app]` table of
-`~/.config/morning-star-review/config.toml` (see [cli.md](cli.md)). Only a short-lived
-child process reads the key. It signs a JWT, mints an installation token for the one
-repository under review, and exits. The key never reaches the review process, the
-Workflows worker or the agents.
-
-## 5. Check the setup
-
-```bash
-msreview app-check OWNER/REPO
-```
-
-Example output:
+Example output of `msreview app-check`:
 
 ```
 The GitHub App 'acme-code-review' is installed on OWNER/REPO.
@@ -133,6 +185,6 @@ The GitHub App 'acme-code-review' is installed on OWNER/REPO.
   pull_requests: write
 ```
 
-The command exits 1 when the App is not installed or when Pull requests: write is
-missing. `msreview doctor` also checks that the client ID and the key are set, and that
-the key file has mode 0600.
+`msreview app-check` exits 1 when the App is not installed or when Pull requests: write
+is missing. `msreview doctor` also checks the App settings of the CLI, if you set them
+(step 5).

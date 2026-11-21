@@ -6,6 +6,82 @@ All notable changes to this project are documented here. The format follows
 break compatibility, and a review made by an older minor version is reviewed again in
 full.
 
+## [0.2.0] - 2026-11-21
+
+Enable the reviewer in many repositories with one command. Your keys are stored only
+as GitHub Actions secrets of those repositories.
+
+### Upgrade note
+
+- Workflows that pin an earlier release keep working. To move them to this release,
+  install it and run `msreview update --all` (or `msreview update OWNER/REPO ...`).
+- The repository secret for the Mistral key is now `MSREVIEW_MISTRAL_API_KEY`.
+  Workflows from 0.1.x that map `secrets.MISTRAL_API_KEY` keep working, and
+  `msreview update` leaves that line as it is. To move a repository to the new name,
+  run `msreview enable OWNER/REPO --secrets-only`, then
+  `msreview update OWNER/REPO --force`; then delete the old `MISTRAL_API_KEY` yourself
+  if no other workflow uses it.
+- This is a new minor version, so the first review of each PR after the upgrade
+  reviews the PR in full, not only the files changed since the last review.
+- The example workflows' concurrency group is now `${{ github.workflow }}-<PR number>`,
+  so a review can no longer be cancelled by another workflow that happened to use the
+  same group name on the same pull request.
+
+### Added
+
+- **`msreview enable OWNER/REPO [OWNER/REPO ...]`** sets up the GitHub Action in one
+  or more repositories, through your GitHub CLI (`gh`) login:
+  - it asks for the Mistral API key (hidden) and the App's Client ID once, reads the
+    App's private key once from `--app-key-file`, and checks the keys before it
+    changes any repository (`--no-verify` checks only their formats). The
+    `MSREVIEW_ENABLE_*` environment variables can supply the values instead;
+  - for each repository, it checks that the App is installed (if not, it prints a
+    link to add the repository and skips it), sets the secrets
+    `MSREVIEW_MISTRAL_API_KEY` and `MSREVIEW_APP_PRIVATE_KEY` and the variable
+    `MSREVIEW_APP_CLIENT_ID`, and then commits
+    `.github/workflows/morning-star-code-review.yml` to the default branch (or opens a
+    pull request with `--pr`; that pull request is itself reviewed by the workflow it
+    adds);
+  - it never sets, overwrites or deletes a secret named `MISTRAL_API_KEY`; if a
+    repository has one (for example for another workflow), it prints a note that it
+    was left untouched;
+  - secret values go to `gh` on stdin, never on the command line, and nothing is
+    stored on your computer;
+  - it is safe to run again: the same file is not committed twice, and a different
+    file is not replaced without `--force`;
+  - `--secrets-only` rotates keys; `--no-secrets` writes only the workflow file;
+    `--preset` sets the workflow's preset; `--version` chooses the release to pin;
+  - a failing repository does not stop the others, and the exit code reports it.
+- **`msreview status [OWNER/REPO ...]`** shows, for each repository that the App can
+  see, the workflow file with its pinned release and preset, whether the secrets and
+  the variable exist (names only), and the last run's conclusion. It changes nothing.
+  `--json` prints JSON. Without repository names, it needs the App's private key to
+  list them (`--app-key-file`). A 0.1.x workflow's key is shown as
+  `legacy secret name MISTRAL_API_KEY`, with a hint on how to move it.
+- **`msreview update [OWNER/REPO ... | --all]`** pins enabled repositories to a new
+  release. It keeps their preset and any edits to the workflow file (`--force` writes
+  the file again from the template).
+- **`msreview disable OWNER/REPO [OWNER/REPO ...]`** removes the workflow file, and
+  msreview's secrets and variable (only the `MSREVIEW_` names) unless you pass
+  `--keep-secrets`. With `--pr`, a second run while the pull request is open prints
+  `workflow removal: already proposed in <url>`.
+
+### Changed
+
+- **The secret for the Mistral key is renamed to `MSREVIEW_MISTRAL_API_KEY`**, so
+  msreview never collides with a repository's own `MISTRAL_API_KEY` (which another
+  workflow may use). The template, both example workflows and the setup commands use
+  the new name; the Action's input is still `mistral-api-key`. Existing 0.1.x
+  workflows that map `secrets.MISTRAL_API_KEY` keep working.
+- The example workflow `examples/workflows/morning-star-code-review.yml` is now made
+  from the same template as the file that `msreview enable` writes. The example uses
+  the release tag (`@v0.2.0`); `msreview enable` pins the release's full commit SHA,
+  with a `# v0.2.0` comment.
+- The README quickstart now uses `msreview enable`. The manual setup is still
+  documented as an alternative. The documentation no longer suggests keeping keys on
+  your computer: local reviews take the Mistral key from `MISTRAL_API_KEY`, and the
+  CLI needs the App's private key only if you want it to post.
+
 ## [0.1.1] - 2026-11-18
 
 Rate limits now make a review slower. They no longer make it fail.
@@ -177,5 +253,6 @@ First public release.
   workspace. The API cannot delete these records.
 - Only github.com is supported (no GitHub Enterprise Server).
 
+[0.2.0]: https://github.com/ThomsenDrake/morning-star-code-reviews/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/ThomsenDrake/morning-star-code-reviews/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ThomsenDrake/morning-star-code-reviews/releases/tag/v0.1.0

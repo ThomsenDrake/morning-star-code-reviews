@@ -1,8 +1,9 @@
 """Command-line interface ``msreview`` (argparse; heavy modules are imported lazily).
 
 Commands: ``review <PR URL>``, ``ci`` and ``ci-publish`` (used by the Action),
-``doctor``, ``setup``, ``app-check <owner>/<repo>`` and the hidden ``_mint`` (the
-token-minting child).
+``doctor``, ``setup``, ``app-check <owner>/<repo>``, ``enable``, ``status``, ``update``
+and ``disable`` (set the review up on repositories with the user's ``gh`` login) and the
+hidden ``_mint`` (the token-minting child).
 """
 
 from __future__ import annotations
@@ -125,7 +126,105 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--check", action="store_true", help="only check the installation")
     app = sub.add_parser("app-check", help="is the GitHub App installed on a repository?")
     app.add_argument("repo", help="owner/repo")
+    _add_enable_commands(sub)
     return parser
+
+
+ENABLE_COMMANDS = ("enable", "status", "update", "disable")
+
+
+def _add_client_id(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--client-id",
+        default=None,
+        help="the GitHub App's client id (else MSREVIEW_ENABLE_APP_CLIENT_ID, "
+        "MSREVIEW_APP_CLIENT_ID or the config file's [app] client_id)",
+    )
+
+
+def _add_release(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--version",
+        dest="release",
+        metavar="vX.Y.Z",
+        default=None,
+        help=f"the release to pin, by its full commit SHA (default: v{__version__})",
+    )
+
+
+def _add_listing_key(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--app-key-file",
+        metavar="PATH",
+        default=None,
+        help="the App's private key, to list the App's repositories (else "
+        "MSREVIEW_ENABLE_APP_PRIVATE_KEY or the key the CLI posts with)",
+    )
+
+
+def _add_enable_commands(sub: Any) -> None:
+    """``enable``, ``status``, ``update`` and ``disable`` (module ``enable``)."""
+    repos = {"metavar": "OWNER/REPO"}
+    enable = sub.add_parser(
+        "enable", help="set the review up on repositories: workflow file, secrets, variable"
+    )
+    enable.add_argument("repos", nargs="+", **repos)
+    enable.add_argument("--preset", choices=PRESETS, default=None)
+    how = enable.add_mutually_exclusive_group()
+    how.add_argument("--pr", action="store_true", help="open a pull request with the workflow")
+    how.add_argument(
+        "--direct", dest="pr", action="store_false", help="commit to the default branch (default)"
+    )
+    what = enable.add_mutually_exclusive_group()
+    what.add_argument("--secrets-only", action="store_true", help="skip the workflow file")
+    what.add_argument("--no-secrets", action="store_true", help="skip the secrets and variable")
+    enable.add_argument(
+        "--force",
+        action="store_true",
+        help="replace a different workflow file; go on where the App is not installed",
+    )
+    _add_release(enable)
+    _add_client_id(enable)
+    enable.add_argument(
+        "--app-key-file",
+        metavar="PATH",
+        default=None,
+        help="the App's private key (.pem; else MSREVIEW_ENABLE_APP_PRIVATE_KEY)",
+    )
+    verify = enable.add_mutually_exclusive_group()
+    verify.add_argument(
+        "--verify",
+        dest="verify",
+        action="store_true",
+        default=True,
+        help="check the Mistral key and the App credentials online first (default)",
+    )
+    verify.add_argument("--no-verify", dest="verify", action="store_false")
+    status = sub.add_parser("status", help="show the review setup of repositories (read-only)")
+    status.add_argument(
+        "repos", nargs="*", help="default: every repository the App is installed on", **repos
+    )
+    _add_client_id(status)
+    _add_listing_key(status)
+    status.add_argument("--json", action="store_true", help="print JSON")
+    update = sub.add_parser("update", help="pin the review workflow to another release")
+    update.add_argument("repos", nargs="*", **repos)
+    update.add_argument(
+        "--all", action="store_true", help="every repository of the App that has the workflow"
+    )
+    _add_release(update)
+    update.add_argument("--pr", action="store_true", help="open a pull request")
+    update.add_argument(
+        "--force", action="store_true", help="re-render an edited workflow file from the template"
+    )
+    _add_client_id(update)
+    _add_listing_key(update)
+    disable = sub.add_parser("disable", help="remove the review workflow and its secrets")
+    disable.add_argument("repos", nargs="+", **repos)
+    disable.add_argument(
+        "--keep-secrets", action="store_true", help="keep the secrets and the variable"
+    )
+    disable.add_argument("--pr", action="store_true", help="open a pull request")
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -800,6 +899,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_setup(source=args.source, force=args.force, check=args.check)
         if args.command == "app-check":
             return cmd_app_check(args.repo)
+        if args.command in ENABLE_COMMANDS:
+            from morning_star_review.enable import run_command
+
+            return run_command(args)
     except (UsageError, DriverError, MsreviewError) as exc:
         _err(str(exc))
         return 2

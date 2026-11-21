@@ -6,7 +6,7 @@ as **your own GitHub App**, or it writes a report when it cannot post.
 
 - Command: `msreview` (Python package `morning_star_review`, distribution `morning-star-code-reviews`)
 - Runs as: a GitHub Action (composite) or a local CLI
-- Status: 0.1.1, alpha. See [Limitations](#limitations).
+- Status: 0.2.0, alpha. See [Limitations](#limitations).
 - License: Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). The agent
   environment installs a proprietary component; see [Limitations](#limitations).
 
@@ -14,7 +14,9 @@ as **your own GitHub App**, or it writes a report when it cannot post.
 
 - **Your infrastructure, your keys.** The reviewer runs in your GitHub Actions job (or
   on your machine). It starts a short-lived Workflows worker in your Mistral workspace,
-  runs one workflow execution, then stops the worker. No hosted review service is involved.
+  runs one workflow execution, then stops the worker. No hosted review service is
+  involved. Your keys are stored only as GitHub Actions secrets of the repositories
+  that you enable.
 - **Read-only agents explore the change.** One or more explorer agents read the diff and
   the repository through five read-only tools (list, read, read base version, search,
   show diff). They cannot run code, write files or use the network. Pull request code
@@ -40,93 +42,218 @@ as **your own GitHub App**, or it writes a report when it cannot post.
 
 A longer description is in [docs/architecture.md](docs/architecture.md).
 
-## Quickstart: GitHub Action
+## Quickstart
 
-You need a Mistral API key for a workspace that has **Workflows** access. Mistral
-Workflows is a Public Preview product.
+You need:
 
-1. **Create a GitHub App** (once per account or organisation). Step-by-step guide:
+- a Mistral API key for a workspace that has **Workflows** access (Mistral Workflows
+  is a Public Preview product);
+- the [GitHub CLI](https://cli.github.com/) `gh`, logged in with the scopes `repo` and
+  `workflow` (see [GitHub CLI scopes](#github-cli-scopes));
+- [uv](https://docs.astral.sh/uv/), on macOS or Linux.
+
+1. **Create a GitHub App** (once). Step-by-step guide:
    [docs/setup-github-app.md](docs/setup-github-app.md).
    - Repository permissions: **Contents: Read**, **Pull requests: Read & write**,
      **Issues: Read & write** (for the verdict labels), **Metadata: Read**.
    - No webhook: clear "Active" under Webhook. The Action calls GitHub itself.
-   - Generate a private key and note the App's **Client ID**.
-2. **Install the App** on the repositories that you want reviewed.
-3. **Add to each repository** (Settings → Secrets and variables → Actions):
-   - Secret `MISTRAL_API_KEY`: your Mistral API key.
+   - Note the App's **Client ID**, then generate a private key. Your browser downloads
+     a `.pem` file.
+2. **Install the App** on the repositories that you want reviewed (on the App's page:
+   **Install App**).
+3. **Install msreview and enable your repositories:**
+
+   ```bash
+   uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.2.0
+   msreview enable you/repo1 you/repo2 --app-key-file ~/Downloads/<app>.private-key.pem
+   ```
+
+   `msreview enable` asks for the Mistral API key once (the input is hidden) and for
+   the App's Client ID, and checks both keys before it changes any repository. Then,
+   for each repository, it adds the review workflow and stores the keys as that
+   repository's GitHub Actions secrets. It prints one result line per repository.
+   The keys go **only** into the repositories' secrets: msreview stores nothing on
+   your computer. When it is done, delete the `.pem` file.
+4. **Open a pull request.** The review appears as one summary comment, inline comments
+   from `<your-app>[bot]`, and a `msreview: …` label. The full report is also in the
+   job's step summary and in an artifact.
+
+You do not need `msreview setup` for this. It is only for [local reviews](#local-reviews-cli).
+
+### What `msreview enable` changes
+
+In each repository:
+
+| Kind | Name | Value |
+|---|---|---|
+| Workflow file | `.github/workflows/morning-star-code-review.yml` | The review workflow. It pins the action to the full commit SHA of the release (with a `# v0.2.0` comment), sets `timeout-minutes: 110`, and sets `preset` when you pass `--preset` |
+| Secret | `MSREVIEW_MISTRAL_API_KEY` | Your Mistral API key |
+| Secret | `MSREVIEW_APP_PRIVATE_KEY` | The App's private key (the contents of the `.pem` file) |
+| Variable | `MSREVIEW_APP_CLIENT_ID` | The App's Client ID (not a secret) |
+
+Every name starts with `MSREVIEW_`, so msreview never collides with your own secrets.
+A repository's own `MISTRAL_API_KEY` (for example, one that another workflow uses) is
+never set, overwritten or deleted. If a repository has one, `msreview enable` prints a
+note that it was left untouched.
+
+- By default, the workflow file is committed directly to the default branch with the
+  message "Enable Morning Star Code Review". With `--pr`, msreview opens a pull
+  request from the branch `msreview/enable` instead, for example when the default
+  branch is protected. That pull request is itself reviewed by the workflow it adds:
+  GitHub runs `pull_request` workflows from the pull request's branch, and the secrets
+  are already set. So its review is a first end-to-end check of the setup.
+- You can run it again safely. If the file already has the same content, nothing is
+  committed. If a different file is at that path, msreview shows a short summary of
+  the differences and does not replace it unless you pass `--force`. To move a
+  workflow to a new release, use `msreview update`.
+- If the App is not installed on a repository, msreview skips that repository and
+  prints a link where you can add it.
+- A failing or skipped repository does not stop the others. The exit code is 1 when
+  any repository failed or was skipped.
+- `--secrets-only` sets only the secrets and the variable. `--no-secrets` writes only
+  the workflow file.
+
+All flags are in [docs/cli.md](docs/cli.md#msreview-enable).
+
+### Why the keys are stored in every repository
+
+GitHub has no account-wide Actions secrets for personal accounts. Actions secrets
+exist only for a repository, an environment or an organisation. So every repository
+needs its own copy, and `msreview enable` sets them for many repositories in one
+command. `gh` encrypts each value with the repository's public key before it is
+uploaded. After that, no one can read the value back, not you and not msreview:
+GitHub gives it only to the repository's workflow runs. Anyone who can push a
+workflow to the repository can use its secrets, so enable repositories where you
+trust the people with write access.
+
+### Managing enabled repositories
+
+```bash
+msreview status                     # every repository that the App can see (needs the App key)
+msreview status you/repo1           # one repository
+msreview update --all               # pin every enabled repository to this msreview's release
+msreview update you/repo1 --pr      # one repository, through a pull request
+msreview disable you/repo1          # remove the workflow, msreview's secrets and the variable
+msreview disable you/repo1 --keep-secrets
+```
+
+`msreview status` changes nothing. For each repository, it shows whether the workflow
+file exists and which release it pins, whether the two secrets and the variable exist,
+and the conclusion of the last workflow run. GitHub returns only the names of secrets,
+never their values. `msreview update` changes only the pinned release: it keeps a
+preset that you chose with `--preset` and edits that you made to the file.
+`msreview disable` deletes only the `MSREVIEW_` names; with `--pr`, nothing is removed
+until you merge the pull request, and a second run prints
+`workflow removal: already proposed in <url>`.
+
+**Workflows from 0.1.x** map `secrets.MISTRAL_API_KEY`, and they keep working:
+`msreview update` re-pins them and leaves that line as it is. `msreview status` shows
+such a repository's key as `legacy secret name MISTRAL_API_KEY`. To move a repository
+to msreview's own name:
+
+```bash
+msreview enable --secrets-only you/repo1 --app-key-file ~/Downloads/<app>.private-key.pem
+msreview update you/repo1 --force   # re-renders the file (it keeps the preset, not other edits)
+```
+
+msreview does not delete the old `MISTRAL_API_KEY`: remove it yourself when no other
+workflow uses it.
+
+**Key rotation.** Generate a second private key on the App's page (an App can have
+several active keys), or create a new Mistral key. Then set the new values in your
+repositories, and delete or revoke the old key:
+
+```bash
+msreview enable --secrets-only you/repo1 you/repo2 --app-key-file ~/Downloads/<app>.private-key.pem
+```
+
+This asks for the Mistral key again: enter the new one, or the current one if you
+rotate only the App key. There is no downtime, because GitHub accepts every active key
+of the App. A 0.1.x workflow that still maps `secrets.MISTRAL_API_KEY` does not read
+the new `MSREVIEW_MISTRAL_API_KEY`: move it first (see above).
+
+### GitHub CLI scopes
+
+msreview makes every change through `gh` with your login (`gh api`,
+`gh secret set`, `gh variable set`), and passes secret values on stdin, never on the
+command line. Only the check of where the App is installed is made as the App, with
+its private key, because GitHub does not show App installations to a `gh` login. Your
+login needs two scopes:
+
+- `repo`: read the repositories, write the workflow file, and set secrets and variables;
+- `workflow`: GitHub refuses changes to files under `.github/workflows/` without it.
+
+`gh auth status` lists the scopes of your login. To add a missing one:
+
+```bash
+gh auth refresh -h github.com -s workflow
+```
+
+### Manual setup (without `msreview enable`)
+
+You can also do the same steps yourself, for example to use organisation-level secrets
+for the repositories of an organisation.
+
+1. Create and install the GitHub App as in steps 1 and 2 above.
+2. In each repository (Settings → Secrets and variables → Actions), or once for the
+   organisation, add:
+   - Secret `MSREVIEW_MISTRAL_API_KEY`: your Mistral API key.
    - Secret `MSREVIEW_APP_PRIVATE_KEY`: the full contents of the App's `.pem` file.
    - Variable `MSREVIEW_APP_CLIENT_ID`: the App's Client ID.
 
-   Organisation-level secrets and variables also work.
-4. **Copy the workflow**
+   The `gh` commands for this are in
+   [docs/setup-github-app.md](docs/setup-github-app.md#manual-setup-with-gh).
+3. Copy the workflow
    [`examples/workflows/morning-star-code-review.yml`](examples/workflows/morning-star-code-review.yml)
-   to `.github/workflows/` in your repository. Pin the action to the full commit SHA of
-   the release that you reviewed.
-5. **Open a pull request.** The review appears as one summary comment, inline comments
-   from `<your-app>[bot]`, and a `msreview: …` label. The full report is also in the job's
-   step summary and in an artifact.
+   to `.github/workflows/` in your repository. It is made from the same template as the
+   file that `msreview enable` writes, but it uses the release tag. Pin the action to the
+   full commit SHA of the release that you reviewed.
+4. Open a pull request.
 
 The workflow does not need `actions/checkout`. If the App credentials are missing or
 the App is not installed, the run does not fail: it produces a report (step summary
 and artifact) that tells you why nothing was posted.
 
-**Pull requests from forks** get no secrets on `pull_request`, so the example skips
-them. To review them, use the hardened `pull_request_target` template
-[`examples/workflows/morning-star-code-review-forks.yml`](examples/workflows/morning-star-code-review-forks.yml).
-It reviews automatically for trusted authors. For other authors, a maintainer must add a
-label, and the approval applies to one head commit only. The job checks that the person
-who added the label has write, maintain or admin access, because the triage role can
-add labels too. Read [docs/security.md](docs/security.md) before you use it.
+### Pull requests from forks
 
-## Quickstart: CLI
+Pull requests from forks get no secrets on `pull_request`, so the standard workflow
+skips them. `msreview enable` installs only the standard workflow. To review fork PRs,
+add the hardened `pull_request_target` template
+[`examples/workflows/morning-star-code-review-forks.yml`](examples/workflows/morning-star-code-review-forks.yml)
+yourself. It reviews automatically for trusted authors. For other authors, a maintainer
+must add a label, and the approval applies to one head commit only. The job checks that
+the person who added the label has write, maintain or admin access, because the triage
+role can add labels too. Read [docs/security.md](docs/security.md) before you use it.
 
-Requires Python 3.12 to 3.14, `git` and [uv](https://docs.astral.sh/uv/), on macOS or Linux.
+### Planned: a mode where you only install the App
+
+A hosted mode is planned in which you only install a GitHub App: no workflow file
+and no secrets in your repositories. It is not available yet, and it has no date.
+Until then, reviews run only in your own GitHub Actions jobs or on your own machine.
+
+## Local reviews (CLI)
+
+The CLI reviews one pull request on demand. Requires Python 3.12 to 3.14, `git` and
+[uv](https://docs.astral.sh/uv/), on macOS or Linux.
 
 ```bash
-uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.1.1
-msreview setup                 # builds the agent environment (pinned, hash-checked)
-export MISTRAL_API_KEY=...     # or use a key command, see below
-msreview doctor                # checks the key, Workflows access and the installation
+uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.2.0
+msreview setup                                       # builds the agent environment (pinned, hash-checked)
+read -rs MISTRAL_API_KEY && export MISTRAL_API_KEY   # paste the key; it is not shown or kept in history
+msreview doctor                                      # checks the key, Workflows access and the installation
 msreview review https://github.com/OWNER/REPO/pull/123
 ```
 
-Without App credentials the CLI only reports. It prints the review as Markdown and
-saves `report.md`, `findings.json` and `run.json` under `./msreview-reports/`. To post
-as your App, give the CLI the App's client ID and private key:
+The CLI reads the Mistral key from the `MISTRAL_API_KEY` environment variable of your
+shell, and does not save it. Without App credentials, the CLI only reports: it prints
+the review as Markdown and saves `report.md`, `findings.json` and `run.json` under
+`./msreview-reports/`. Use `--read-token gh` to review private repositories in this
+mode.
 
-```bash
-export MSREVIEW_APP_CLIENT_ID=Iv23li...
-export MSREVIEW_APP_PRIVATE_KEY_PATH=~/.config/morning-star-review/app.pem   # chmod 600
-msreview app-check OWNER/REPO       # is the App installed, with which permissions?
-msreview review OWNER/REPO#123      # posts as <your-app>[bot]
-msreview review OWNER/REPO#123 --post never --json   # report only, JSON outcome
-```
-
-Only a short-lived child process reads the App key. It is never passed to the review
-process or to the agents.
-
-### Keep keys out of files and shell history
-
-Each key can come from a command that prints it, for example a secrets-manager CLI.
-The command runs once per review, and its output is kept only in memory.
-
-```toml
-# ~/.config/morning-star-review/config.toml
-[mistral]
-api_key_command = "op read op://Private/Mistral/api-key"
-
-[app]
-client_id = "Iv23li..."
-private_key_command = "op read op://Private/msreview-app/private-key"
-
-[defaults]
-preset = "best"
-```
-
-The same settings exist as environment variables: `MSREVIEW_MISTRAL_API_KEY_COMMAND`,
-`MSREVIEW_APP_PRIVATE_KEY_COMMAND` and `MSREVIEW_APP_CLIENT_ID`. Any CLI that prints
-the secret works (`op`, `pass`, `vault`, `aws secretsmanager`, `gcloud secrets`, …).
-All commands and flags are in [docs/cli.md](docs/cli.md).
+You do not need the App's private key on your computer: the workflow posts the reviews
+of the repositories that you enabled. If you also want the CLI to post as your App,
+see [docs/cli.md](docs/cli.md#posting-as-your-app). All commands and flags are in
+[docs/cli.md](docs/cli.md).
 
 ## Presets and models
 
@@ -223,9 +350,9 @@ input and the precedence rules are in [docs/configuration.md](docs/configuration
 
 | Document | Contents |
 |---|---|
-| [docs/setup-github-app.md](docs/setup-github-app.md) | Creating and installing the GitHub App |
-| [docs/configuration.md](docs/configuration.md) | Repository file, Action inputs and outputs, CLI flags, environment variables, precedence |
-| [docs/cli.md](docs/cli.md) | `msreview` commands, user config file, exit codes |
+| [docs/setup-github-app.md](docs/setup-github-app.md) | Creating and installing the GitHub App, enabling repositories, key rotation |
+| [docs/configuration.md](docs/configuration.md) | What `msreview enable` writes, repository file, Action inputs and outputs, CLI flags, environment variables, precedence |
+| [docs/cli.md](docs/cli.md) | `msreview` commands (`enable`, `status`, `update`, `disable`, `review`, …), user config file, exit codes |
 | [docs/models.md](docs/models.md) | Models, efforts, presets, evaluation method and results |
 | [docs/security.md](docs/security.md) | Threat model, fork template, residual risks |
 | [docs/operations.md](docs/operations.md) | Deployments, costs, telemetry, troubleshooting |

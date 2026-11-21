@@ -188,6 +188,51 @@ is invalid (an unknown key, a wrong type or a value out of range), **the whole f
 ignored**. The review still runs with defaults, and the summary explains the
 problem. One bad key cannot partly apply.
 
+## Enabling a repository
+
+`msreview enable` (see [cli.md](cli.md#msreview-enable)) writes the workflow file
+`.github/workflows/morning-star-code-review.yml` from a template that is packaged with
+msreview. [`examples/workflows/morning-star-code-review.yml`](../examples/workflows/morning-star-code-review.yml)
+is made from the same template, but uses the release tag instead of a commit SHA. The
+file that `msreview enable` writes:
+
+- pins the action to the full commit SHA of the release, with a `# vX.Y.Z` comment
+  (`--version`, default: the version of the installed msreview);
+- passes the secrets and the variable that `msreview enable` sets to the Action inputs:
+
+  | Repository setting | Action input |
+  |---|---|
+  | Secret `MSREVIEW_MISTRAL_API_KEY` | `mistral-api-key` |
+  | Variable `MSREVIEW_APP_CLIENT_ID` | `client-id` |
+  | Secret `MSREVIEW_APP_PRIVATE_KEY` | `app-private-key` |
+
+  Every name starts with `MSREVIEW_`, so it never collides with the repository's own
+  secrets: a `MISTRAL_API_KEY` that another workflow uses is never set, overwritten or
+  deleted by msreview. Workflow files from 0.1.x map `secrets.MISTRAL_API_KEY` to
+  `mistral-api-key` and keep working; `msreview status` shows that name as
+  `legacy secret name MISTRAL_API_KEY`, and `msreview update` leaves the line as it is
+  unless you pass `--force` (see [cli.md](cli.md#msreview-update)). The input names do
+  not change. `MSREVIEW_MISTRAL_API_KEY` is only the name of the repository secret: the
+  CLI reads the key from the environment variable `MISTRAL_API_KEY` (below);
+
+- sets `timeout-minutes: 110` for the default `deadline-minutes` of 90;
+- sets the input `preset` only when you pass `--preset`. Otherwise the repository file
+  `.morning-star-review.yml` chooses the preset, else `best`.
+
+Some other [Action inputs](#github-action-inputs) are listed as comments in the file.
+You can edit the file to set them: `msreview update` then changes only the pinned
+release and keeps your edits (unless you pass `--force`).
+
+`msreview enable` reads these environment variables instead of prompting, for example
+in a script. `--client-id` and `--app-key-file` win over them. The values go only into
+the repositories' secrets and variable; msreview writes them nowhere else.
+
+| Variable | Meaning |
+|---|---|
+| `MSREVIEW_ENABLE_MISTRAL_API_KEY` | The Mistral API key to store as the secret `MSREVIEW_MISTRAL_API_KEY` |
+| `MSREVIEW_ENABLE_APP_CLIENT_ID` | The App's Client ID, stored as the variable `MSREVIEW_APP_CLIENT_ID`. `msreview status` and `msreview update --all` also use it to find the App's repositories. Without it, these commands use `MSREVIEW_APP_CLIENT_ID` or the user config file's `[app] client_id` |
+| `MSREVIEW_ENABLE_APP_PRIVATE_KEY` | The App's private key (the PEM text), stored as the secret `MSREVIEW_APP_PRIVATE_KEY`. `msreview status` and `msreview update --all` also use it to find the App's repositories. Without it (and without `--app-key-file`), these commands use the key that the CLI posts with |
+
 ## GitHub Action inputs
 
 All inputs are strings. Boolean inputs accept `true`/`false` (also `1`/`0`, `yes`/`no`,

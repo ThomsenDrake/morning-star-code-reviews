@@ -246,8 +246,11 @@ The review stops with exit code 2 before it starts a worker. The preflight call
 `GET /v1/workflows/workers/whoami` was refused.
 
 - Check that the key is correct and still active. In Actions, check that the secret
-  `MISTRAL_API_KEY` exists in this repository or organisation, and that the workflow
-  passes it.
+  `MSREVIEW_MISTRAL_API_KEY` exists in this repository or organisation, and that the
+  workflow passes it (`msreview status OWNER/REPO` shows both). A workflow from 0.1.x
+  passes `secrets.MISTRAL_API_KEY` instead: then that secret must hold the key, and
+  `msreview enable --secrets-only` (which sets only `MSREVIEW_MISTRAL_API_KEY`) does
+  not change what it uses.
 - Check that the key's workspace has **Workflows** access (Public Preview). A key that
   works for chat completions can still be refused here.
 - In the CLI, check which key is used: `MSREVIEW_MISTRAL_API_KEY_COMMAND` wins over
@@ -308,9 +311,12 @@ the latest run did not finish. The label becomes `msreview: incomplete`.
 ### Other messages
 
 - **"no Mistral API key: the Action input `mistral-api-key` is empty"**: the
-  `MISTRAL_API_KEY` secret is missing (or not available to this workflow), or the
-  workflow does not pass it to the action. GitHub does not enforce `required: true` for
-  the inputs of a composite action, so msreview checks it itself.
+  `MSREVIEW_MISTRAL_API_KEY` secret (or, in a workflow from 0.1.x, `MISTRAL_API_KEY`)
+  is missing or not available to this workflow, or the workflow does not pass it to the
+  action. `msreview status OWNER/REPO` shows which name the workflow uses and whether it
+  is set. After `msreview update --force` moved a 0.1.x workflow to the new name, run
+  `msreview enable OWNER/REPO --secrets-only` to set it. GitHub does not enforce
+  `required: true` for the inputs of a composite action, so msreview checks it itself.
 - **"the agent environment is not installed; run `msreview setup`"**, or doctor
   reports a version mismatch: run `msreview setup`. It rebuilds the environment when the
   version differs. In the Action, both environments are built in each job.
