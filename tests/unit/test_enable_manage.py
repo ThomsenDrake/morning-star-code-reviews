@@ -266,3 +266,35 @@ def test_disable_pr_rerun_says_the_removal_is_already_proposed(gh: Any) -> None:
     ]
     assert "workflow removed" not in first.out + again.out
     assert len(gh.repo("octo/one")["commits"]) == 2  # enable + the one removal commit
+
+
+def without_comment_trigger(text: str) -> str:
+    """A workflow as 0.2.x wrote it: no issue_comment trigger."""
+    trigger = "  issue_comment:\n    types: [created, edited]\n"
+    assert trigger in text
+    return text.replace(trigger, "")
+
+
+def test_status_and_update_say_how_to_enable_dismiss_commands(gh: Any) -> None:
+    old = without_comment_trigger(tpl.render("v0.2.0", h.SHA_020, "fast"))
+    gh.put("octo/one", files={WF: old})
+    lines = gh.run("status", "octo/one").out.splitlines()
+    hint = (
+        "the workflow does not run on comments, so `/msreview dismiss` takes effect at the "
+        "next review only; `msreview update octo/one --force` adds it (it re-renders the file)"
+    )
+    assert lines[-1] == f"  hint      {hint}"
+    rows = json.loads(gh.run("status", "octo/one", "--json").out)
+    assert rows[0]["workflow"]["commands"] is False
+    # The last run is the last review: runs that comments start (and skip) do not count.
+    runs = [" ".join(c["argv"]) for c in gh.calls() if "/runs" in " ".join(c["argv"])]
+    assert runs and all("/runs?event=pull_request&per_page=1" in r for r in runs)
+    # update keeps the file's other lines (no trigger) and says so; --force adds it.
+    res = gh.run("update", "octo/one", "--version", "v0.2.0")
+    assert f"  {hint}" in res.out.splitlines()
+    forced = gh.run("update", "octo/one", "--version", "v0.2.0", "--force")
+    assert forced.code == 0 and hint not in forced.out
+    assert gh.file("octo/one", WF) == tpl.render("v0.2.0", h.SHA_020, "fast")
+    assert not any("hint" in line for line in gh.run("status", "octo/one").out.splitlines())
+    rows = json.loads(gh.run("status", "octo/one", "--json").out)
+    assert rows[0]["workflow"]["commands"] is True

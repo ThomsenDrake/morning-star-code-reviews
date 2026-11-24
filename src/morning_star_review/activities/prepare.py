@@ -188,16 +188,21 @@ def prepare_sync(req: ReviewRequest, snap: PrSnapshot, ctx: RunContext) -> Prepa
     write_changed_files(run_dir, _changed_refs(snap, full))
 
     fetchable, changed_since = _prior_changes(snap, repo_dir)
-    scope = decide_scope(
-        prior,
-        snap.compare_from_prior,
-        snap.prior_to_head_merges,
-        cfg,
-        changed_since,
-        full.reviewable,
-        req.force,
-        prior_fetchable=fetchable,
-    )
+    if req.refresh and prior is not None and prior.head_sha == snap.head_sha:
+        # A refresh re-applies `/msreview` commands to the review of this head: the
+        # previous result is carried over and no model runs.
+        scope = ScopeDecision("carry_over", prior.head_sha, [], "refresh")
+    else:
+        scope = decide_scope(
+            prior,
+            snap.compare_from_prior,
+            snap.prior_to_head_merges,
+            cfg,
+            changed_since,
+            full.reviewable,
+            req.force,
+            prior_fetchable=fetchable,
+        )
     if not full.reviewable and scope.scope == "carry_over":
         # Nothing in the pull request is reviewable, so the verdict cannot depend on an
         # earlier review (which may have been incomplete): decide it afresh.

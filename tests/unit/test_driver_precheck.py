@@ -111,6 +111,18 @@ async def test_already_reviewed_needs_the_same_config(fake: FakeGitHub) -> None:
     assert await _early(fake) is None  # a new head
 
 
+async def test_a_refresh_without_a_review_of_the_head_starts_nothing(fake: FakeGitHub) -> None:
+    # A `/msreview` comment before the head was reviewed: the next review applies it.
+    assert await _early(fake, refresh=True) == EarlySkip("not_reviewed", HEAD)
+    _summary(fake, head_sha="e" * 40)
+    assert await _early(fake, refresh=True) == EarlySkip("not_reviewed", HEAD)
+    fake.issue_comments.clear()
+    _summary(fake, verdict="findings")
+    assert await _early(fake) == EarlySkip("already_reviewed", HEAD, "findings")
+    assert await _early(fake, refresh=True) is None  # reviewed: re-apply the commands
+    assert "/msreview commands apply" in SKIP_REASONS["not_reviewed"]
+
+
 async def test_a_forged_summary_does_not_skip(fake: FakeGitHub) -> None:
     fake.add_issue_comment(
         f"{st.SUMMARY_MARKER}\n{st.encode_state(make_state())}", login="someone-else"

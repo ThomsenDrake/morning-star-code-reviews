@@ -20,6 +20,7 @@ from morning_star_review.review.reconcile import (
     combine_prior_status,
     reconcile_priors,
     refound_priors,
+    repeat_of,
 )
 
 GLM, LARGE, DEEPSEEK = "zai-glm-5-3", "mistral-large-4", "deepseek-v4-1-flash-1017"
@@ -247,14 +248,15 @@ _RESOLVERS = {
 
 
 def _expected(resolver: str, said: str | None, evidence: str) -> tuple[str, str]:
-    if resolver == "human_with_write":
-        return "dismissed", "dismissed by maintainer"
+    # A change to the flagged code is a fix, also when someone resolved the thread.
     if evidence == "deleted":
         return "file_deleted", "the file was deleted"
-    if evidence == "absent":
-        if said == "still_open":
-            return "keep_open", "the flagged code changed, but the model reports it is still open"
+    if evidence == "absent" and said != "still_open":
         return "resolve", "the flagged code changed"
+    if resolver == "human_with_write":
+        return "dismissed", "dismissed by maintainer"
+    if evidence == "absent":
+        return "keep_open", "the flagged code changed, but the model reports it is still open"
     if resolver == "human_without_write":
         return "keep_open", "resolved without a fix by drive-by"
     if said == "fixed":
@@ -389,3 +391,93 @@ def test_a_prior_reported_again_is_not_resolved(make) -> None:
     again = refound_priors(priors, frozenset({"f00000000000c"}))
     assert (again[0].action, again[0].note) == ("keep_open", "reported again in this review")
     assert refound_priors(priors, frozenset()) == priors
+
+
+# --- dismiss commands and repeats of dismissed findings --------------------------------
+
+
+def test_dismiss_command_wins(make) -> None:
+    from morning_star_review.core.contract import DismissCommand
+
+    fixed = make.prior_finding(id="f00000000000c", evidence="gone from the file")
+    unchanged = make.prior_finding(id="f00000000000d")
+    other = make.prior_finding(id="f00000000000e")
+    state = make.prior_state([fixed, unchanged, other])
+    commands = [
+        DismissCommand(id="f00000000000c", by="alice", reason="", comment_id=1),
+        DismissCommand(id="f00000000000d", by="bob", reason="by design", comment_id=2),
+    ]
+    got = reconcile_priors(state, [], make.head_text(), commands=commands)
+    assert [(r.id, r.action, r.note) for r in got] == [
+        ("f00000000000c", "dismissed", "dismissed by alice"),
+        ("f00000000000d", "dismissed", "dismissed by bob"),
+        ("f00000000000e", "keep_open", "the flagged code is unchanged"),
+    ]
+
+
+# PR titles from a real review: the second repeats the first in other words.
+DISMISSED_TITLE = (
+    "Popularity-weighted label pool puts duplicate labels in the permutation pool, so null "
+    "raters lose notes and p-values collapse to the minimum"
+)
+REPEAT_TITLE = (
+    "Popularity-weighted label pool lets one permutation draw pick duplicate copies of a note, "
+    "collapsing null set sizes below the rater's exact set size"
+)
+UNRELATED_TITLE = (
+    "Weighted permutation draw is O(L log L) per rater per permutation, risking "
+    "detect-activity timeout on large runs"
+)
+
+
+def test_repeat_of_a_dismissed_finding(make) -> None:
+    gone = make.prior_finding(
+        id="f00000000000d", title=DISMISSED_TITLE, line=798, state="dismissed", evidence="x"
+    )
+    repeat = make.prior_finding(id="f00000000000e", title=REPEAT_TITLE, line=819, evidence="y")
+    assert repeat_of(repeat, [gone], {}) is gone
+    # Too far away, in another file, or about something else: not a repeat.
+    assert repeat_of(repeat.model_copy(update={"line": 900}), [gone], {}) is None
+    assert repeat_of(repeat.model_copy(update={"path": "other.py"}), [gone], {}) is None
+    assert repeat_of(repeat.model_copy(update={"title": UNRELATED_TITLE}), [gone], {}) is None
+    # The same flagged code is a repeat whatever the title; a renamed file still matches.
+    same_code = repeat.model_copy(update={"title": "Something else", "evidence": " x "})
+    assert repeat_of(same_code, [gone], {}) is gone
+    moved = gone.model_copy(update={"path": "ledger/old.py"})
+    assert repeat_of(repeat, [moved], {"ledger/old.py": PY}) is moved
+
+
+def test_open_findings_are_never_dismissed_as_repeats(make) -> None:
+    # Both were open together and only one was dismissed: the other stays open.
+    gone = make.prior_finding(
+        id="f00000000000d", title=DISMISSED_TITLE, line=18, state="dismissed", evidence="x"
+    )
+    still_id = finding_id(PY, "        return prorate(days, amount, total_days)")
+    still = make.prior_finding(id=still_id, title=REPEAT_TITLE, line=27)
+    got = reconcile_priors(make.prior_state([gone, still]), [], make.head_text())
+    assert [(r.id, r.action) for r in got] == [
+        ("f00000000000d", "dismissed"),
+        (still_id, "keep_open"),
+    ]
+    built = build(
+        make,
+        [Source(make.draft(line=27, title=REPEAT_TITLE, evidence="return prorate"))],
+        priors=got,
+        prior_state=make.prior_state([gone, still]),
+    )
+    assert built.repeats == [] and [f.id for f in built.findings] == [still_id]
+
+
+def test_new_finding_repeating_a_dismissed_one_is_dropped(make) -> None:
+    gone = make.prior_finding(
+        id="f00000000000d", title=DISMISSED_TITLE, line=14, state="dismissed", evidence="nope"
+    )
+    state = make.prior_state([gone])
+    priors = reconcile_priors(state, [], make.head_text())
+    reworded = make.draft(title=REPEAT_TITLE)
+    other = make.draft(line=18, evidence="if user.id != entry.owner_id:", title="Authz")
+    built = build(make, [Source(reworded), Source(other)], priors=priors, prior_state=state)
+    assert [f.title for f in built.findings] == ["Authz"]
+    [(dropped, same)] = built.repeats
+    assert dropped.title == REPEAT_TITLE and same.id == "f00000000000d"
+    assert dropped.id not in built.reported_ids

@@ -170,6 +170,8 @@ class DriverConfig:
     wind_down_after_s: float | None = None
     # CI deferred publish: when set, the run writes a publish plan and copies it here.
     defer_publish_dir: Path | None = None
+    # Re-apply `/msreview` commands to the review of the current head (no model runs).
+    refresh: bool = False
 
 
 @dataclass
@@ -346,6 +348,7 @@ def build_request(cfg: DriverConfig) -> tuple[ReviewRequest, PrRef]:
             expected_head_sha=cfg.expected_head_sha or None,
             post=cfg.post,
             force=cfg.force,
+            refresh=cfg.refresh,
             overrides=cfg.overrides,
             policy=cfg.policy,
             run_label=cfg.run_label[:200],

@@ -149,19 +149,48 @@ def _with_findings(state: PriorState, findings: list[PriorFinding]) -> PriorStat
     return PriorState.model_validate(data)
 
 
+# The texts of open findings are cut to these lengths, then dropped, before any
+# finding is dropped from the state.
+_TEXT_CUTS = ((300, 150), (0, 0))
+
+
+def _cut_texts(f: PriorFinding, explanation: int, fix: int) -> PriorFinding:
+    return f.model_copy(
+        update={
+            "explanation": f.explanation[:explanation],
+            "fix": (f.fix[:fix] or None) if f.fix else None,
+        }
+    )
+
+
+def _drop_order(findings: list[PriorFinding]) -> int:
+    """Index of the finding to drop next: the last fixed, else dismissed, else open one."""
+    for states in (("fixed",), ("dismissed",)):
+        closed = [i for i, f in enumerate(findings) if f.state in states]
+        if closed:
+            return closed[-1]
+    return len(findings) - 1
+
+
 def encode_state(state: PriorState) -> str:
     """The state marker for ``state``: at most ``MAX_STATE_MARKER_CHARS`` characters.
 
-    When too large, the oldest findings that are no longer open are dropped first,
-    then open findings from the end, until it fits.
+    When too large, the explanations of open findings are shortened and then left out;
+    then findings are dropped from the end of the list: fixed ones first (the list
+    holds the newest first), then dismissed ones, then open ones, until it fits.
     """
     marker = _pack(state)
     if len(marker) <= MAX_STATE_MARKER_CHARS:
         return marker
     findings = list(state.findings)
+    for explanation, fix in _TEXT_CUTS:
+        findings = [_cut_texts(f, explanation, fix) for f in findings]
+        marker = _pack(_with_findings(state, findings))
+        if len(marker) <= MAX_STATE_MARKER_CHARS:
+            log.warning("review state too large; shortened the explanations of open findings")
+            return marker
     while findings:
-        closed = [i for i, f in enumerate(findings) if f.state != "open"]
-        findings.pop(closed[0] if closed else len(findings) - 1)
+        findings.pop(_drop_order(findings))
         marker = _pack(_with_findings(state, findings))
         if len(marker) <= MAX_STATE_MARKER_CHARS:
             log.warning(

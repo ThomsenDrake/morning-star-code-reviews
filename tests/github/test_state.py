@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import random
 import zlib
 
@@ -45,6 +46,45 @@ def test_large_state_drops_closed_findings_first() -> None:
     kept_open = [f for f in decoded.findings if f.state == "open"]
     # Closed findings go first; open ones stay as long as possible.
     assert len(kept_open) == min(30, len(decoded.findings))
+
+
+def noise(i: int, n: int = 300) -> str:
+    return base64.b64encode(random.Random(i).randbytes(n)).decode()
+
+
+def test_large_state_shortens_explanations_before_dropping_findings() -> None:
+    findings = [
+        prior_finding(
+            f"f{i:012x}",
+            title=f"Finding {i}",
+            evidence=f"line {i}",
+            state="summary_only" if i % 2 else "open",
+            explanation=noise(i)[:1000],
+            fix=noise(i + 500)[:500],
+        )
+        for i in range(30)
+    ]
+    decoded = st.decode_state(st.encode_state(make_state(findings)))
+    assert decoded is not None
+    assert [f.id for f in decoded.findings] == [f.id for f in findings]  # none dropped
+    assert all(len(f.explanation) <= 300 for f in decoded.findings)
+    assert all(f.fix is None or len(f.fix) <= 150 for f in decoded.findings)
+
+
+def test_large_state_drops_fixed_then_dismissed_then_open() -> None:
+    def big(i: int, state: str) -> object:
+        return prior_finding(
+            f"f{i:012x}", title=noise(i)[:150], evidence=noise(i + 1000)[:290], state=state
+        )
+
+    states = ["open"] * 20 + ["summary_only"] * 10 + ["dismissed"] * 15 + ["fixed"] * 15
+    findings = [big(i, s) for i, s in enumerate(states)]
+    decoded = st.decode_state(st.encode_state(make_state(findings)))  # type: ignore[arg-type]
+    assert decoded is not None
+    kept = [f.state for f in decoded.findings]
+    assert "fixed" not in kept  # the fixed ones went first
+    assert kept[:30] == states[:30]  # open findings (inline or not) stay longest
+    assert kept == states[: len(kept)]  # the tail was dropped, nothing out of order
 
 
 def test_decode_rejects_garbage() -> None:
@@ -119,3 +159,17 @@ def test_decode_trusts_only_the_last_marker() -> None:
     broken = f"{st.SUMMARY_MARKER}\n{st.encode_state(ours)}\n{junk}"
     assert st.decode_state(broken) is None
     assert st.strip_state(body) == f"{st.SUMMARY_MARKER}\n\nsummary"
+
+
+def test_a_state_from_before_the_record_still_decodes() -> None:
+    # 0.2.x states have no category, texts, fixed_in or dismissal fields.
+    state = make_state([prior_finding("f0123456789ab", state="dismissed", resolved_by="dev")])
+    data = state.model_dump(mode="json")
+    new_keys = ("category", "explanation", "fix", "fixed_in", "dismissed_by", "dismiss_reason")
+    for f in data["findings"]:
+        for key in new_keys:
+            del f[key]
+    raw = json.dumps(data, separators=(",", ":")).encode()
+    packed = base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode()
+    decoded = st.decode_state(f"<!-- morning-star-review:state {packed} -->")
+    assert decoded == state

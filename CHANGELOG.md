@@ -6,6 +6,68 @@ All notable changes to this project are documented here. The format follows
 break compatibility, and a review made by an older minor version is reviewed again in
 full.
 
+## [0.3.0] - 2026-11-24
+
+The summary comment becomes the PR's list of what is still open, findings can be
+dismissed with a comment, and one label says whether the PR is ready to merge.
+
+### Upgrade note
+
+- Run `msreview update OWNER/REPO ... --force` (or `msreview update --all --force`) to
+  get the new workflow file: it adds the `issue_comment` trigger that
+  `/msreview dismiss` comments use, and keeps the preset (not other edits). Without
+  `--force`, `msreview update` only re-pins the release; commands then take effect at
+  the next review, and `msreview status` shows a hint.
+- The label `msreview: clean` is replaced by `msreview: ready to merge`, and its meaning
+  changes: a PR is ready when the review is complete and no open finding is at or
+  above `review.blocking_severity` (default `medium`). Open low findings no longer keep
+  a PR from being ready. The old label is removed at the next review. Branch protection
+  or automation that looked for `msreview: clean` needs the new name. The `verdict`
+  output and `fail-on` are unchanged.
+- This is a new minor version, so the first review of each PR after the upgrade
+  reviews the PR in full.
+
+### Added
+
+- **The summary lists every open finding**, inline or not, in one table with its id,
+  severity, location and status (`new`, or `still open` with a link to its thread, or
+  why it has no thread), and a collapsed block with each open finding's explanation
+  and suggested fix. A coding agent can read everything that is still outstanding in
+  one comment.
+- **A record of fixed and dismissed findings** (collapsed): "fixed in `<commit>`", or
+  "dismissed by `<login>`: `<reason>`". The state marker keeps it across runs.
+- **`/msreview dismiss <id> [<id> ...] [reason]`** in a PR comment dismisses findings,
+  also ones without an inline thread. Only people with write access can dismiss (the
+  PR author too, unless `review.author_may_dismiss: false`); the summary says when a
+  command was ignored and why. The comment starts a short run that re-publishes the
+  review of the current head without calling a model, replies "Dismissed by …" on the
+  finding's thread and hides it as resolved. When the head has no review yet, the run
+  is skipped and the next review applies the command.
+- **Dismissals stick.** The explorers are shown the dismissed findings and told not to
+  report them again, and a new finding that repeats a dismissed one in other words (the
+  same file, and the same code or a title that shares most of its words, within 40
+  lines) is recorded as a repeat of it instead of being shown as open.
+- **Ready to merge:** a line under the verdict, the label `msreview: ready to merge`,
+  the Action output `ready`, and the repository setting `review.blocking_severity`.
+- Finding ids in inline comments, the summary and the report.
+- A carried-over review (a refresh, or a push that changes no reviewable file) shows
+  the reasons and the coverage of the review it carries over, not a generic reason,
+  and keeps each finding's line range.
+- `msreview status` and `msreview update` say when a workflow does not run on comments;
+  `msreview status --json` has `workflow.commands`.
+
+### Changed
+
+- A finding whose code changed is recorded as **fixed**, also when someone resolved
+  its thread (before, resolving the thread counted as a dismissal).
+- The example workflow (and the file that `msreview enable` writes) runs on
+  `issue_comment` too (comments by bots never start a review job). Its concurrency
+  group is set on the job, so runs that other comments start (and skip) never join it;
+  a push still cancels the review in progress, while a command waits for it.
+- `msreview status` shows the last review run, not the last run of any kind.
+- The "Other findings" and "Resolved since the last review" sections of the summary
+  are replaced by the open findings table and the record.
+
 ## [0.2.0] - 2026-11-21
 
 Enable the reviewer in many repositories with one command. Your keys are stored only
@@ -253,6 +315,7 @@ First public release.
   workspace. The API cannot delete these records.
 - Only github.com is supported (no GitHub Enterprise Server).
 
+[0.3.0]: https://github.com/ThomsenDrake/morning-star-code-reviews/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ThomsenDrake/morning-star-code-reviews/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/ThomsenDrake/morning-star-code-reviews/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ThomsenDrake/morning-star-code-reviews/releases/tag/v0.1.0

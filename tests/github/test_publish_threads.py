@@ -2,8 +2,8 @@
 
 When ``resolveReviewThread`` is refused, ``publish`` replies once, minimizes our
 comment as RESOLVED once, records the prior as ``fixed`` (and the thread id in
-``refused_resolves``), and notes it under "Resolved since the last review". Later
-runs must not reply again nor retry the resolve or the minimize.
+``refused_resolves``), and notes it in the record of fixed and dismissed findings.
+Later runs must not reply again nor retry the resolve or the minimize.
 """
 
 from __future__ import annotations
@@ -15,11 +15,15 @@ from builders import make_ctx, make_final, make_req, make_snap, make_state, no_s
 from builders import prior_finding as base_prior
 from fakegh import BOT, HEAD, FakeGitHub
 
-from morning_star_review.core.contract import FinalReview, PrSnapshot, ResolvedPrior
+from morning_star_review.core.contract import (
+    FinalReview,
+    PriorFinding,
+    PrSnapshot,
+    ResolvedPrior,
+)
 from morning_star_review.github import state as st
 from morning_star_review.github.http import GitHubHttp
 from morning_star_review.github.publish import (
-    RESOLVED_HEADING,
     UNCLOSED_NOTE,
     UNCLOSED_SUFFIX,
     publish,
@@ -50,8 +54,19 @@ def resolved(fid: str = FID, action: str = "resolve") -> ResolvedPrior:
     return ResolvedPrior(id=fid, title=TITLE, path=PATH, action=action, note="")  # type: ignore[arg-type]
 
 
+CLOSED = f"<summary>{render.CLOSED_SUMMARY} ("
+FIXED_HERE = "fixed in `aaaaaaa`"
+
+
+def record(rp: ResolvedPrior) -> PriorFinding:
+    """The state entry ``finalize`` writes for a prior this run fixed or dismissed."""
+    if rp.action == "dismissed":
+        return base_prior(rp.id, title=rp.title, path=rp.path, state="dismissed")
+    return base_prior(rp.id, title=rp.title, path=rp.path, state="fixed", fixed_in=HEAD)
+
+
 def rendered_summary(priors: list[ResolvedPrior]) -> str:
-    """The summary exactly as ``review.render`` writes it (so the note finds its line)."""
+    """The summary exactly as ``review.render`` writes it (so the note finds its row)."""
     return render.summary(
         render.SummaryInput(
             owner="octo-org",
@@ -67,13 +82,15 @@ def rendered_summary(priors: list[ResolvedPrior]) -> str:
             inline_min_severity="medium",
             coverage=render.Coverage(reviewable=1, covered=1),
             details=None,
+            closed=[record(rp) for rp in priors],
         )
     )
 
 
 def fixed_run_final(priors: list[ResolvedPrior]) -> FinalReview:
-    """Like ``finalize``: resolved priors are not in the new state."""
-    final = make_final([], priors=priors, verdict="clean", state=make_state([]))
+    """Like ``finalize``: the new state records the priors this run closed."""
+    state = make_state([record(rp) for rp in priors])
+    final = make_final([], priors=priors, verdict="clean", state=state)
     return final.model_copy(update={"summary_md": rendered_summary(priors)})
 
 
@@ -127,8 +144,8 @@ async def test_refused_resolve_replies_and_minimizes_once(fake: FakeGitHub, tmp_
     assert not recorded.thread_resolved and recorded.resolved_by is None
 
     body = summary_comment(fake)["body"]
-    section = body.split(RESOLVED_HEADING, 1)[1]
-    assert f"`{PATH}`): code changed{UNCLOSED_SUFFIX}" in section
+    section = body.split(CLOSED, 1)[1].split("</details>", 1)[0]
+    assert f"| {FIXED_HERE}{UNCLOSED_SUFFIX} |" in section
     assert body.count(TITLE) == 1
     assert UNCLOSED_NOTE in section
     assert any("could not be resolved automatically" in n for n in outcome.notes)
@@ -193,7 +210,7 @@ async def test_retry_of_the_same_run_does_not_reply_twice(fake: FakeGitHub, tmp_
     replies = [c for c in fake.review_comments if c["in_reply_to_id"] == comment["id"]]
     assert len(replies) == 1 and replies[0]["body"].startswith("File removed.")
     body = summary_comment(fake)["body"]
-    assert f"`{PATH}`): file deleted{UNCLOSED_SUFFIX}" in body
+    assert f"| {FIXED_HERE}{UNCLOSED_SUFFIX} |" in body
 
 
 async def test_resolved_thread_is_not_recorded_as_unclosed(
@@ -204,43 +221,45 @@ async def test_resolved_thread_is_not_recorded_as_unclosed(
     outcome = await run(fake, tmp_path, snap, fixed_run_final([resolved()]))
     assert thread in fake.resolved and fake.minimized == set()
     state = st.decode_state(summary_comment(fake)["body"])
-    assert state is not None and state.findings == [] and state.refused_resolves == []
+    assert state is not None and state.refused_resolves == []
+    assert [(f.id, f.state, f.fixed_in) for f in state.findings] == [(FID, "fixed", HEAD)]
     assert UNCLOSED_NOTE not in summary_comment(fake)["body"]
+    assert UNCLOSED_SUFFIX not in summary_comment(fake)["body"]
     assert not any("automatically" in n for n in outcome.notes)
 
 
-def test_unclosed_notes_mark_the_rendered_lines() -> None:
+def test_unclosed_notes_mark_the_rendered_rows() -> None:
     other = ResolvedPrior(id="f0000000000a2", title="Other", path="b.py", action="resolve", note="")
     summary = rendered_summary([resolved(), other])
     out = with_unclosed_notes(summary, [resolved()])
     lines = out.split("\n")
-    marked = [ln for ln in lines if ln.endswith(UNCLOSED_SUFFIX)]
-    assert len(marked) == 1 and TITLE in marked[0]
-    assert sum(TITLE in ln for ln in lines) == 1  # render's own line was found and marked
-    assert "- Other (`b.py`): code changed" in lines  # not marked
-    start = lines.index(RESOLVED_HEADING)
+    marked = [ln for ln in lines if f"{UNCLOSED_SUFFIX} |" in ln]
+    assert len(marked) == 1 and TITLE in marked[0] and marked[0].startswith(f"| `{FID}` |")
+    assert sum(TITLE in ln for ln in lines) == 1  # render's own row was found and marked
+    [plain] = [ln for ln in lines if ln.startswith("| `f0000000000a2` |")]
+    assert plain.endswith(f"| {FIXED_HERE} |")  # not marked
+    start = next(i for i, ln in enumerate(lines) if CLOSED in ln)
     note = lines.index(UNCLOSED_NOTE)
-    assert start < note < next(i for i, ln in enumerate(lines) if ln.startswith("#### Coverage"))
+    assert start < note < lines.index("</details>", start)
     assert with_unclosed_notes(summary, []) == summary
 
 
-def test_unclosed_notes_add_missing_lines_and_section() -> None:
-    # The section exists but the line was cut: the line is added inside the section.
+def test_unclosed_notes_add_missing_rows_before_the_footer() -> None:
+    # The record exists but the row was cut: the prior is listed before the footer.
     other = ResolvedPrior(id="f0000000000a2", title="Other", path="b.py", action="resolve", note="")
     summary = rendered_summary([other])
     out = with_unclosed_notes(summary, [resolved()])
-    section = out.split(RESOLVED_HEADING, 1)[1].split("\n#### ", 1)[0]
-    assert f"- {TITLE} (`{PATH}`): code changed{UNCLOSED_SUFFIX}" in section
-    assert UNCLOSED_NOTE in section
-    # No section at all: one is added before the footer.
+    line = f"- {TITLE} (`{PATH}`){UNCLOSED_SUFFIX}"
+    assert out.index(line) < out.index(UNCLOSED_NOTE) < out.index("<sub>Automated review")
+    assert out.count(UNCLOSED_NOTE) == 1
+    # No record at all: the same.
     bare = rendered_summary([])
-    assert RESOLVED_HEADING not in bare
+    assert CLOSED not in bare
     out = with_unclosed_notes(bare, [resolved(action="file_deleted")])
-    assert out.index(RESOLVED_HEADING) < out.index("<sub>Automated review")
-    assert f"(`{PATH}`): file deleted{UNCLOSED_SUFFIX}" in out
+    assert out.index(line) < out.index("<sub>Automated review")
     # And at the end when there is no footer either.
     out = with_unclosed_notes("<!-- morning-star-review:summary v1 -->\nshort", [resolved()])
-    assert out.endswith(UNCLOSED_NOTE) and RESOLVED_HEADING in out
+    assert out.endswith(UNCLOSED_NOTE) and line in out
 
 
 async def test_full_state_keeps_open_findings_first(fake: FakeGitHub, tmp_path: Path) -> None:
@@ -252,3 +271,60 @@ async def test_full_state_keeps_open_findings_first(fake: FakeGitHub, tmp_path: 
     assert state is not None
     assert len(state.findings) == 60 and FID not in {f.id for f in state.findings}
     assert state.refused_resolves == [thread]  # still protects the thread
+
+
+async def test_a_dismissed_finding_gets_its_thread_closed(fake: FakeGitHub, tmp_path: Path) -> None:
+    """``/msreview dismiss`` on a finding with an open thread: reply, then close it."""
+    snap, comment, thread = setup_open_prior(fake, tmp_path)
+    rp = resolved(action="dismissed")
+    entry = base_prior(
+        FID,
+        title=TITLE,
+        path=PATH,
+        state="dismissed",
+        dismissed_by="alice",
+        dismiss_reason="by design",
+    )
+    final = make_final([], priors=[rp], verdict="clean", state=make_state([entry]))
+    summary = render.summary(
+        render.SummaryInput(
+            owner="octo-org",
+            repo="widgets",
+            number=7,
+            head_sha=HEAD,
+            verdict="clean",
+            verdict_reasons=[],
+            scope="carry_over",
+            since_sha=HEAD,
+            findings=[],
+            priors=[rp],
+            inline_min_severity="medium",
+            coverage=render.Coverage(reviewable=1, covered=1),
+            details=None,
+            closed=[entry],
+        )
+    )
+    final = final.model_copy(update={"summary_md": summary})
+    await run(fake, tmp_path, snap, final)
+    replies = [c for c in fake.review_comments if c["in_reply_to_id"] == comment["id"]]
+    assert len(replies) == 1 and replies[0]["body"].startswith("Dismissed by alice: by design.")
+    assert fake.minimized == {comment["node_id"]} and thread not in fake.resolved
+    state = st.decode_state(summary_comment(fake)["body"])
+    assert state is not None and state.refused_resolves == [thread]
+    [recorded] = state.findings
+    assert (recorded.state, recorded.dismissed_by, recorded.comment_id) == (
+        "dismissed",
+        "alice",
+        comment["id"],
+    )
+    assert f"dismissed by alice: by design{UNCLOSED_SUFFIX} |" in summary_comment(fake)["body"]
+    # The next run finds it recorded as dismissed and writes nothing to the thread.
+    later = snap_from_summary(fake, tmp_path)
+    assert later.prior is not None
+    assert [(r.id, r.action) for r in reconcile_priors(later.prior, [], lambda p: None)] == [
+        (FID, "dismissed")
+    ]
+    mutations = len(fake.mutations)
+    await run(fake, tmp_path, later, final)
+    assert len(fake.mutations) == mutations
+    assert len([c for c in fake.review_comments if c["in_reply_to_id"] == comment["id"]]) == 1

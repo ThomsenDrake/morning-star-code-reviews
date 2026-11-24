@@ -603,7 +603,9 @@ def _ci_settings(env: Mapping[str, str]) -> dict[str, Any]:
         raise UsageError(f"fail-on must be one of {', '.join(FAIL_ON)}")
     pr_url = get("PR_URL").strip()
     if not pr_url:
-        raise UsageError("MSREVIEW_PR_URL is empty; run the Action on pull_request events")
+        raise UsageError(
+            "MSREVIEW_PR_URL is empty; run the Action on pull_request or issue_comment events"
+        )
     deadline = _opt_int(get("DEADLINE_MINUTES"), "deadline-minutes")
     deadline = check_deadline(CI_DEADLINE_MINUTES if deadline is None else deadline)
     wind_down = wind_down_after_s(
@@ -611,6 +613,8 @@ def _ci_settings(env: Mapping[str, str]) -> dict[str, Any]:
     )
     defer_dir = _opt_str(get("DEFER_PUBLISH_DIR"))
     return {
+        # An issue_comment run (a `/msreview` command): re-apply commands, no models.
+        "refresh": bool(_opt_bool(get("REFRESH"), "refresh")),
         "post": post,
         "fail_on": fail_on,
         "pr_url": pr_url,
@@ -768,6 +772,7 @@ def cmd_ci(env: dict[str, str] | os._Environ[str] | None = None) -> int:
             stop_commands=stop,
             wind_down_after_s=s["wind_down_after_s"],
             defer_publish_dir=defer_dir,
+            refresh=s["refresh"],
         )
         try:
             outcome, code = asyncio.run(driver.run_review(cfg, sec))

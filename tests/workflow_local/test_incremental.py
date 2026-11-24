@@ -103,3 +103,36 @@ async def test_force_gives_a_full_review(harness: Harness) -> None:
     assert out.status == "posted"
     job = json.loads((h.run_dir / "explore-zai-glm-5-3" / "job.json").read_text())
     assert job["variant"] == "full"
+
+
+async def test_a_dismiss_command_refresh_runs_no_model(harness: Harness) -> None:
+    """A `/msreview dismiss` comment: the review of the head is re-published with the
+    finding dismissed (reply on its thread, record, label) and no model runs."""
+    h = harness
+    ids = await _first_review(h)
+    sqli_id, authz_id = ids[SQLI[2]], ids[AUTHZ[2]]
+    h.fake.collaborators["maintainer"] = "admin"
+    h.fake.add_issue_comment(
+        f"/msreview dismiss {authz_id} checked: callers verify it", "maintainer"
+    )
+    out = await h.run(h.request(refresh=True))
+
+    assert out.status == "posted", out.reason
+    assert h.calls() == []  # no model call
+    assert not (h.run_dir / "explore-zai-glm-5-3").exists()
+    assert [f.id for f in out.findings] == [sqli_id]
+    replies = [c for c in h.fake.review_comments if c["in_reply_to_id"] is not None]
+    assert len(replies) == 1
+    assert replies[0]["body"].startswith("Dismissed by maintainer: checked: callers verify it.")
+    [summary] = [c for c in h.fake.issue_comments if c["user"]["login"] == BOT]
+    body = summary["body"]
+    assert f"| `{sqli_id}` |" in body.split("#### Open findings", 1)[1].split("<details>", 1)[0]
+    assert "dismissed by maintainer: checked: callers verify it" in body
+    assert out.ready is False  # the injection (high) still blocks merging
+    assert h.fake.pr_labels == ["msreview: findings"]
+
+    # A refresh before the new head was reviewed changes nothing.
+    _push(h, {"uv.lock": "version = 3\n"}, "lock file only")
+    h.reset_calls()
+    skipped = await h.run(h.request(refresh=True))
+    assert skipped.status == "skipped" and "no review yet" in (skipped.reason or "")

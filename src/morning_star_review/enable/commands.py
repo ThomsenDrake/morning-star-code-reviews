@@ -15,6 +15,7 @@ from morning_star_review._version import __version__
 from morning_star_review.enable import template as tpl
 from morning_star_review.enable.actions import (
     Result,
+    commands_hint,
     disable_one,
     legacy_hint,
     moved_warning,
@@ -290,6 +291,8 @@ def _status_lines(row: dict[str, object]) -> list[str]:
     ]
     if legacy:
         lines.append(f"  hint      {legacy_hint(str(row['repo']))}")
+    if wf["present"] and wf.get("commands") is False:
+        lines.append(f"  hint      {commands_hint(str(row['repo']))}")
     return lines
 
 

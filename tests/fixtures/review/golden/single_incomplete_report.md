@@ -1,17 +1,20 @@
 ### Morning Star Code Review report
 **Verdict: 1 open finding (1 high)** · `aaaaaaa` · full review
+**Not ready to merge:** 1 open finding at medium severity or above.
 
 The review did not cover everything, so there may be more findings:
 - the zai-glm-5-3 explorer did not finish its review (out of deadline)
 - 1 of 2 reviewable changed files was not opened
 
-| Severity | Finding | Location | Status |
-|---|---|---|---|
-| High | Off-by-one in page end index | [`ledger/service.py:14`](https://github.com/octo/ledger/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ledger/service.py#L14) | new |
+#### Open findings
+
+| ID | Severity | Finding | Location | Status |
+|---|---|---|---|---|
+| `f96addfc28589` | High | Off-by-one in page end index | [`ledger/service.py:14`](https://github.com/octo/ledger/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ledger/service.py#L14) | new |
 
 #### Findings in detail
 
-##### 1. High · correctness: Off-by-one in page end index
+##### 1. `f96addfc28589` · High · correctness: Off-by-one in page end index
 
 `ledger/service.py:14` · on a changed line · reported by zai-glm-5-3
 

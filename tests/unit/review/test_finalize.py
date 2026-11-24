@@ -290,12 +290,19 @@ def test_pipeline_outcome(make) -> None:
     assert final.cost_usd == pytest.approx(0.06 + 0.05 + 0.04 + 0.01 + 0.03)
     assert final.coverage == {"reviewable": 1, "covered": 1, "excluded": 1}
     # State: every listed finding but the possible issues, with the head code as
-    # evidence for new anchored ones.
+    # evidence for new anchored ones, then the prior fixed in this run.
     state_ids = {p.id: p for p in final.state.findings}
     possible = {f.id for f in final.findings if is_possible(f)}
     assert money.id in possible and len(possible) == 2
-    assert set(state_ids) == {f.id for f in final.findings} - possible
+    assert set(state_ids) == ({f.id for f in final.findings} - possible) | {"f0000000000aa"}
+    fixed = state_ids["f0000000000aa"]
+    assert (fixed.state, fixed.fixed_in, fixed.explanation) == ("fixed", make.head_sha, "")
+    assert final.state.findings[-1].id == "f0000000000aa"
     assert state_ids[off.id].evidence == "        end = start + size + 1"
+    # Open findings keep their explanation for later summaries.
+    assert state_ids[off.id].explanation.startswith("Each page has size + 1 items")
+    assert state_ids[off.id].fix == "Drop the + 1." and state_ids[off.id].category == "correctness"
+    assert (final.ready, final.blocking) == (False, 5)
     assert state_ids[sqli.id].comment_id == 103 and final.state.summary_comment_id == 55
     assert final.state.complete and final.state.verdict == "findings"
     assert final.state.reviewed_at == "2026-11-17T12:00:00Z"
@@ -794,3 +801,168 @@ def test_skipped_verifier_leaves_every_candidate_unconfirmed(make) -> None:
     assert [f.verify_status for f in final.findings] == ["uncertain"]
     assert "Verifier: did not run; 1 not confirmed\n" in final.summary_md
     assert "Rate-limit wait" not in final.summary_md
+
+
+# --------------------------------------------------------------------------------------
+# The record of findings, `/msreview dismiss` commands and readiness
+# --------------------------------------------------------------------------------------
+
+
+def test_a_refresh_applies_commands_and_keeps_the_reviewed_state(make) -> None:
+    from morning_star_review.core.contract import DismissCommand
+
+    off = finding_id(PY, "        end = start + size + 1")
+    authz = finding_id(PY, "        if user.id != entry.owner_id:")
+    prior = make.prior_state(
+        [
+            make.prior_finding(id=off, explanation="Pages overlap.", category="correctness"),
+            make.prior_finding(
+                id=authz,
+                line=None,
+                severity="low",
+                title="Wording",
+                evidence="if user.id != entry.owner_id:",
+                comment_id=None,
+                thread_id=None,
+                state="summary_only",
+            ),
+            make.prior_finding(
+                id="f0000000000f1", title="Fixed long ago", state="fixed", fixed_in="e" * 40
+            ),
+        ],
+        tool_version="0.3.0",
+        config_hash="9" * 64,
+        head_sha=make.head_sha,
+    )
+    snap = make.snapshot(
+        prior=prior,
+        dismiss_commands=[
+            DismissCommand(id=off, by="alice", reason="the API allows it", comment_id=9),
+            DismissCommand(id="f0000000000ff", by="alice", comment_id=9),
+        ],
+        ignored_commands=["a dismiss command by eve was ignored: only people with write access"],
+    )
+    prep = make.prepared(scope="carry_over", since_sha=prior.head_sha)
+    final = finalize(snap, prep, None, None, make.anchors(), make.heads().get, make.info())
+    # The dismissed finding is gone from the open ones, and recorded with who and why.
+    assert [f.id for f in final.findings] == [authz]
+    by_id = {f.id: f for f in final.state.findings}
+    assert (by_id[off].state, by_id[off].dismissed_by, by_id[off].dismiss_reason) == (
+        "dismissed",
+        "alice",
+        "the API allows it",
+    )
+    assert by_id[off].explanation == ""  # closed records keep no text
+    assert by_id["f0000000000f1"].state == "fixed"  # history is kept
+    assert [f.id for f in final.state.findings] == [authz, off, "f0000000000f1"]
+    # Only low findings are left: ready to merge.
+    assert final.verdict == "findings" and (final.ready, final.blocking) == (True, 0)
+    assert "**Ready to merge:** no open findings at medium severity or above" in final.summary_md
+    assert "dismissed by alice: the API allows it" in final.summary_md
+    assert "dismiss command for f0000000000ff by alice: this pull request has no such finding" in (
+        final.summary_md
+    )
+    assert "a dismiss command by eve was ignored" in final.summary_md
+    # Nothing was reviewed again: the state still names the review it carries over.
+    assert final.state.config_hash == "9" * 64 and final.state.tool_version == "0.3.0"
+
+
+def test_a_new_finding_that_repeats_a_dismissed_one_is_recorded_as_dismissed(make) -> None:
+    gone = make.prior_finding(
+        id="f00000000000d",
+        title="Page slice is off by one and pages overlap",
+        state="dismissed",
+        dismissed_by="alice",
+        dismiss_reason="intended",
+        evidence="something else",
+    )
+    prior = make.prior_state([gone])
+    draft = make.draft(title="Off by one: page slice overlaps the next pages")
+    final = finalize(
+        make.snapshot(prior=prior),
+        make.prepared(),
+        make.explore(),
+        make.review_draft([draft]),
+        make.anchors(),
+        make.heads().get,
+        make.info(),
+    )
+    assert final.findings == [] and final.verdict == "clean" and final.ready
+    [repeat, earlier] = final.state.findings
+    assert earlier.id == "f00000000000d" and earlier.state == "dismissed"
+    assert repeat.state == "dismissed" and repeat.dismissed_by == "alice"
+    assert repeat.dismiss_reason == "repeats f00000000000d"
+    assert "dismissed by alice: repeats f00000000000d" in final.summary_md
+
+
+def test_a_fix_is_recorded_even_when_the_thread_was_resolved(make) -> None:
+    # The author resolved the thread after fixing the code: fixed, not dismissed.
+    p = make.prior_finding(
+        evidence="gone from the file",
+        thread_resolved=True,
+        resolved_by="dev",
+        resolver_can_dismiss=True,
+    )
+    prior = make.prior_state([p])
+    final = finalize(
+        make.snapshot(prior=prior),
+        make.prepared(),
+        make.explore(),
+        make.review_draft([]),
+        make.anchors(),
+        make.heads().get,
+        make.info(),
+    )
+    [record] = final.state.findings
+    assert (record.state, record.fixed_in) == ("fixed", make.head_sha)
+    assert "fixed in `aaaaaaa`" in final.summary_md
+
+
+def test_incomplete_review_is_not_ready(make) -> None:
+    final = single(make, complete=False, budget_exhausted=True, exhausted_by=["deadline"])
+    assert final.verdict == "incomplete" and not final.ready and final.blocking == 0
+    assert "**Not ready to merge:** the review is incomplete (see below)." in final.summary_md
+
+
+def test_a_carried_over_incomplete_review_keeps_its_reasons_and_coverage(make) -> None:
+    first = single(
+        make,
+        [make.draft()],
+        opened_paths=[PY],
+        complete=False,
+        budget_exhausted=True,
+        exhausted_by=["tool_calls"],
+    )
+    assert not first.state.complete and first.state.not_opened == ["ledger/money.py"]
+    reasons = list(first.verdict_reasons)
+    assert first.state.blockers == reasons and len(reasons) == 2
+    # A refresh (or a push of a lock file) carries that review over: same reasons, same
+    # coverage, and the finding keeps its range and explanation.
+    snap = make.snapshot(paths=[PY, "ledger/money.py"], prior=first.state)
+    prep = make.prepared(
+        paths=[PY],
+        on_demand_paths=["ledger/money.py"],
+        reviewable_paths=[PY, "ledger/money.py"],
+        scope="carry_over",
+        since_sha=make.head_sha,
+    )
+    again = finalize(snap, prep, None, None, make.anchors(), make.heads().get, make.info())
+    assert again.verdict_reasons == reasons and not again.state.complete
+    assert again.state.blockers == reasons and again.state.not_opened == ["ledger/money.py"]
+    assert "1 of 2 reviewable changed files reviewed." in again.summary_md
+    assert "Not opened: `ledger/money.py`." in again.summary_md
+    [carried] = again.findings
+    assert carried.carried and carried.explanation == first.findings[0].explanation
+    assert carried.start_line == first.findings[0].start_line
+
+
+def test_a_carried_over_state_from_before_the_record(make) -> None:
+    # States before 0.3.0 have no reasons or coverage: the generic reason, nothing covered.
+    prior = make.prior_state([], complete=False, verdict="incomplete")
+    snap = make.snapshot(prior=prior)
+    prep = make.prepared(scope="carry_over", since_sha=prior.head_sha)
+    final = finalize(snap, prep, None, None, make.anchors(), make.heads().get, make.info())
+    assert final.verdict_reasons == [
+        "the previous review was incomplete and no reviewable file changed since"
+    ]
+    assert final.coverage["covered"] == 0

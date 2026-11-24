@@ -24,7 +24,8 @@ Effort = Literal["default", "low", "medium", "high", "max"]  # "default" = do no
 Mode = Literal["ci", "cli", "local"]
 Verdict = Literal["clean", "findings", "incomplete"]
 OutcomeStatus = Literal["posted", "report", "skipped", "superseded", "failed"]
-SkipReason = Literal["closed", "draft", "superseded", "already_reviewed"]
+# not_reviewed: a refresh (``/msreview`` command) for a head commit without a review.
+SkipReason = Literal["closed", "draft", "superseded", "already_reviewed", "not_reviewed"]
 AnchorKind = Literal["inline", "snapped", "file", "outside"]
 Scope = Literal["full", "incremental", "carry_over"]
 PriorStatusValue = Literal["fixed", "still_open", "unsure"]
@@ -147,6 +148,8 @@ class ReviewRequest(Contract):
     expected_head_sha: str | None = Field(default=None, pattern=_SHA_PATTERN)
     post: Literal["auto", "never"] = "auto"
     force: bool = False  # bypass already_reviewed / closed / draft (never superseded)
+    # Apply `/msreview` commands to the review of the current head; never runs a model.
+    refresh: bool = False
     overrides: RunOverrides = Field(default_factory=RunOverrides)
     policy: OperatorPolicy
     run_label: str = Field(max_length=200)  # "gha:<repo>/<run_id>/<attempt>" or "cli:<rand>"
@@ -244,6 +247,8 @@ class ResolvedConfig(Contract):
     review_drafts: bool = False
     incremental: bool = True
     author_may_dismiss: bool = True
+    # Open findings at or above this severity keep the PR from being ready to merge.
+    blocking_severity: Severity = "medium"
     instructions: str = Field(default="", max_length=8192)
     path_instructions: list[PathInstruction] = Field(default_factory=list, max_length=30)
     exclude: list[Glob] = Field(default_factory=list, max_length=100)
@@ -252,8 +257,9 @@ class ResolvedConfig(Contract):
     labels: bool = True
     suggestions: bool = True
     related_definitions: bool = True
-    # sha256 over the settings that change what a review finds; budgets, labels and
-    # usage display are excluded so changing them does not force a full re-review.
+    # sha256 over the settings that change what a review finds; budgets, labels, the
+    # blocking severity and usage display are excluded so changing them does not force
+    # a full re-review.
     # Leave empty to have it computed; a non-empty value must match. model_copy() does
     # not re-validate, so build changed configs with model_validate or the constructor.
     config_hash: str = ""
@@ -317,7 +323,11 @@ class PrFile(Contract):
 
 
 class PriorFinding(Contract):
-    """Decoded from our state marker; trusted only when authored by the bot."""
+    """Decoded from our state marker; trusted only when authored by the bot.
+
+    The state keeps the PR's record of findings: open ones (with their explanation, so
+    a later review can show them in full) and closed ones (fixed or dismissed).
+    """
 
     id: str = Field(max_length=40)
     path: str = Field(max_length=500)
@@ -331,6 +341,13 @@ class PriorFinding(Contract):
     thread_resolved: bool = False  # live, from GraphQL
     resolved_by: str | None = Field(default=None, max_length=100)  # live
     resolver_can_dismiss: bool = False  # live: resolver has write+ (and the author rule)
+    start_line: int | None = None  # multi-line range start
+    category: Category | None = None  # None in states written before 0.3.0
+    explanation: str = Field(default="", max_length=1000)  # open findings only
+    fix: str | None = Field(default=None, max_length=500)  # open findings only
+    fixed_in: str | None = Field(default=None, max_length=64)  # head sha that fixed it
+    dismissed_by: str | None = Field(default=None, max_length=100)
+    dismiss_reason: str | None = Field(default=None, max_length=200)
 
 
 class PriorState(Contract):
@@ -348,6 +365,21 @@ class PriorState(Contract):
     refused_resolves: list[Annotated[str, StringConstraints(max_length=200)]] = Field(
         default_factory=list, max_length=60
     )
+    # Why the review was incomplete, and the reviewable files no agent opened: a
+    # carry-over (or a refresh) shows them again. Empty in states before 0.3.0.
+    blockers: list[Note] = Field(default_factory=list, max_length=20)
+    not_opened: list[Annotated[str, StringConstraints(max_length=500)]] = Field(
+        default_factory=list, max_length=100
+    )
+
+
+class DismissCommand(Contract):
+    """A ``/msreview dismiss <id> <reason>`` command by someone who may dismiss findings."""
+
+    id: str = Field(pattern=r"^f[0-9a-f]{6,32}$")
+    by: str = Field(min_length=1, max_length=100)  # the commenter's login
+    reason: str = Field(default="", max_length=200)  # PR text: sanitise before display
+    comment_id: int = Field(ge=1)
 
 
 class PrSnapshot(Sealed):
@@ -385,6 +417,10 @@ class PrSnapshot(Sealed):
     config_warnings: list[Message] = Field(default_factory=list, max_length=20)
     skip: SkipReason | None = None
     run_dir: str = Field(max_length=4096)
+    # `/msreview dismiss` commands in PR comments: the authorised ones (oldest first),
+    # and why the others were ignored.
+    dismiss_commands: list[DismissCommand] = Field(default_factory=list, max_length=100)
+    ignored_commands: list[Message] = Field(default_factory=list, max_length=20)
 
     @property
     def full_name(self) -> str:
@@ -801,6 +837,10 @@ class FinalReview(Sealed):
     # {"reviewable": n, "covered": m, "excluded": k}
     coverage: dict[str, int] = Field(max_length=10)
     refuted: list[DroppedCandidate] = Field(default_factory=list, max_length=60)
+    # Ready to merge: the review is complete and no open finding is at or above the
+    # blocking severity (``blocking`` counts those that are).
+    ready: bool = False
+    blocking: int = Field(default=0, ge=0)
 
 
 class ReviewOutcome(Contract):
@@ -809,6 +849,7 @@ class ReviewOutcome(Contract):
     status: OutcomeStatus
     reason: str | None = Field(default=None, max_length=1000)  # set unless status == "posted"
     verdict: Verdict | None = None
+    ready: bool | None = None  # FinalReview.ready; None when no review was produced
     pr_url: str = Field(max_length=300)
     head_sha: str | None = Field(default=None, max_length=64)
     execution_id: str = Field(max_length=200)

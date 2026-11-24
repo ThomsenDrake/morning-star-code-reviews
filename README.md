@@ -6,7 +6,7 @@ as **your own GitHub App**, or it writes a report when it cannot post.
 
 - Command: `msreview` (Python package `morning_star_review`, distribution `morning-star-code-reviews`)
 - Runs as: a GitHub Action (composite) or a local CLI
-- Status: 0.2.0, alpha. See [Limitations](#limitations).
+- Status: 0.3.0, alpha. See [Limitations](#limitations).
 - License: Apache-2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). The agent
   environment installs a proprietary component; see [Limitations](#limitations).
 
@@ -30,14 +30,18 @@ as **your own GitHub App**, or it writes a report when it cannot post.
   finding moves to the line that really holds it. Suggestion blocks are posted only
   when they pass validation: for example, the file must still parse after the change
   is applied.
-- **Honest verdicts.** Each PR gets one summary comment and one label: `clean`,
-  `findings` or `incomplete`. The verdict is `clean` only when every reviewable file was
-  read and every agent finished. A review that found nothing but could not finish is
+- **Honest verdicts.** The verdict is `clean` only when every reviewable file was read
+  and every agent finished. A review that found nothing but could not finish is
   `incomplete`, never a guessed `clean`. Findings that the verifier could neither
   confirm nor refute are listed as "possible issues" and do not make the verdict
   `findings` on their own.
+- **One place for what is still open.** Each PR gets one summary comment, updated on
+  every push: every finding that is still open (with its id, explanation and fix), and
+  a record of the findings that were fixed or dismissed. One label says whether the PR
+  is ready to merge: `msreview: ready to merge`, `msreview: findings` or
+  `msreview: incomplete`. See [Working with findings](#working-with-findings).
 - **Incremental and idempotent.** On later pushes, only the files changed since the last
-  reviewed commit are reviewed. Findings whose code changed are marked as addressed.
+  reviewed commit are reviewed. Findings whose code changed are marked as fixed.
   Hidden markers make retries safe: a retry never posts duplicates.
 
 A longer description is in [docs/architecture.md](docs/architecture.md).
@@ -55,7 +59,7 @@ You need:
 1. **Create a GitHub App** (once). Step-by-step guide:
    [docs/setup-github-app.md](docs/setup-github-app.md).
    - Repository permissions: **Contents: Read**, **Pull requests: Read & write**,
-     **Issues: Read & write** (for the verdict labels), **Metadata: Read**.
+     **Issues: Read & write** (for the status labels), **Metadata: Read**.
    - No webhook: clear "Active" under Webhook. The Action calls GitHub itself.
    - Note the App's **Client ID**, then generate a private key. Your browser downloads
      a `.pem` file.
@@ -64,7 +68,7 @@ You need:
 3. **Install msreview and enable your repositories:**
 
    ```bash
-   uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.2.0
+   uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.3.0
    msreview enable you/repo1 you/repo2 --app-key-file ~/Downloads/<app>.private-key.pem
    ```
 
@@ -80,13 +84,45 @@ You need:
 
 You do not need `msreview setup` for this. It is only for [local reviews](#local-reviews-cli).
 
+### Working with findings
+
+The summary comment is the PR's list of what is still open. msreview edits it in place
+after every push (it stays where it was first posted), so a person or a coding agent
+can read it at any time, for example with `gh pr view <number> --comments`:
+
+- **Open findings:** a table of every finding that is still open, inline or not, with
+  its id (`f` and 12 hex digits), severity, location and status (`new` or `still
+  open`, with a link to its thread). A collapsed block below it holds each finding's
+  explanation and suggested fix.
+- **Fixed and dismissed findings:** a collapsed record of the PR's earlier findings,
+  each "fixed in `<commit>`" or "dismissed by `<login>`: `<reason>`".
+- **Ready to merge:** a line under the verdict, and the label. The PR is ready when
+  the review is complete and no open finding is at or above `review.blocking_severity`
+  (default `medium`): low findings alone do not block it.
+
+A finding is **fixed** when a later push changes the code it flags. To **dismiss** a
+false positive (or a finding you accept), either resolve its inline thread, or comment
+on the PR:
+
+```text
+/msreview dismiss f0123456789ab the caller validates this
+/msreview dismiss f0123456789ab f00000000000b intended
+```
+
+The command works for every finding, also the ones without an inline thread, and it
+takes effect within a minute: the comment starts a short run that updates the summary,
+the label and the finding's thread without running any model. Only people with write
+access can dismiss (the PR author too, unless `review.author_may_dismiss: false`).
+A dismissed finding stays dismissed: when a later review reports it again, even in
+other words, it is recorded as a repeat of the dismissed one and not shown as open.
+
 ### What `msreview enable` changes
 
 In each repository:
 
 | Kind | Name | Value |
 |---|---|---|
-| Workflow file | `.github/workflows/morning-star-code-review.yml` | The review workflow. It pins the action to the full commit SHA of the release (with a `# v0.2.0` comment), sets `timeout-minutes: 110`, and sets `preset` when you pass `--preset` |
+| Workflow file | `.github/workflows/morning-star-code-review.yml` | The review workflow. It pins the action to the full commit SHA of the release (with a `# v0.3.0` comment), sets `timeout-minutes: 110`, and sets `preset` when you pass `--preset` |
 | Secret | `MSREVIEW_MISTRAL_API_KEY` | Your Mistral API key |
 | Secret | `MSREVIEW_APP_PRIVATE_KEY` | The App's private key (the contents of the `.pem` file) |
 | Variable | `MSREVIEW_APP_CLIENT_ID` | The App's Client ID (not a secret) |
@@ -139,7 +175,7 @@ msreview disable you/repo1 --keep-secrets
 
 `msreview status` changes nothing. For each repository, it shows whether the workflow
 file exists and which release it pins, whether the two secrets and the variable exist,
-and the conclusion of the last workflow run. GitHub returns only the names of secrets,
+and the conclusion of the last review run. GitHub returns only the names of secrets,
 never their values. `msreview update` changes only the pinned release: it keeps a
 preset that you chose with `--preset` and edits that you made to the file.
 `msreview disable` deletes only the `MSREVIEW_` names; with `--pr`, nothing is removed
@@ -158,6 +194,11 @@ msreview update you/repo1 --force   # re-renders the file (it keeps the preset, 
 
 msreview does not delete the old `MISTRAL_API_KEY`: remove it yourself when no other
 workflow uses it.
+
+**Workflows from before 0.3.0** do not run on comments, so a `/msreview dismiss`
+comment takes effect only at the next review. `msreview status` and `msreview update`
+say so; `msreview update you/repo1 --force` re-renders the file with the comment
+trigger (it keeps the preset, not other edits).
 
 **Key rotation.** Generate a second private key on the App's page (an App can have
 several active keys), or create a new Mistral key. Then set the new values in your
@@ -237,7 +278,7 @@ The CLI reviews one pull request on demand. Requires Python 3.12 to 3.14, `git` 
 [uv](https://docs.astral.sh/uv/), on macOS or Linux.
 
 ```bash
-uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.2.0
+uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.3.0
 msreview setup                                       # builds the agent environment (pinned, hash-checked)
 read -rs MISTRAL_API_KEY && export MISTRAL_API_KEY   # paste the key; it is not shown or kept in history
 msreview doctor                                      # checks the key, Workflows access and the installation
@@ -335,8 +376,14 @@ input and the precedence rules are in [docs/configuration.md](docs/configuration
 - **Threads of fixed findings are not resolved automatically.** GitHub lets a token
   resolve a review thread only when it has **Contents: write**. That permission also
   lets the token push code, so we **do not recommend** granting it, and msreview always
-  requests tokens with Contents: read. When the flagged code changes, the bot replies
-  "Looks addressed" and hides its comment as resolved. You can resolve the thread yourself.
+  requests tokens with Contents: read. When the flagged code changes (or a
+  `/msreview dismiss` command dismisses the finding), the bot replies on the thread and
+  hides its comment as resolved. You can resolve the thread yourself.
+- **Every PR comment starts a workflow run.** GitHub cannot filter `issue_comment`
+  events by text, so each comment starts a run of the review workflow; its job is
+  skipped unless the comment holds `/msreview dismiss` by an owner, member or
+  collaborator (the bot's own summary edits start skipped runs too). Skipped runs
+  cost no runner minutes.
 - **Fork PRs** need the separate `pull_request_target` template and a maintainer's
   approval for each push from an untrusted author, or an on-demand CLI review.
 - **Deployment records accumulate.** Each PR leaves about one inactive deployment

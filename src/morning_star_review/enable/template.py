@@ -23,6 +23,7 @@ __all__ = [
     "diff_summary",
     "find_pin",
     "find_preset",
+    "has_command_trigger",
     "normalize_version",
     "render",
     "repin",
@@ -139,6 +140,15 @@ def find_preset(text: str) -> str | None:
     if m is None or m.group("name") not in PRESETS:
         return None
     return m.group("name")
+
+
+_COMMAND_TRIGGER_RE = re.compile(r"^[ \t]*issue_comment[ \t]*:", re.MULTILINE)
+
+
+def has_command_trigger(text: str) -> bool:
+    """Whether ``text`` runs on ``issue_comment`` (``/msreview`` commands, since 0.3.0).
+    Comments do not count."""
+    return _COMMAND_TRIGGER_RE.search(_COMMENT_RE.sub("", text)) is not None
 
 
 def uses_legacy_secret(text: str) -> bool:

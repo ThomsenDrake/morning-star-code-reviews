@@ -21,6 +21,7 @@ from morning_star_review.core.contract import (
     DroppedCandidate,
     ExcludedFile,
     FinalFinding,
+    PriorFinding,
     PriorState,
     ResolvedPrior,
     ResolvedRoles,
@@ -42,7 +43,8 @@ from morning_star_review.review.anchoring import line_text
 from morning_star_review.review.verdict import counts_as_finding, is_possible, resolved_without_fix
 
 __all__ = [
-    "OTHER_HEADING",
+    "CLOSED_SUMMARY",
+    "OPEN_HEADING",
     "REPORT_LIMIT",
     "SUMMARY_LIMIT",
     "SUMMARY_MARKER",
@@ -54,6 +56,7 @@ __all__ = [
     "finding_marker",
     "findings_json",
     "inline_body",
+    "readiness_line",
     "report",
     "summary",
     "verdict_headline",
@@ -61,12 +64,16 @@ __all__ = [
 
 TOOL_NAME = "Morning Star Code Review"
 SUMMARY_MARKER = "<!-- morning-star-review:summary v1 -->"
-# Findings without an inline comment that are neither main nor "possible" findings:
-# outside the changed files, not on a changed line, or below the inline threshold.
-OTHER_HEADING = "#### Other findings"
+# Every finding still open on the pull request, inline or not.
+OPEN_HEADING = "#### Open findings"
+# The record of the findings that were fixed or dismissed (a <details> block).
+CLOSED_SUMMARY = "Fixed and dismissed findings"
+DISMISS_COMMAND = "/msreview dismiss <id> <reason>"
 # The summary comment holds the summary plus the state marker (<= 20 KB) and must
 # stay under 60,000 characters.
 SUMMARY_LIMIT = 38_000
+# The explanations of open findings in the summary stop at about this size.
+EXPLANATIONS_LIMIT = 16_000
 REPORT_LIMIT = 262_144
 MAX_LISTED_PATHS = 20
 _EXCERPT_CONTEXT = 2
@@ -185,9 +192,18 @@ def inline_body(f: FinalFinding, model: str, sha7: str) -> str:
     elif fix:
         parts.append(fix)
     who = sanitize_inline(model, 300) if model.strip() else ""
-    meta = " · ".join(p for p in (TOOL_NAME, who, code_span(sha7[:7]), _verification_note(f)) if p)
+    meta = " · ".join(
+        p
+        for p in (TOOL_NAME, who, code_span(sha7[:7]), _verification_note(f), f"id {_id(f.id)}")
+        if p
+    )
     parts.append(f"<sub>{meta}</sub>\n{finding_marker(f.id)}")
     return "\n\n".join(parts)
+
+
+def _id(finding_id: str) -> str:
+    """A finding id as a code span (ids are ``f`` + hex, but come from our state)."""
+    return code_span(strip_markers(finding_id)[:40])
 
 
 # --------------------------------------------------------------------------------------
@@ -243,6 +259,14 @@ class SummaryInput:
     # False when the review has blockers (verdict.Assessment.complete); a "findings"
     # review can be incomplete too, and then its reasons say what was not covered.
     complete: bool = True
+    # Ready to merge (None: no readiness line), and the open findings that block it.
+    ready: bool | None = None
+    blocking: int = 0
+    blocking_severity: Severity = "medium"
+    # The PR's record of fixed and dismissed findings (newest first).
+    closed: Sequence[PriorFinding] = ()
+    # Why `/msreview` commands did nothing.
+    command_notes: Sequence[str] = ()
 
 
 def _plural(n: int, word: str, plural: str | None = None) -> str:
@@ -258,14 +282,6 @@ def _counts(findings: Sequence[FinalFinding]) -> str:
 
 def _below_threshold(f: FinalFinding, threshold: Severity) -> bool:
     return SEVERITY_ORDER[f.severity] > SEVERITY_ORDER[threshold]
-
-
-def _is_main(f: FinalFinding, threshold: Severity) -> bool:
-    if is_possible(f):
-        return False
-    if f.state == "open":
-        return True
-    return f.anchor in ("inline", "snapped") and not _below_threshold(f, threshold)
 
 
 def verdict_headline(s: SummaryInput) -> str:
@@ -292,7 +308,34 @@ def verdict_headline(s: SummaryInput) -> str:
         "incremental": f"incremental since {since}",
         "carry_over": f"no reviewable changes since {since}",
     }[s.scope]
+    if s.scope == "carry_over" and s.since_sha == s.head_sha:
+        scope = "updated for `/msreview` commands"  # a refresh of the reviewed head
     return f"**Verdict: {text}**{extra} · {sha7} · {scope}"
+
+
+def _blocking_words(severity: Severity, count: int | None = None) -> str:
+    """``open findings at medium severity or above`` (with a count when given)."""
+    noun = "open finding" if count == 1 else "open findings"
+    if severity == "critical":
+        noun = noun.replace("open ", "open critical ")
+    elif severity != "low":
+        noun += f" at {severity} severity or above"
+    return noun if count is None else f"{count} {noun}"
+
+
+def readiness_line(s: SummaryInput) -> str:
+    """``**Ready to merge:** ...`` or ``**Not ready to merge:** ...`` (empty when unknown)."""
+    if s.ready is None:
+        return ""
+    if s.ready:
+        rest = sum(1 for f in s.findings if counts_as_finding(f))
+        line = f"**Ready to merge:** no {_blocking_words(s.blocking_severity)}"
+        if rest:
+            line += f" ({_plural(rest, 'less severe finding')} still open)"
+        return line + "."
+    if s.blocking:
+        return f"**Not ready to merge:** {_blocking_words(s.blocking_severity, s.blocking)}."
+    return "**Not ready to merge:** the review is incomplete (see below)."
 
 
 def _location(s: SummaryInput, f: FinalFinding) -> str:
@@ -311,19 +354,6 @@ def _cell(text: str, limit: int = 200) -> str:
     return sanitize_inline(text, limit)
 
 
-def _main_status(s: SummaryInput, f: FinalFinding, notes: Mapping[str, str]) -> str:
-    if f.carried:
-        status = "still open"
-        if f.id in notes:
-            status = f"still open ({_cell(notes[f.id], 150)})"
-        if f.comment_id is not None:
-            status = f"[{status}]({_thread_url(s, f.comment_id)})"
-        return status
-    if f.state == "summary_only":
-        return "listed here only (inline comment limit reached)"
-    return "new, not confirmed" if f.verify_status == "uncertain" else "new"
-
-
 # Where a finding is anchored, in the words of the report's detail lines.
 _ANCHOR_WORDS = {
     "inline": "on a changed line",
@@ -333,17 +363,35 @@ _ANCHOR_WORDS = {
 }
 
 
-def _other_reason(f: FinalFinding, threshold: Severity) -> str:
-    """Where an "Other findings" item is and why it has no inline comment.
+def _no_inline_reason(f: FinalFinding, threshold: Severity) -> str:
+    """Why a finding has no inline comment (it is listed in the summary only).
 
     The location words match the finding's detail line in the report.
     """
+    if f.carried:
+        return "no inline comment"
     if f.anchor in ("outside", "file"):
-        return _ANCHOR_WORDS[f.anchor]
-    where = _ANCHOR_WORDS["inline"]
-    if _below_threshold(f, threshold):
-        return f"{where}, below the inline threshold ({threshold})"
-    return where
+        where = _ANCHOR_WORDS[f.anchor]
+    elif _below_threshold(f, threshold):
+        where = f"{_ANCHOR_WORDS['inline']}, below the inline threshold ({threshold})"
+    else:
+        where = f"{_ANCHOR_WORDS['inline']}, inline comment limit reached"
+    return f"no inline comment: {where}"
+
+
+def _open_status(s: SummaryInput, f: FinalFinding, notes: Mapping[str, str]) -> str:
+    """``new`` or ``still open``, a link to the thread, or why there is no thread."""
+    if f.carried:
+        status = "still open"
+        if f.id in notes:
+            status = f"still open ({_cell(notes[f.id], 150)})"
+    else:
+        status = "new, not confirmed" if f.verify_status == "uncertain" else "new"
+    if f.state == "summary_only":
+        return f"{status} · {_no_inline_reason(f, s.inline_min_severity)}"
+    if f.comment_id is not None:
+        return f"[{status}]({_thread_url(s, f.comment_id)})"
+    return status
 
 
 def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
@@ -352,19 +400,73 @@ def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
     return "\n".join([head, rule, *("| " + " | ".join(r) + " |" for r in rows)])
 
 
+def _open(s: SummaryInput) -> list[FinalFinding]:
+    """The open findings, as the verdict counts them (possible issues are separate)."""
+    return [f for f in s.findings if counts_as_finding(f)]
+
+
 def _findings_section(s: SummaryInput) -> str:
+    """Every open finding, inline or not: what is still outstanding on the PR."""
     notes = {p.id: p.note for p in resolved_without_fix(s.priors)}
     rows = [
-        [_severity(f.severity), _cell(f.title), _location(s, f), _main_status(s, f, notes)]
-        for f in s.findings
-        if _is_main(f, s.inline_min_severity)
+        [
+            _id(f.id),
+            _severity(f.severity),
+            _cell(f.title),
+            _location(s, f),
+            _open_status(s, f, notes),
+        ]
+        for f in _open(s)
     ]
     if not rows:
         return ""
-    out = _table(["Severity", "Finding", "Location", "Status"], rows)
+    out = f"{OPEN_HEADING}\n\n" + _table(["ID", "Severity", "Finding", "Location", "Status"], rows)
     if s.over_cap:
         out += f"\n\n_{_plural(s.over_cap, 'more finding')} not listed (at most 50 are shown)._"
     return out
+
+
+def _explanation(f: FinalFinding) -> str:
+    """One open finding's explanation and fix, under a heading with its id."""
+    parts = [f"##### {_id(f.id)} · {_heading(f)}"]
+    if f.explanation.strip():
+        parts.append(sanitize_md(f.explanation, 6000))
+    fix = _fix_block(f.fix)
+    if fix:
+        parts.append(fix)
+    if f.suggestion is not None:
+        sg = f.suggestion
+        where = (
+            f"lines {sg.start_line}-{sg.end_line}"
+            if sg.end_line != sg.start_line
+            else f"line {sg.start_line}"
+        )
+        parts.append(
+            f"Suggested replacement for {where}:\n\n" + _fenced(sg.text, _language(f.path))
+        )
+    return "\n\n".join(parts)
+
+
+def _explanations_section(s: SummaryInput, limit: int = EXPLANATIONS_LIMIT) -> str:
+    """What each open finding is about, collapsed (the inline comments say it too)."""
+    blocks: list[str] = []
+    used = 0
+    shown = [f for f in _open(s) if f.explanation.strip() or (f.fix or "").strip()]
+    for i, f in enumerate(shown):
+        block = _explanation(f)
+        if used + len(block) > limit:
+            more = len(shown) - i
+            blocks.append(
+                f"_{_plural(more, 'more explanation')} not shown here: see the inline "
+                "comments, or the report of the run._"
+            )
+            break
+        blocks.append(block)
+        used += len(block) + 2
+    if not blocks:
+        return ""
+    body = "\n\n".join(blocks)
+    return f"<details><summary>Explanations and suggested fixes</summary>\n\n{body}\n\n</details>"
 
 
 def _possible_section(s: SummaryInput) -> str:
@@ -380,40 +482,42 @@ def _possible_section(s: SummaryInput) -> str:
     return f"#### Possible issues (not confirmed)\n\n{intro}\n\n{table}"
 
 
-def _other_section(s: SummaryInput) -> str:
+def _outcome(p: PriorFinding) -> str:
+    """``fixed in <sha>`` or ``dismissed by <login>: <reason>``."""
+    if p.state == "fixed":
+        return f"fixed in {code_span(p.fixed_in[:7])}" if p.fixed_in else "fixed"
+    text = "dismissed"
+    by = p.dismissed_by or p.resolved_by
+    if by:
+        text += f" by {_cell(by, 100)}"
+    if p.dismiss_reason and p.dismiss_reason.strip():
+        text += f": {_cell(p.dismiss_reason, 200)}"
+    return text
+
+
+def _closed_section(s: SummaryInput) -> str:
+    """The PR's record of fixed and dismissed findings, collapsed."""
+    if not s.closed:
+        return ""
     rows = [
         [
-            _severity(f.severity),
-            _cell(f.title),
-            _location(s, f),
-            _other_reason(f, s.inline_min_severity),
+            _id(p.id),
+            _severity(p.severity),
+            _cell(p.title),
+            _path_span(p.path, p.line, table=True),
+            _outcome(p),
         ]
-        for f in s.findings
-        if not _is_main(f, s.inline_min_severity) and not is_possible(f)
+        for p in s.closed
     ]
-    if not rows:
+    table = _table(["ID", "Severity", "Finding", "Location", "Outcome"], rows)
+    return f"<details><summary>{CLOSED_SUMMARY} ({len(rows)})</summary>\n\n{table}\n\n</details>"
+
+
+def _commands_block(s: SummaryInput) -> str:
+    if not s.command_notes:
         return ""
-    return f"{OTHER_HEADING}\n\n" + _table(
-        ["Severity", "Finding", "Location", "Why not inline"], rows
-    )
-
-
-_PRIOR_HEADINGS = {"resolve": "code changed", "file_deleted": "file deleted"}
-
-
-def _resolved_section(s: SummaryInput) -> str:
-    lines: list[str] = []
-    for p in s.priors:
-        if p.action in _PRIOR_HEADINGS:
-            why = _PRIOR_HEADINGS[p.action]
-        elif p.action == "dismissed" and p.note.startswith("dismissed by "):
-            why = _cell(p.note, 150)
-        else:
-            continue
-        lines.append(f"- {_cell(p.title)} ({_path_span(p.path)}): {why}")
-    if not lines:
-        return ""
-    return "#### Resolved since the last review\n\n" + "\n".join(lines)
+    items = "\n".join(f"- {_cell(n, 400)}" for n in s.command_notes)
+    return f"Commands that did nothing:\n{items}"
 
 
 def _path_list(paths: Sequence[str], reasons: Mapping[str, str] | None = None) -> str:
@@ -546,14 +650,13 @@ def _details_section(d: RunDetails) -> str:
 
 
 def _footer(s: SummaryInput) -> str:
-    who = (
-        "the PR author or anyone with write access"
-        if s.author_may_dismiss
-        else "write access required"
-    )
+    who = "anyone with write access"
+    if not s.author_may_dismiss:
+        who += " except the PR author"
     return (
-        "<sub>Automated review; findings can be wrong. "
-        f"Resolve a thread to dismiss a finding ({who}).</sub>"
+        "<sub>Automated review; findings can be wrong. Open findings lists everything "
+        "still outstanding on this pull request. To dismiss a finding, resolve its thread "
+        f"or comment {code_span(DISMISS_COMMAND)} ({who}).</sub>"
     )
 
 
@@ -581,20 +684,27 @@ def _shorten(text: str, limit: int) -> str:
     return head + note
 
 
-def _summary_sections(s: SummaryInput) -> list[str]:
+def _summary_sections(s: SummaryInput, *, explanations: bool = True) -> list[str]:
+    """The sections after the headline; the last one is the coverage."""
     return [
         _reasons_block(s),
+        _commands_block(s),
         _findings_section(s),
+        _explanations_section(s) if explanations else "",
         _possible_section(s),
-        _resolved_section(s),
-        _other_section(s),
+        _closed_section(s),
         _coverage_section(s),
     ]
 
 
+def _headline(s: SummaryInput) -> str:
+    ready = readiness_line(s)
+    return verdict_headline(s) + (f"\n{ready}" if ready else "")
+
+
 def summary(s: SummaryInput, *, limit: int = SUMMARY_LIMIT) -> str:
     """The summary comment body without the state marker (``publish`` appends it)."""
-    parts = [f"{SUMMARY_MARKER}\n### {TOOL_NAME}\n{verdict_headline(s)}", *_summary_sections(s)]
+    parts = [f"{SUMMARY_MARKER}\n### {TOOL_NAME}\n{_headline(s)}", *_summary_sections(s)]
     if s.details is not None:
         parts.append(_details_section(s.details))
     body = without_controls("\n\n".join(p for p in parts if p))
@@ -648,7 +758,7 @@ def _detail(i: int, f: FinalFinding, head: HeadText) -> str:
     note = _verification_note(f)
     if note:
         meta.append(note)
-    parts = [f"##### {i}. {_heading(f)}", " · ".join(meta)]
+    parts = [f"##### {i}. {_id(f.id)} · {_heading(f)}", " · ".join(meta)]
     if f.explanation.strip():
         parts.append(sanitize_md(f.explanation, 6000))
     fix = _fix_block(f.fix)
@@ -675,11 +785,10 @@ def report(s: SummaryInput, head_text: HeadText, *, limit: int = REPORT_LIMIT) -
 
     ``publish`` puts a "Not posted" banner with its reason in front of it.
     """
-    sections = _summary_sections(s)
+    # The details below explain every finding, so no collapsed explanations here.
+    sections = _summary_sections(s, explanations=False)
     coverage = sections.pop()  # moved after the details, as the report reads top-down
-    head_part = "\n\n".join(
-        p for p in [f"### {TOOL_NAME} report\n{verdict_headline(s)}", *sections] if p
-    )
+    head_part = "\n\n".join(p for p in [f"### {TOOL_NAME} report\n{_headline(s)}", *sections] if p)
     tail = [coverage]
     if s.details is not None:
         tail.append(_details_section(s.details))  # its <summary> is the heading

@@ -89,8 +89,8 @@ inputs:
     default: "false"
   labels:
     description: >-
-      true | false: keep one verdict label on the PR (msreview: clean / findings /
-      incomplete). Needs Issues: write on the App.
+      true | false: keep one status label on the PR (msreview: ready to merge /
+      findings / incomplete). Needs Issues: write on the App.
     required: false
     default: "true"
   suggestions:
@@ -112,7 +112,9 @@ inputs:
     required: false
     default: "false"
   pr-url:
-    description: Pull request URL. Empty = the triggering pull request.
+    description: >-
+      Pull request URL. Empty = the triggering pull request (or, on issue_comment, the
+      pull request commented on).
     required: false
     default: ""
   expected-head-sha:
@@ -134,6 +136,11 @@ outputs:
   verdict:
     description: "clean | findings | incomplete"
     value: ${{ steps.publish.outputs.verdict || steps.review.outputs.verdict }}
+  ready:
+    description: >-
+      true | false: ready to merge (a complete review, and no open finding at or above
+      the blocking severity). Empty when no review was produced.
+    value: ${{ steps.publish.outputs.ready || steps.review.outputs.ready }}
   findings:
     description: Number of open findings (possible issues, which the verifier could not confirm, do not count).
     value: ${{ steps.publish.outputs.findings || steps.review.outputs.findings }}
@@ -199,7 +206,11 @@ runs:
         MSREVIEW_AGENT_PYTHON: ${{ runner.temp }}/msreview/venv-agent/bin/python
         MSREVIEW_REPORT_DIR: ${{ runner.temp }}/msreview/report
         MSREVIEW_RUN_ROOT: ${{ runner.temp }}/msreview/runs
-        MSREVIEW_PR_URL: ${{ inputs.pr-url || github.event.pull_request.html_url }}
+        MSREVIEW_PR_URL: >-
+          ${{ inputs.pr-url || github.event.pull_request.html_url ||
+          github.event.issue.pull_request.html_url }}
+        # A `/msreview` command comment: re-apply the commands, never run a model.
+        MSREVIEW_REFRESH: ${{ github.event_name == 'issue_comment' }}
         # The event's head SHA only binds the run when the run reviews the event's PR.
         MSREVIEW_HEAD_SHA: >-
           ${{ inputs.expected-head-sha || ((inputs.pr-url == '' ||
@@ -264,7 +275,9 @@ runs:
         MSREVIEW_PUBLISH_PLAN: ${{ steps.review.outputs.publish-plan }}
         MSREVIEW_FAIL_ON: ${{ inputs.fail-on }}
         MSREVIEW_REMOVE_LABEL: ${{ inputs.remove-label }}
-        MSREVIEW_PR_URL: ${{ inputs.pr-url || github.event.pull_request.html_url }}
+        MSREVIEW_PR_URL: >-
+          ${{ inputs.pr-url || github.event.pull_request.html_url ||
+          github.event.issue.pull_request.html_url }}
         MSREVIEW_REPORT_DIR: ${{ runner.temp }}/msreview/report
       run: |
         msreview="$RUNNER_TEMP/msreview/venv-worker/bin/msreview"

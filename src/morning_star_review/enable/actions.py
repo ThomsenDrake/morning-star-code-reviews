@@ -19,6 +19,7 @@ from morning_star_review.enable.values import Values
 
 __all__ = [
     "Result",
+    "commands_hint",
     "disable_one",
     "legacy_hint",
     "moved_warning",
@@ -98,6 +99,14 @@ def legacy_hint(full: str) -> str:
     )
 
 
+def commands_hint(full: str) -> str:
+    """How to add the ``issue_comment`` trigger that ``/msreview`` commands need."""
+    return (
+        "the workflow does not run on comments, so `/msreview dismiss` takes effect at the "
+        f"next review only; `msreview update {full} --force` adds it (it re-renders the file)"
+    )
+
+
 def moved_warning(repo: Repo, old: str, new: str) -> str | None:
     """A warning when ``new`` moves a 0.1.x workflow (``old``) from the secret
     ``MISTRAL_API_KEY`` to ``SECRET_MISTRAL`` while that secret is not set."""
@@ -156,6 +165,8 @@ def update_one(
     details: list[str] = []
     if tpl.uses_legacy_secret(new):  # kept as it is: only --force changes the name
         details.append(legacy_hint(repo.full))
+    if not tpl.has_command_trigger(new):  # likewise: only --force adds the trigger
+        details.append(commands_hint(repo.full))
     warning = moved_warning(repo, existing.text, new)  # --force: is the new name set?
     if warning is not None:
         details.append(warning)
@@ -218,6 +229,7 @@ def status_one(repo: Repo) -> dict[str, Any]:
         "sha": pin.sha if pin else None,
         "pinned": pin.describe() if pin else None,
         "preset": tpl.find_preset(existing.text) if existing else None,
+        "commands": tpl.has_command_trigger(existing.text) if existing else None,
     }
     # A 0.1.x workflow maps secrets.MISTRAL_API_KEY: report the name it really uses.
     legacy = existing is not None and tpl.uses_legacy_secret(existing.text)

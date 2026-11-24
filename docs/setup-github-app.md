@@ -30,7 +30,7 @@ still produced, but only as the Action's step summary and artifact, or as CLI ou
    |---|---|---|
    | **Contents** | Read-only | Fetch the PR's commits and read the repository config file at the base commit |
    | **Pull requests** | Read and write | Read the PR; post the review, its inline comments, replies and the summary comment |
-   | **Issues** | Read and write | Create the `msreview: …` verdict labels and set them on the PR |
+   | **Issues** | Read and write | Create the `msreview: …` status labels and set them on the PR |
    | **Metadata** | Read-only | Mandatory for every App |
 
    Leave everything else at "No access". Do not subscribe to any events. Do not grant
@@ -56,7 +56,7 @@ resolved. The thread stays open until a person resolves it.
 
 ### Without Issues: write
 
-The verdict labels need Issues: write. If the App does not have it:
+The status labels need Issues: write. If the App does not have it:
 
 - **CLI:** labels are skipped, and the outcome records a note. `msreview app-check`
   shows it.
@@ -84,7 +84,7 @@ scopes `repo` and `workflow` (`gh auth refresh -h github.com -s workflow` adds a
 missing scope).
 
 ```bash
-uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.2.0
+uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.3.0
 msreview enable you/repo1 you/repo2 --app-key-file ~/Downloads/<app>.private-key.pem
 ```
 

@@ -65,7 +65,7 @@ def test_inline_body_basic_layout() -> None:
         "**High · correctness: Off by one**\n\nPages overlap.\n\n**Suggested fix:** Drop the + 1."
     )
     assert body.endswith(
-        "<sub>Morning Star Code Review · zai-glm-5-3 · `aaaaaaa`</sub>\n"
+        "<sub>Morning Star Code Review · zai-glm-5-3 · `aaaaaaa` · id `f0123456789ab`</sub>\n"
         "<!-- morning-star-review:finding f0123456789ab -->"
     )
 
@@ -94,8 +94,8 @@ def test_no_suggestion_block_without_a_validated_suggestion() -> None:
 def test_unconfirmed_tag_and_verifier_note() -> None:
     body = render.inline_body(ff(verify_status="uncertain", votes=["a", "b"]), "a, b", SHA)
     assert body.startswith("**High · correctness: Off by one (unconfirmed)**")
-    assert "· not confirmed by the verifier</sub>" in body
-    assert "confirmed by the verifier</sub>" in render.inline_body(
+    assert "· not confirmed by the verifier · id " in body
+    assert "· confirmed by the verifier · id " in render.inline_body(
         ff(verify_status="confirmed"), "m", SHA
     )
 
@@ -179,48 +179,129 @@ def test_sections_and_reasons(make) -> None:
         ff(id="f2", anchor="outside", line=None, path="x.py", state="summary_only"),
         ff(id="f3", severity="low", state="summary_only"),
         ff(id="f4", state="summary_only"),  # anchored, severe enough: inline cap
+        ff(id="f5", state="summary_only", carried=True, explanation=""),
     ]
-    priors = [
-        ResolvedPrior(
-            id="p1",
-            title="Fixed bug",
-            path="a.py",
-            action="resolve",
-            note="the flagged code changed",
+    closed = [
+        make.prior_finding(
+            id="p1", title="Fixed bug", path="a.py", state="fixed", fixed_in="e" * 40
         ),
-        ResolvedPrior(
-            id="p2", title="Gone", path="b.py", action="file_deleted", note="the file was deleted"
+        make.prior_finding(
+            id="p3",
+            title="Dismissed",
+            path="c.py",
+            line=None,
+            state="dismissed",
+            dismissed_by="alice",
+            dismiss_reason="intended: | the API allows it",
         ),
-        ResolvedPrior(
-            id="p3", title="Dismissed", path="c.py", action="dismissed", note="dismissed by alice"
-        ),
-        ResolvedPrior(
-            id="p4", title="Old", path="d.py", action="dismissed", note="dismissed earlier"
-        ),
+        make.prior_finding(id="p4", title="Old", path="d.py", state="dismissed", resolved_by="bob"),
     ]
     text = render.summary(
         view(
             make,
             findings,
-            priors=priors,
+            closed=closed,
             verdict="incomplete",
             verdict_reasons=["the verifier did not run"],
+            command_notes=["a dismiss command by eve was ignored: only people with write access"],
         )
     )
     assert (
         "The review is incomplete, so it cannot be called clean:\n- the verifier did not run"
         in text
     )
-    assert "| listed here only (inline comment limit reached) |" in text
-    # "Other findings" holds findings off the changed lines and below-threshold ones on
-    # them; each row says where the finding is, in the report's words.
-    other = text.split(render.OTHER_HEADING, 1)[1].split("\n\n#### ", 1)[0]
-    assert "| Severity | Finding | Location | Why not inline |" in other
-    assert "| outside this PR's changed files |" in other
-    assert "| on a changed line, below the inline threshold (medium) |" in other
-    assert "Not on changed lines" not in text and "| not on a changed line |" not in text
-    assert "- Fixed bug (`a.py`): code changed" in text and "- Gone (`b.py`): file deleted" in text
-    assert "- Dismissed (`c.py`): dismissed by alice" in text and "Old" not in text
+    assert "Commands that did nothing:\n- a dismiss command by eve was ignored" in text
+    # One table of every open finding, inline or not, with its id and why it has no thread.
+    table = text.split(render.OPEN_HEADING, 1)[1].split("\n\n", 2)[1]
+    rows = table.split("\n")
+    assert rows[0] == "| ID | Severity | Finding | Location | Status |"
+    status = {r.split(" | ", 1)[0][2:]: r.rsplit(" | ", 1)[1][:-2] for r in rows[2:]}
+    assert status == {
+        "`f1`": "new",
+        "`f2`": "new · no inline comment: outside this PR's changed files",
+        "`f3`": "new · no inline comment: on a changed line, below the inline threshold (medium)",
+        "`f4`": "new · no inline comment: on a changed line, inline comment limit reached",
+        "`f5`": "still open · no inline comment",
+    }
+    # The record of fixed and dismissed findings, collapsed.
+    record = text.split(f"<details><summary>{render.CLOSED_SUMMARY} (3)</summary>", 1)[1]
+    record = record.split("</details>", 1)[0]
+    assert "| `p1` | High | Fixed bug | `a.py:14` | fixed in `eeeeeee` |" in record
+    assert (
+        "| `p3` | High | Dismissed | `c.py` | dismissed by alice: intended: \\| the API allows it |"
+        in record
+    )
+    assert "| `p4` | High | Old | `d.py:14` | dismissed by bob |" in record
+    assert "Other findings" not in text and "Resolved since" not in text
+
+
+def test_explanations_of_open_findings(make) -> None:
+    fixed = ff(id="f1", fix="Drop the + 1.")
+    bare = ff(id="f2", explanation="", carried=True, state="summary_only")
+    text = render.summary(view(make, [fixed, bare]))
+    block = text.split("<details><summary>Explanations and suggested fixes</summary>", 1)[1]
+    block = block.split("</details>", 1)[0]
+    assert "##### `f1` · High · correctness: Off by one\n\nPages overlap." in block
+    assert "**Suggested fix:** Drop the + 1." in block
+    assert "`f2`" not in block  # nothing recorded to explain
+    # The block stops at its size limit and says how many it left out.
+    many = [ff(id=f"f{i}", explanation="x" * 1500) for i in range(20)]
+    text = render.summary(view(make, many))
+    assert "more explanations not shown here: see the inline comments" in text
+    assert len(text) <= render.SUMMARY_LIMIT
+    # The report explains every finding in detail instead.
+    report = render.report(view(make, [fixed]), lambda _p: None)
+    assert "Explanations and suggested fixes" not in report
+    assert "##### 1. `f1` · High · correctness: Off by one" in report
+
+
+def test_headline_of_a_refresh(make) -> None:
+    refresh = view(make, [], verdict="clean", scope="carry_over", since_sha=SHA)
+    assert render.verdict_headline(refresh) == (
+        "**Verdict: clean** · `aaaaaaa` · updated for `/msreview` commands"
+    )
+    older = view(make, [], verdict="clean", scope="carry_over", since_sha="b" * 40)
+    assert render.verdict_headline(older).endswith("no reviewable changes since `bbbbbbb`")
+
+
+def test_readiness_line(make) -> None:
+    low = ff(id="f1", severity="low")
+    ready = view(make, [low], ready=True, blocking=0)
+    assert render.readiness_line(ready) == (
+        "**Ready to merge:** no open findings at medium severity or above "
+        "(1 less severe finding still open)."
+    )
+    assert render.readiness_line(view(make, [], ready=True, verdict="clean")) == (
+        "**Ready to merge:** no open findings at medium severity or above."
+    )
+    blocked = view(make, [ff(), ff(id="f2")], ready=False, blocking=2)
+    assert render.readiness_line(blocked) == (
+        "**Not ready to merge:** 2 open findings at medium severity or above."
+    )
+    one = view(make, [ff()], ready=False, blocking=1, blocking_severity="critical")
+    assert render.readiness_line(one) == "**Not ready to merge:** 1 open critical finding."
+    every = view(make, [], ready=True, blocking_severity="low", verdict="clean")
+    assert render.readiness_line(every) == "**Ready to merge:** no open findings."
+    incomplete = view(make, [], ready=False, verdict="incomplete")
+    assert render.readiness_line(incomplete) == (
+        "**Not ready to merge:** the review is incomplete (see below)."
+    )
+    assert render.readiness_line(view(make, [])) == ""  # unknown: no line
+    text = render.summary(blocked)
+    assert text.split("\n")[2:4] == [
+        "**Verdict: 2 open findings (2 high)** · `aaaaaaa` · full review",
+        "**Not ready to merge:** 2 open findings at medium severity or above.",
+    ]
+
+
+def test_footer_says_how_to_dismiss(make) -> None:
+    text = render.summary(view(make, [ff()]))
+    assert text.endswith(
+        "To dismiss a finding, resolve its thread or comment "
+        "`/msreview dismiss <id> <reason>` (anyone with write access).</sub>"
+    )
+    strict = render.summary(view(make, [ff()], author_may_dismiss=False))
+    assert strict.endswith("(anyone with write access except the PR author).</sub>")
 
 
 def test_reasons_for_findings_and_clean_verdicts(make) -> None:
@@ -239,7 +320,7 @@ def test_reasons_for_findings_and_clean_verdicts(make) -> None:
     assert "Notes on" not in render.summary(view(make, verdict="clean"))
 
 
-def test_report_other_findings_match_their_detail_lines(make) -> None:
+def test_report_open_findings_match_their_detail_lines(make) -> None:
     findings = [
         ff(id="f1"),
         ff(id="f2", anchor="outside", line=None, path="x.py", state="summary_only"),
@@ -251,13 +332,14 @@ def test_report_other_findings_match_their_detail_lines(make) -> None:
         execution_id="msreview-x", run_label="cli:1", roles=None, usage={}, cost_usd=0.25
     )
     text = render.report(view(make, findings, details=details), lambda _path: None)
-    other = text.split(render.OTHER_HEADING, 1)[1].split("\n\n#### ", 1)[0]
-    rows = [ln for ln in other.split("\n") if ln.startswith("| ") and "Severity" not in ln]
+    table = text.split(render.OPEN_HEADING, 1)[1].split("\n\n", 2)[1]
+    rows = table.split("\n")[2:]
     assert [r.rsplit(" | ", 1)[1] for r in rows] == [
-        "outside this PR's changed files |",
-        "in a changed file, not on a changed line |",
-        "on a changed line, below the inline threshold (medium) |",
-        "on a changed line, below the inline threshold (medium) |",
+        "new |",
+        "new · no inline comment: outside this PR's changed files |",
+        "new · no inline comment: in a changed file, not on a changed line |",
+        "new · no inline comment: on a changed line, below the inline threshold (medium) |",
+        "new · no inline comment: on a changed line, below the inline threshold (medium) |",
     ]
     # Each row's location words open the finding's detail line too.
     assert "`x.py` · outside this PR's changed files" in text

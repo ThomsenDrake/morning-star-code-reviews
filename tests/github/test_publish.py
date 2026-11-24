@@ -267,7 +267,7 @@ async def test_resolve_forbidden_falls_back_to_minimize(fake: FakeGitHub, tmp_pa
         fake.thread_id_of(old["f0000000000f2"]["id"]),
     }
     assert all(f.state == "fixed" for f in state.findings)
-    assert fake.pr_labels == ["msreview: clean"]
+    assert fake.pr_labels == ["msreview: ready to merge"]
     # A retry neither replies nor minimizes twice.
     before = fake.snapshot()
     await run(fake, tmp_path, snap, final)
@@ -305,10 +305,31 @@ async def test_minimize_failure_is_recorded_once(fake: FakeGitHub, tmp_path: Pat
 
 
 async def test_label_hygiene(fake: FakeGitHub, tmp_path: Path) -> None:
-    fake.pr_labels = ["msreview: clean", "msreview: incomplete", "bug"]
+    # The pre-0.3.0 "msreview: clean" label goes too.
+    fake.pr_labels = ["msreview: clean", "msreview: ready to merge", "msreview: incomplete", "bug"]
     fake.repo_labels = {n: {"name": n} for n in fake.pr_labels}
     await run(fake, tmp_path, make_snap(tmp_path), standard_final())
     assert sorted(fake.pr_labels) == ["bug", "msreview: findings"]
+
+
+@pytest.mark.parametrize(
+    ("severity", "label"),
+    [
+        ("high", "msreview: findings"),
+        ("medium", "msreview: findings"),
+        ("low", "msreview: ready to merge"),
+    ],
+)
+async def test_label_says_whether_the_pr_is_ready_to_merge(
+    fake: FakeGitHub, tmp_path: Path, severity: str, label: str
+) -> None:
+    # Open findings below the blocking severity (medium) do not keep a PR from merging.
+    final = make_final([final_finding("f00000000000a", 12, severity=severity)])
+    outcome = await run(fake, tmp_path, make_snap(tmp_path), final)
+    assert fake.pr_labels == [label]
+    assert outcome.verdict == "findings" and outcome.ready is (severity == "low")
+    spec = LABEL_SPECS[label]
+    assert fake.repo_labels[label]["color"] == spec[0]
 
 
 async def test_label_failure_is_a_note(fake: FakeGitHub, tmp_path: Path) -> None:
@@ -320,7 +341,7 @@ async def test_label_failure_is_a_note(fake: FakeGitHub, tmp_path: Path) -> None
     fake.rules.append(deny_labels)
     outcome = await run(fake, tmp_path, make_snap(tmp_path), standard_final())
     assert outcome.status == "posted"
-    assert any("verdict label" in n for n in outcome.notes)
+    assert any("status label" in n for n in outcome.notes)
 
 
 async def test_labels_disabled(fake: FakeGitHub, tmp_path: Path) -> None:

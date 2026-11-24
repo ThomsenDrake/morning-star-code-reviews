@@ -17,7 +17,7 @@ macOS or Linux.
 ```bash
 uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews
 # or a specific release:
-uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.2.0
+uv tool install git+https://github.com/ThomsenDrake/morning-star-code-reviews@v0.3.0
 
 msreview setup      # only for local reviews
 ```
@@ -144,7 +144,7 @@ The values are kept in memory only, and are dropped after use.
    example:
 
    ```
-   you/repo1: enabled: secrets and variable set; workflow v0.2.0: committed 1a2b3c4 to main
+   you/repo1: enabled: secrets and variable set; workflow v0.3.0: committed 1a2b3c4 to main
      the existing secret MISTRAL_API_KEY is left untouched (msreview uses MSREVIEW_MISTRAL_API_KEY)
    ```
 
@@ -194,11 +194,12 @@ For each repository, it shows:
   the variable `MSREVIEW_APP_CLIENT_ID` exist. GitHub returns only the names of
   secrets: no one can read their values back. `unknown` means that your login cannot
   list them;
-- the conclusion and the date of the last run of the workflow.
+- the conclusion and the date of the last review run of the workflow (runs that PR
+  comments start are not counted).
 
 ```
 you/repo1
-  workflow  v0.2.0 (1a2b3c4), preset balanced
+  workflow  v0.3.0 (1a2b3c4), preset balanced
   secrets   MSREVIEW_MISTRAL_API_KEY set, MSREVIEW_APP_PRIVATE_KEY set
   variable  MSREVIEW_APP_CLIENT_ID set
   last run  success (2026-11-21)
@@ -217,9 +218,15 @@ you/repo2
   hint      the workflow uses the secret MISTRAL_API_KEY (the 0.1.x name); to move to MSREVIEW_MISTRAL_API_KEY, run `msreview enable you/repo2 --secrets-only`, then `msreview update you/repo2 --force` (it re-renders the file)
 ```
 
+A workflow file from before 0.3.0 does not run on PR comments, so `/msreview dismiss`
+takes effect only at the next review. Status adds a `hint` line for it too:
+`` the workflow does not run on comments, so `/msreview dismiss` takes effect at the
+next review only; `msreview update you/repo3 --force` adds it (it re-renders the file) ``.
+
 `--json` prints the same information as a JSON list (`legacy_secret` is
-`"MISTRAL_API_KEY"` for such a repository, else `null`). The exit code is 1 when a
-repository could not be read.
+`"MISTRAL_API_KEY"` for such a repository, else `null`; `workflow.commands` says
+whether the workflow runs on comments). The exit code is 1 when a repository could
+not be read.
 
 ### `msreview update`
 
@@ -246,6 +253,9 @@ installed msreview). A named repository without the workflow file fails: use
   `msreview update OWNER/REPO --force`. If you pass `--force` while
   `MSREVIEW_MISTRAL_API_KEY` is not set, msreview still writes the file and warns that
   reviews fail until you set it. msreview does not delete the old `MISTRAL_API_KEY`.
+- A workflow from before 0.3.0 has no `issue_comment` trigger. Without `--force` it
+  keeps it that way (the review works; `/msreview dismiss` takes effect at the next
+  review), and msreview prints a hint. `--force` adds the trigger.
 
 The change is committed to the default branch with the message "Update Morning Star
 Code Review to vX.Y.Z", or with `--pr` through a pull request from the branch
@@ -317,7 +327,7 @@ Flags:
 | `--trust-repo-config` | Let the repository file choose models, budgets, exclusions and instructions (see [configuration.md](configuration.md#untrusted-repository-files-cli)) |
 | `--read-token env\|gh\|none` | Read-only GitHub token, used when there is no App token: `env` uses `GITHUB_TOKEN` or `GH_TOKEN`, `gh` runs `gh auth token`, `none` uses no token |
 | `--fail-on LEVEL` | `never`, `findings`, `high` or `critical`: exit 3 when the open findings reach this level (possible issues that the verifier could not confirm do not count) |
-| `--no-labels`, `--no-suggestions` | Do not set verdict labels, or do not post suggestion blocks |
+| `--no-labels`, `--no-suggestions` | Do not set status labels, or do not post suggestion blocks |
 | `--local` | Run the workflow in this process, without starting a Workflows worker (for development and debugging) |
 | `--verbose` | More log output on stderr |
 | `--telemetry` | Turn on the SDK telemetry for this run (off by default) |
@@ -435,7 +445,7 @@ fail_on = "never"          # never | findings | high | critical
 allowed_models = ["zai-glm-5-3", "mistral-large-4", "zai-glm-5-3-flash", "deepseek-v4-1-flash-1017"]
 
 [agent]
-python = "~/.cache/morning-star-review/agent-0.2.0/bin/python"   # MSREVIEW_AGENT_PYTHON
+python = "~/.cache/morning-star-review/agent-0.3.0/bin/python"   # MSREVIEW_AGENT_PYTHON
 ```
 
 The order for the Mistral key is: `MSREVIEW_MISTRAL_API_KEY_COMMAND`, then

@@ -62,6 +62,8 @@ is usually lower.
   the verifier is on), and the rest shared equally by the explorers. An agent that reaches
   its share stops early, and the summary says so.
 - Budgets for tool calls and time limit each agent (see [configuration.md](configuration.md#budgets)).
+- A `/msreview dismiss` comment re-publishes the review of the current head without
+  calling a model: it costs a short worker run and some runner time, no tokens.
 - A head commit that was already reviewed with the same configuration is skipped
   before any worker starts. Later pushes are reviewed **incrementally**: only the files
   changed since the last reviewed commit. A push without reviewable changes carries the
@@ -283,6 +285,9 @@ first line of the report says why it was not posted:
 - **draft:** enable `review.drafts` or the input `review-drafts`, or use `--force`.
 - **closed:** use `--force` in the CLI to review a closed PR anyway.
 - **superseded:** the PR head moved on after the run was triggered.
+- **no review yet** (a `/msreview dismiss` comment): the current head commit has not
+  been reviewed, for example because its review is still running or failed. Nothing is
+  lost: the next review reads every command on the PR and applies it.
 - **The job shows as skipped for a fork PR:** this is expected with the standard
   workflow. See [Pull requests from forks](security.md#pull-requests-from-forks).
 - **The fork review fails at "Check that the label was added by someone with write
@@ -307,6 +312,26 @@ coverage. See [models.md](models.md#how-ensemble-results-are-published).
 
 If a run fails after it has started, the existing summary comment gets a notice that
 the latest run did not finish. The label becomes `msreview: incomplete`.
+
+### A dismiss command did nothing
+
+The summary lists commands that did nothing under "Commands that did nothing", with
+the reason:
+
+- **"only people with write access can dismiss findings"**: the commenter has read or
+  triage access, or none. With `review.author_may_dismiss: false`, the PR author cannot
+  dismiss either.
+- **"this pull request has no such finding"**: a typo in the id, or the id of a
+  possible issue (possible issues have no id and do not block merging).
+- **"the finding is already fixed"**: nothing to dismiss.
+- **"names no finding id"**: the line has no id. Write
+  `/msreview dismiss f0123456789ab <reason>`, at the start of a line and not inside a
+  code block or a quote.
+
+If no run started at all, the comment did not contain `/msreview dismiss`, or its author
+is not an owner, member or collaborator of the repository, or the workflow is from
+before 0.3.0 (`msreview status` says so; `msreview update OWNER/REPO --force` adds the
+comment trigger). The next review applies the command anyway.
 
 ### Other messages
 
@@ -333,8 +358,12 @@ the latest run did not finish. The label becomes `msreview: incomplete`.
   `timeout-minutes: 50`.
 - **"N finding(s) could not be placed on the diff"**: GitHub refused those
   comment positions. The findings are in the summary.
-- **Threads of fixed findings stay open:** this is expected. See
+- **Threads of fixed or dismissed findings stay open:** this is expected. See
   [setup-github-app.md](setup-github-app.md#why-not-contents-write).
+- **Many skipped runs of the review workflow:** every PR comment starts a run, because
+  GitHub cannot filter `issue_comment` events by text. The job is skipped unless the
+  comment holds `/msreview dismiss` by an owner, member or collaborator, and a skipped
+  job uses no runner minutes.
 - **No labels appear:** the App needs Issues: write, and `labels` must be on in both
   the input and the repository file.
 - **HTTP 429 from the models:** expected in workspaces with low limits. The agents

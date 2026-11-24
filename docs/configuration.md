@@ -85,9 +85,10 @@ too. When you run `msreview review` without `--trust-repo-config`, the repositor
 `preset`, `models`, `reasoning_effort`, `ensemble`, `verify` and `budgets` are
 **ignored**, and the summary lists them. A repository that you do not control cannot
 choose your models or spend your money. The settings that could steer or empty the
-review are ignored too: `exclude`, `review.instructions`, `review.path_instructions`
-and `review.inline_min_severity` (a foreign file could otherwise exclude every file or
-tell the explorer to report nothing). Settings that can only reduce output (labels,
+review are ignored too: `exclude`, `review.instructions`, `review.path_instructions`,
+`review.inline_min_severity` and `review.blocking_severity` (a foreign file could
+otherwise exclude every file, tell the explorer to report nothing, or call every PR
+ready to merge). Settings that can only reduce output (labels,
 suggestions, drafts and so on) still apply. In the Action, the file is always trusted,
 because the repository's own maintainers control the base branch.
 
@@ -131,7 +132,8 @@ review:
   incremental: true              # review only what changed since the last reviewed commit
   inline_min_severity: medium    # critical | high | medium | low: lowest severity posted inline
   max_inline_comments: 15        # 0-25 new inline comments per review
-  author_may_dismiss: true       # may the PR author dismiss findings by resolving threads?
+  author_may_dismiss: true       # may the PR author dismiss findings (thread or command)?
+  blocking_severity: medium      # open findings at or above this keep a PR from "ready to merge"
   instructions: |                # up to 8 KB of guidance for the agents
     Money is stored as integer cents; flag float arithmetic on amounts.
   path_instructions:             # up to 30 entries, each text up to 1 KB
@@ -145,7 +147,7 @@ exclude:                         # up to 100 extra globs to skip
 summary:
   show_usage: true               # the "Run details" block (models, tokens, cost)
 
-labels: true                     # keep one msreview: clean | findings | incomplete label
+labels: true                     # keep one msreview: ready to merge | findings | incomplete label
 suggestions: true                # validated suggestion blocks in inline comments
 
 context:
@@ -167,12 +169,13 @@ context:
 | `review.incremental` | bool | `true` | When `false`, every push is reviewed in full |
 | `review.inline_min_severity` | `critical` \| `high` \| `medium` \| `low` | `medium` | Findings below this severity are listed only in the summary |
 | `review.max_inline_comments` | 0-25 | 15 | Extra findings are listed in the summary |
-| `review.author_may_dismiss` | bool | `true` | If `false`, only other people with write access can dismiss |
+| `review.author_may_dismiss` | bool | `true` | Dismissing (resolving a thread, or `/msreview dismiss`) needs write access. If `false`, the PR author cannot dismiss even with write access |
+| `review.blocking_severity` | `critical` \| `high` \| `medium` \| `low` | `medium` | The PR is ready to merge when the review is complete and no open finding is at or above this severity. Changes only the label and the readiness line, never what is reviewed |
 | `review.instructions` | text, max 8,192 chars | empty | Given to the agents as repository guidance (never as instructions that override the review rules) |
 | `review.path_instructions` | max 30 × `{path: glob, instructions: max 1,024 chars}` | empty | |
 | `exclude` | max 100 globs | empty | Gitignore-like: `*` stays within one path segment, `**` crosses segments, a pattern without `/` matches at any depth, and a trailing `/` matches a directory |
 | `summary.show_usage` | bool | `true` | Turn off to hide models, tokens and cost in public repositories |
-| `labels` | bool | `true` | |
+| `labels` | bool | `true` | One label per PR: `msreview: ready to merge`, `msreview: findings` (open findings at or above `review.blocking_severity`) or `msreview: incomplete` |
 | `suggestions` | bool | `true` | |
 | `context.related_definitions` | bool | `true` | Adds the definitions of functions called on added lines, so the agents can check call sites |
 
@@ -259,12 +262,12 @@ All inputs are strings. Boolean inputs accept `true`/`false` (also `1`/`0`, `yes
 | `verifier-minutes` | empty (8) | Minutes for the verifier |
 | `allowed-models` | the four supported models | Comma-separated models that the run may use |
 | `review-drafts` | `false` | Review draft pull requests |
-| `labels` | `true` | Keep one verdict label on the PR. Needs Issues: write on the App; set `"false"` if the App does not have it |
+| `labels` | `true` | Keep one status label on the PR (`msreview: ready to merge`, `findings` or `incomplete`). Needs Issues: write on the App; set `"false"` if the App does not have it |
 | `suggestions` | `true` | Add validated suggestion blocks to inline comments |
 | `fail-on` | `never` | `never`, `findings`, `high` or `critical`: fail the step (exit code 3) when open findings reach this level. Possible issues (not confirmed) do not count |
 | `deadline-minutes` | `90` | Overall time limit in minutes (20 to 300). The run winds down 15 minutes before it and still posts what it has. With verification, the verifier may start until then, and the explorers stop earlier (25.5 minutes before it) so that it can. Keep the job's `timeout-minutes` about 20 above it (110 in the examples). See [operations.md](operations.md#rate-limits-and-the-time-limit) |
 | `telemetry` | `false` | Turn on the Workflows and Agents SDK telemetry (see [operations.md](operations.md#telemetry)) |
-| `pr-url` | empty | The pull request to review. Empty means the PR that triggered the run |
+| `pr-url` | empty | The pull request to review. Empty means the PR that triggered the run (on `issue_comment`, the PR that was commented on) |
 | `expected-head-sha` | empty | Review only this head commit, and skip if the PR has moved on. Empty means the event's head SHA, when the run reviews the triggering PR |
 | `remove-label` | empty | A label to remove after the run (the publish step removes it). The fork template passes `msreview: safe-to-review` |
 
@@ -274,9 +277,15 @@ All inputs are strings. Boolean inputs accept `true`/`false` (also `1`/`0`, `yes
 |---|---|
 | `status` | `posted`, `report`, `skipped`, `superseded` or `failed` |
 | `verdict` | `clean`, `findings` or `incomplete` (empty when skipped before a review) |
+| `ready` | `true` or `false`: ready to merge (a complete review, and no open finding at or above `review.blocking_severity`). Empty when no review was produced |
 | `findings` | Number of open findings. Possible issues that the verifier could not confirm do not count |
 | `execution-id` | The Mistral Workflows execution id |
 | `report-path` | Path of `report.md` on the runner |
+
+On an `issue_comment` event (a `/msreview dismiss` comment), the Action does not review
+the PR again: it re-publishes the review of the current head with the commands
+applied, and no model runs. If the head has no review yet, it is skipped (`status`
+`skipped`), and the next review applies the commands.
 
 The review's Markdown report is also written to the job's step summary. The three
 report files (`report.md`, `findings.json`, `run.json`) are uploaded as the artifact

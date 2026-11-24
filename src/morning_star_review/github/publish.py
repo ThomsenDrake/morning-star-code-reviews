@@ -32,7 +32,7 @@ from morning_star_review.core.runctx import RunContext
 from morning_star_review.core.sanitize import code_span, sanitize_inline, strip_markers
 from morning_star_review.github import graphql
 from morning_star_review.github.http import GitHubGraphQLError, GitHubHttp, GitHubLasting
-from morning_star_review.github.labels import set_verdict_label
+from morning_star_review.github.labels import set_status_label, status_of
 from morning_star_review.github.state import (
     SUMMARY_MARKER,
     encode_state,
@@ -99,6 +99,10 @@ SKIP_REASONS: dict[str, str] = {
     "superseded": "Skipped: the pull request has a newer head commit than this run expected.",
     "already_reviewed": (
         "Skipped: this head commit was already reviewed with the same configuration."
+    ),
+    "not_reviewed": (
+        "Skipped: the current head commit has no review yet; /msreview commands apply "
+        "when it is reviewed."
     ),
 }
 
@@ -184,6 +188,7 @@ def report_outcome(
             "status": status,
             "reason": _cap(reason, 1000),
             "verdict": final.verdict,
+            "ready": final.ready,
             "pr_url": req.pr_url,
             "head_sha": snap.head_sha,
             "execution_id": execution_id or _execution_id(snap),
@@ -289,16 +294,22 @@ def summary_body(summary_md: str, unplaced: list[FinalFinding], state: PriorStat
     return f"{text}\n{state_marker}"
 
 
-def reply_body(finding_id: str, action: str, head_sha: str) -> str:
+def reply_body(
+    finding_id: str, action: str, head_sha: str, *, by: str | None = None, reason: str | None = None
+) -> str:
+    """Our reply on the thread of a prior that this run fixed or dismissed."""
     if action == "file_deleted":
         text = "File removed."
+    elif action == "dismissed":
+        who = f" by {sanitize_inline(by, 100)}" if by else ""
+        why = f": {sanitize_inline(reason, 200)}" if reason and reason.strip() else ""
+        text = f"Dismissed{who}{why}."
     else:
         text = f"Looks addressed in `{head_sha[:7]}`: the flagged code changed."
     return f"{text}\n{reply_marker(finding_id)}"
 
 
-RESOLVED_HEADING = "#### Resolved since the last review"
-UNCLOSED_SUFFIX = "; the thread could not be closed automatically"
+UNCLOSED_SUFFIX = "; thread hidden, not resolved"
 UNCLOSED_NOTE = (
     "<sub>GitHub did not let this app resolve the threads marked above, so it replied to "
     "each and hid the comment as resolved instead. You can resolve them by hand.</sub>"
@@ -306,43 +317,47 @@ UNCLOSED_NOTE = (
 _FOOTER_START = "<sub>Automated review"
 
 
-def _resolved_line(rp: ResolvedPrior) -> str:
-    """The line ``review.render`` writes for ``rp`` under ``RESOLVED_HEADING``."""
-    why = "file deleted" if rp.action == "file_deleted" else "code changed"
-    return f"- {sanitize_inline(rp.title, 200)} ({code_span(strip_markers(rp.path))}): {why}"
+def _closed_row(rp: ResolvedPrior) -> str:
+    """A line for a closed prior whose row the (shortened) summary does not have."""
+    return f"- {sanitize_inline(rp.title, 200)} ({code_span(strip_markers(rp.path))})"
 
 
 def with_unclosed_notes(summary_md: str, unclosed: Sequence[ResolvedPrior]) -> str:
-    """``summary_md`` noting, under "Resolved since the last review", each fixed prior
+    """``summary_md`` noting, in the record of fixed and dismissed findings, each prior
     whose thread could not be resolved (closed by reply + minimize instead).
 
-    The rendered line of each prior gets ``UNCLOSED_SUFFIX``; a prior without a line
-    (a shortened summary) gets one; ``UNCLOSED_NOTE`` closes the section.
+    The row of each such prior gets ``UNCLOSED_SUFFIX`` in its last cell and
+    ``UNCLOSED_NOTE`` follows the table. A prior without a row (a shortened summary)
+    is listed before the footer instead.
     """
+    from morning_star_review.review.render import CLOSED_SUMMARY  # lazy, as above
+
     if not unclosed:
         return summary_md
     lines = summary_md.split("\n")
+    opening = f"<details><summary>{CLOSED_SUMMARY} ("
+    start = next((i for i, ln in enumerate(lines) if ln.startswith(opening)), None)
+    end = None
+    if start is not None:
+        end = next((i for i in range(start, len(lines)) if lines[i] == "</details>"), None)
     missing: list[str] = []
     for rp in unclosed:
-        want = _resolved_line(rp)
-        for i, line in enumerate(lines):
-            if line == want:
-                lines[i] = want + UNCLOSED_SUFFIX
+        span = code_span(rp.id)
+        rows = range(start, end) if start is not None and end is not None else range(0)
+        for i in rows:
+            if lines[i].startswith(f"| {span} |") and lines[i].endswith(" |"):
+                lines[i] = lines[i][: -len(" |")] + UNCLOSED_SUFFIX + " |"
                 break
         else:
-            missing.append(want + UNCLOSED_SUFFIX)
-    addition = [*missing, "", UNCLOSED_NOTE]
-    if RESOLVED_HEADING in lines:
-        end = lines.index(RESOLVED_HEADING) + 2
-        while end < len(lines) and lines[end].strip():
-            end += 1
-        lines[end:end] = addition
-        return "\n".join(lines)
-    section = [RESOLVED_HEADING, "", *addition, ""]
-    footer = next((i for i, ln in enumerate(lines) if ln.startswith(_FOOTER_START)), None)
-    if footer is None:
-        return "\n".join([*lines, "", *section]).rstrip()
-    lines[footer:footer] = section
+            missing.append(_closed_row(rp) + UNCLOSED_SUFFIX)
+    if start is not None and end is not None and not missing:
+        lines[end:end] = [UNCLOSED_NOTE, ""]
+    if missing:  # the note goes once, after these lines
+        section = [*missing, "", UNCLOSED_NOTE, ""]
+        footer = next((i for i, ln in enumerate(lines) if ln.startswith(_FOOTER_START)), None)
+        if footer is None:
+            return "\n".join([*lines, "", *section]).rstrip()
+        lines[footer:footer] = section
     return "\n".join(lines)
 
 
@@ -392,8 +407,9 @@ def _updated_state(
     """``state`` with posted comment ids, unplaced findings and fallback-closed priors.
 
     Priors in ``fixed`` (closed by reply + minimize because the thread could not be
-    resolved) are recorded with state ``fixed``, so a later run never touches them
-    again. Open findings keep priority for the 60 entries the state holds.
+    resolved) are recorded as closed (``fixed``, or ``dismissed`` when finalize
+    recorded them so), so a later run never touches them again. Open findings keep
+    priority for the 60 entries the state holds.
     """
     findings: list[dict[str, Any]] = []
     for f in state.findings:
@@ -406,8 +422,10 @@ def _updated_state(
     listed = {d["id"]: d for d in findings}
     for fid, pf in fixed.items():
         if fid in listed:
-            if listed[fid]["state"] != "open":
-                listed[fid].update(state="fixed", comment_id=pf.comment_id, thread_id=pf.thread_id)
+            entry = listed[fid]
+            if entry["state"] != "open":
+                closed = entry["state"] if entry["state"] in ("fixed", "dismissed") else "fixed"
+                entry.update(state=closed, comment_id=pf.comment_id, thread_id=pf.thread_id)
         elif len(findings) < _MAX_STATE_FINDINGS:
             findings.append({**pf.model_dump(mode="json"), **_LIVE_FIELDS, "state": "fixed"})
     data = state.model_dump(mode="json")
@@ -480,16 +498,29 @@ async def _post_singly(
 
 @dataclass
 class _FixedPrior:
-    """A prior whose code changed or whose file was deleted, with an open thread."""
+    """A prior with an open thread whose code changed, whose file was deleted, or that
+    was dismissed without resolving its thread (a ``/msreview dismiss`` command)."""
 
     resolved: ResolvedPrior
     finding: PriorFinding
     # An earlier run already replied and minimized (its thread is in refused_resolves).
     done_before: bool = False
+    dismissed_by: str | None = None
+    dismiss_reason: str | None = None
+
+    def reply(self, head_sha: str) -> str:
+        rp = self.resolved
+        return reply_body(
+            rp.id, rp.action, head_sha, by=self.dismissed_by, reason=self.dismiss_reason
+        )
+
+
+_CLOSING = ("resolve", "file_deleted", "dismissed")
 
 
 def _fixed_priors(snap: PrSnapshot, final: FinalReview, comments: list[Any]) -> list[_FixedPrior]:
-    """The fixed priors whose threads this run closes (or an earlier run closed).
+    """The priors whose threads this run closes (or an earlier run closed): fixed ones,
+    and ones dismissed in this run while their thread is still open.
 
     A prior whose inline comment is gone (deleted) has nothing left to close.
     """
@@ -497,19 +528,22 @@ def _fixed_priors(snap: PrSnapshot, final: FinalReview, comments: list[Any]) -> 
     if prior is None:
         return []
     by_id = {f.id: f for f in prior.findings}
+    recorded = {f.id: f for f in final.state.findings}
     earlier_refused = set(prior.refused_resolves)
     present = {int(c["id"]) for c in comments if isinstance(c, dict) and c.get("id")}
     out: list[_FixedPrior] = []
     for rp in final.priors:
         pf = by_id.get(rp.id)
-        if rp.action not in ("resolve", "file_deleted") or pf is None or pf.comment_id is None:
+        if rp.action not in _CLOSING or pf is None or pf.comment_id is None:
             continue
-        if pf.state == "fixed" or pf.thread_resolved:
+        if pf.state in ("fixed", "dismissed") or pf.thread_resolved:
             continue
+        entry = recorded.get(rp.id)
+        who = (entry.dismissed_by, entry.dismiss_reason) if entry else (None, None)
         if pf.thread_id and pf.thread_id in earlier_refused:
-            out.append(_FixedPrior(rp, pf, done_before=True))
+            out.append(_FixedPrior(rp, pf, True, *who))
         elif pf.comment_id in present:
-            out.append(_FixedPrior(rp, pf))
+            out.append(_FixedPrior(rp, pf, False, *who))
     return out
 
 
@@ -596,7 +630,7 @@ async def _reply_and_submit(
             variables = {
                 "reviewId": node_id,
                 "threadId": fp.finding.thread_id,
-                "body": reply_body(rp.id, rp.action, snap.head_sha),
+                "body": fp.reply(snap.head_sha),
             }
             try:
                 await gh.graphql(REPLY_MUTATION, variables)
@@ -623,7 +657,7 @@ async def _rest_reply(gh: GitHubHttp, snap: PrSnapshot, fp: _FixedPrior, out: _P
     rp = fp.resolved
     path = f"{_repo_path(snap)}/pulls/{snap.number}/comments/{fp.finding.comment_id}/replies"
     try:
-        await gh.post_json(path, {"body": reply_body(rp.id, rp.action, snap.head_sha)})
+        await gh.post_json(path, {"body": fp.reply(snap.head_sha)})
     except GitHubLasting as exc:
         if exc.status != 404:
             raise
@@ -632,7 +666,7 @@ async def _rest_reply(gh: GitHubHttp, snap: PrSnapshot, fp: _FixedPrior, out: _P
 
 @dataclass
 class _Closed:
-    """What ``_close_priors`` did to the threads of fixed priors."""
+    """What ``_close_priors`` did to the threads of fixed (or dismissed) priors."""
 
     # Priors closed without resolving the thread (reply + minimize), recorded as
     # ``fixed`` in the state so later runs leave them alone.
@@ -683,7 +717,7 @@ async def _close_priors(
         out.unclosed.append(rp)
     if out.unclosed:
         out.notes.append(
-            f"{len(out.unclosed)} thread(s) of fixed findings could not be resolved "
+            f"{len(out.unclosed)} thread(s) of fixed or dismissed findings could not be resolved "
             "automatically; replied and hid the comment as resolved instead"
         )
     if out.refused:
@@ -785,7 +819,8 @@ async def publish(
         summary_url = (created or {}).get("html_url")
 
     if snap.config.labels:
-        notes.extend(await set_verdict_label(gh, snap.owner, snap.repo, snap.number, final.verdict))
+        status = status_of(final.ready, final.blocking)
+        notes.extend(await set_status_label(gh, snap.owner, snap.repo, snap.number, status))
     if unplaced:
         notes.append(f"{len(unplaced)} finding(s) could not be placed on the diff")
 
@@ -802,6 +837,7 @@ async def publish(
         {
             "status": "posted",
             "verdict": final.verdict,
+            "ready": final.ready,
             "pr_url": req.pr_url,
             "head_sha": snap.head_sha,
             "execution_id": execution_id,
@@ -864,6 +900,6 @@ async def write_failure_header(
             if new != old and len(new) <= MAX_COMMENT_CHARS:
                 await gh.patch_json(f"{base}/issues/comments/{int(existing['id'])}", {"body": new})
         if snap.config.labels:
-            await set_verdict_label(gh, snap.owner, snap.repo, snap.number, "incomplete")
+            await set_status_label(gh, snap.owner, snap.repo, snap.number, "incomplete")
     except Exception as exc:  # report_failure must never raise
         log.warning("could not mark the failed run on the PR: %s", type(exc).__name__)

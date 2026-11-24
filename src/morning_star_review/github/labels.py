@@ -1,4 +1,9 @@
-"""Verdict labels (ADDENDUM C): one living ``msreview: <verdict>`` label per PR.
+"""Status labels (ADDENDUM C): one living ``msreview: <status>`` label per PR.
+
+The label says whether the PR is ready to merge: ``msreview: ready to merge`` (the
+review is complete and no open finding is at or above the blocking severity),
+``msreview: findings`` (open findings at or above it) or ``msreview: incomplete``.
+``msreview: clean`` (before 0.3.0) is removed where it is still set.
 
 Everything here is best effort: a failure returns a note for the outcome and never
 fails the run. Labels need the Issues: write permission.
@@ -7,9 +12,9 @@ fails the run. Labels need the Issues: write permission.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 from urllib.parse import quote
 
-from morning_star_review.core.contract import Verdict
 from morning_star_review.github.http import (
     GitHubGraphQLError,
     GitHubHttp,
@@ -20,29 +25,46 @@ from morning_star_review.github.http import (
 
 __all__ = [
     "LABEL_SPECS",
+    "LEGACY_LABELS",
     "SAFE_TO_REVIEW",
-    "VERDICT_LABELS",
+    "STATUS_LABELS",
+    "Status",
     "ensure_label",
     "remove_label",
-    "set_verdict_label",
+    "set_status_label",
+    "status_of",
 ]
 
 log = logging.getLogger(__name__)
 
-VERDICT_LABELS: dict[Verdict, str] = {
-    "clean": "msreview: clean",
+Status = Literal["ready", "findings", "incomplete"]
+
+STATUS_LABELS: dict[Status, str] = {
+    "ready": "msreview: ready to merge",
     "findings": "msreview: findings",
     "incomplete": "msreview: incomplete",
 }
+LEGACY_LABELS = ("msreview: clean",)  # removed wherever it is still set
 SAFE_TO_REVIEW = "msreview: safe-to-review"
 
 # name -> (color, description)
 LABEL_SPECS: dict[str, tuple[str, str]] = {
-    "msreview: clean": ("2DA44E", "Morning Star Code Review found no issues"),
-    "msreview: findings": ("D97706", "Morning Star Code Review reported findings"),
+    "msreview: ready to merge": (
+        "2DA44E",
+        "Morning Star Code Review: no open findings that block merging",
+    ),
+    "msreview: findings": ("D97706", "Morning Star Code Review: open findings to fix or dismiss"),
     "msreview: incomplete": ("6E7781", "Morning Star Code Review could not finish a full review"),
     SAFE_TO_REVIEW: ("0969DA", "Approve one Morning Star Code Review run for this head commit"),
 }
+
+
+def status_of(ready: bool, blocking: int) -> Status:
+    """The label status: ready, else findings when some block merging, else incomplete."""
+    if ready:
+        return "ready"
+    return "findings" if blocking else "incomplete"
+
 
 _GITHUB_ERRORS = (GitHubLasting, GitHubTransient, GitHubRateLimited, GitHubGraphQLError)
 
@@ -81,15 +103,15 @@ async def remove_label(gh: GitHubHttp, owner: str, repo: str, number: int, name:
     return await gh.delete(f"{_repo_path(owner, repo)}/issues/{number}/labels/{_name(name)}")
 
 
-async def set_verdict_label(
-    gh: GitHubHttp, owner: str, repo: str, number: int, verdict: Verdict
+async def set_status_label(
+    gh: GitHubHttp, owner: str, repo: str, number: int, status: Status
 ) -> list[str]:
-    """Put the ``verdict`` label on the PR and remove the other verdict labels.
+    """Put the ``status`` label on the PR and remove the other status labels.
 
     Returns notes describing what failed (empty on success). Never raises for
     GitHub errors.
     """
-    wanted = VERDICT_LABELS[verdict]
+    wanted = STATUS_LABELS[status]
     try:
         present = await current_labels(gh, owner, repo, number)
         if wanted not in present:
@@ -97,10 +119,10 @@ async def set_verdict_label(
             await gh.post_json(
                 f"{_repo_path(owner, repo)}/issues/{number}/labels", {"labels": [wanted]}
             )
-        for other in VERDICT_LABELS.values():
+        for other in (*STATUS_LABELS.values(), *LEGACY_LABELS):
             if other != wanted and other in present:
                 await remove_label(gh, owner, repo, number, other)
     except _GITHUB_ERRORS as exc:
-        log.warning("could not update the verdict label: %s", exc)
-        return [f"could not update the verdict label ({type(exc).__name__}: {exc})"[:300]]
+        log.warning("could not update the status label: %s", exc)
+        return [f"could not update the status label ({type(exc).__name__}: {exc})"[:300]]
     return []

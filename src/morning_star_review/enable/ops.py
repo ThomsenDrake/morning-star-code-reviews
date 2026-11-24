@@ -187,8 +187,10 @@ class Repo:
     # ------------------------------------------------------------------ runs
 
     def last_run(self, workflow_file: str) -> dict[str, Any] | None:
+        """The workflow's last review run (comment runs, mostly skipped, do not count)."""
         data = self.gh.api(
-            f"{self._base}/actions/workflows/{quote(workflow_file)}/runs?per_page=1",
+            f"{self._base}/actions/workflows/{quote(workflow_file)}/runs"
+            "?event=pull_request&per_page=1",
             allow_404=True,
         )
         runs = data.get("workflow_runs") if isinstance(data, dict) else None

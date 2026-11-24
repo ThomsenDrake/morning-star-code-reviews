@@ -119,6 +119,7 @@ class RepoReview(Contract):
     inline_min_severity: Severity = "medium"
     max_inline_comments: int = Field(default=15, ge=0, le=25)
     author_may_dismiss: bool = True
+    blocking_severity: Severity = "medium"
     instructions: str = Field(default="", max_length=8192)
     path_instructions: list[RepoPathInstruction] = Field(default_factory=list, max_length=30)
 
@@ -261,8 +262,9 @@ def _ignored_spend_settings(repo: RepoConfig) -> list[str]:
 
 # Untrusted repository settings that could steer or empty the review itself: skip every
 # file (exclude), tell the explorer what to report (instructions), or hide findings
-# (inline_min_severity). Ignored like the spend settings (security review CFG-2).
-_STEERING_REVIEW = ("instructions", "path_instructions", "inline_min_severity")
+# (inline_min_severity, blocking_severity). Ignored like the spend settings (security
+# review CFG-2).
+_STEERING_REVIEW = ("instructions", "path_instructions", "inline_min_severity", "blocking_severity")
 
 
 def _without_steering_settings(
@@ -604,6 +606,7 @@ def resolve(
         review_drafts=review.drafts or policy.review_drafts,
         incremental=review.incremental,
         author_may_dismiss=review.author_may_dismiss,
+        blocking_severity=review.blocking_severity,
         instructions=review.instructions,
         path_instructions=[(p.path, p.instructions) for p in review.path_instructions],
         exclude=exclude,

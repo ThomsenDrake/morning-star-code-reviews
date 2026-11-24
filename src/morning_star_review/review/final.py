@@ -7,13 +7,14 @@ called and nothing is read from the clock: the caller passes the review time.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 from typing import Any
 
 from morning_star_review.core.contract import (
     AnchorMap,
+    DismissCommand,
     DroppedCandidate,
     ExploreResult,
     FinalFinding,
@@ -27,8 +28,10 @@ from morning_star_review.core.contract import (
     ResolvedRoles,
     ReviewDraft,
     Role,
+    Severity,
     Usage,
     VerifyResult,
+    severity_at_least,
     usage_key,
 )
 from morning_star_review.diff.prepass import nothing_to_review, unreviewed_code
@@ -43,7 +46,12 @@ from morning_star_review.review.reconcile import (
     refound_priors,
     sources_from_draft,
 )
-from morning_star_review.review.verdict import Assessment, assess, is_possible
+from morning_star_review.review.verdict import (
+    Assessment,
+    assess,
+    counts_as_finding,
+    is_possible,
+)
 
 __all__ = [
     "STATE_VERSION",
@@ -52,6 +60,7 @@ __all__ = [
     "collect_usage",
     "finalize",
     "models_of",
+    "readiness",
 ]
 
 STATE_VERSION = 1
@@ -135,8 +144,14 @@ def _coverage(
 ) -> render.Coverage:
     reviewable = set(prep.reviewable_paths)
     if prep.scope == "carry_over":
-        # Nothing changed since a review that covered everything (or did not).
-        covered = reviewable if prior is not None and prior.complete else set()
+        # Nothing changed since a review that covered everything (or did not: then its
+        # state lists the files it did not open; a state before 0.3.0 does not).
+        if prior is not None and prior.complete:
+            covered = reviewable
+        elif prior is not None and prior.blockers:
+            covered = reviewable - set(prior.not_opened)
+        else:
+            covered = set()
     else:
         opened = {p for e in explores for p in e.opened_paths}
         covered = (set(prep.inlined_paths) | opened) & reviewable
@@ -157,6 +172,87 @@ def _state_evidence(f: FinalFinding, head: HeadText) -> str:
     return (text if text and text.strip() else f.evidence)[:300]
 
 
+_EXPLANATION_MAX, _FIX_MAX = 1000, 500  # PriorFinding limits
+
+
+def _open_entry(
+    f: FinalFinding, recorded: Mapping[str, PriorFinding], head: HeadText
+) -> PriorFinding:
+    """The state entry of an open finding, with the text a later summary shows."""
+    prior = recorded.get(f.id)
+    return PriorFinding(
+        id=f.id,
+        path=f.path,
+        line=f.line,
+        severity=f.severity,
+        title=f.title,
+        evidence=prior.evidence if f.carried and prior else _state_evidence(f, head),
+        comment_id=f.comment_id,
+        thread_id=f.thread_id,
+        state=f.state,
+        start_line=f.start_line,
+        category=f.category,
+        explanation=f.explanation[:_EXPLANATION_MAX],
+        fix=f.fix[:_FIX_MAX] if f.fix else None,
+    )
+
+
+def _closed(p: PriorFinding, **update: Any) -> PriorFinding:
+    """``p`` as a closed record: no texts, the given state and attribution."""
+    return p.model_copy(update={"explanation": "", "fix": None, **update})
+
+
+def _dismisser(p: PriorFinding) -> str | None:
+    return p.dismissed_by or p.resolved_by
+
+
+def _closed_entries(
+    snap: PrSnapshot,
+    priors: Sequence[ResolvedPrior],
+    repeats: Sequence[tuple[FinalFinding, PriorFinding]],
+    head: HeadText,
+) -> list[PriorFinding]:
+    """The PR's record of closed findings: dismissed ones first, then fixed ones,
+    each newest first, so the oldest fixed findings are dropped first when the state
+    is full. Findings fixed in earlier reviews are kept as recorded."""
+    prior = snap.prior
+    recorded = {p.id: p for p in prior.findings} if prior else {}
+    commands: dict[str, DismissCommand] = {c.id: c for c in snap.dismiss_commands}
+    dismissed: list[PriorFinding] = []
+    fixed: list[PriorFinding] = []
+    earlier: list[PriorFinding] = []
+    for r in priors:
+        p = recorded.get(r.id)
+        if p is None:
+            continue
+        if r.action == "dismissed" and p.state == "dismissed":
+            earlier.append(_closed(p))
+        elif r.action == "dismissed":
+            c = commands.get(r.id)
+            dismissed.append(
+                _closed(
+                    p,
+                    state="dismissed",
+                    dismissed_by=c.by if c else _dismisser(p),
+                    dismiss_reason=(c.reason or None) if c else None,
+                )
+            )
+        elif r.action in ("resolve", "file_deleted"):
+            fixed.append(_closed(p, state="fixed", fixed_in=snap.head_sha))
+    for f, same in repeats:
+        entry = _open_entry(f, {}, head)
+        dismissed.append(
+            _closed(
+                entry,
+                state="dismissed",
+                dismissed_by=_dismisser(same),
+                dismiss_reason=f"repeats {same.id}",
+            )
+        )
+    old_fixed = [_closed(p) for p in (prior.findings if prior else []) if p.state == "fixed"]
+    return [*dismissed, *earlier, *fixed, *old_fixed]
+
+
 def _state(
     snap: PrSnapshot,
     info: RunInfo,
@@ -164,6 +260,9 @@ def _state(
     findings: Sequence[FinalFinding],
     priors: Sequence[ResolvedPrior],
     head: HeadText,
+    repeats: Sequence[tuple[FinalFinding, PriorFinding]] = (),
+    scope: str = "full",
+    not_opened: Sequence[str] = (),
 ) -> PriorState:
     recorded = {p.id: p for p in snap.prior.findings} if snap.prior else {}
     items: list[PriorFinding] = []
@@ -172,40 +271,61 @@ def _state(
             # Not recorded: a later review would carry it as an open finding (the state
             # has no verification status), and possible issues never count as findings.
             continue
-        prior = recorded.get(f.id)
-        items.append(
-            PriorFinding(
-                id=f.id,
-                path=f.path,
-                line=f.line,
-                severity=f.severity,
-                title=f.title,
-                evidence=prior.evidence if f.carried and prior else _state_evidence(f, head),
-                comment_id=f.comment_id,
-                thread_id=f.thread_id,
-                state=f.state,
-            )
-        )
+        items.append(_open_entry(f, recorded, head))
     listed = {i.id for i in items}
-    for p in priors:
-        if p.action == "dismissed" and p.id in recorded and p.id not in listed:
-            items.append(recorded[p.id].model_copy(update={"state": "dismissed"}))
+    for entry in _closed_entries(snap, priors, repeats, head):
+        if entry.id not in listed:
+            listed.add(entry.id)
+            items.append(entry)
+    prior = snap.prior
+    # A carry-over (and a refresh) reviewed nothing new: the review it carries over
+    # still describes the version and configuration that made it.
+    carried = scope == "carry_over" and prior is not None
     return PriorState.model_validate(
         {
             "version": STATE_VERSION,
-            "tool_version": info.tool_version,
+            "tool_version": prior.tool_version if carried and prior else info.tool_version,
             "head_sha": snap.head_sha,
             "merge_base_sha": snap.merge_base_sha,
             # A "findings" review can be incomplete too: a later review must not rely on it.
             "complete": assessment.complete,
             "verdict": assessment.verdict,
-            "config_hash": snap.config.config_hash,
+            "config_hash": prior.config_hash if carried and prior else snap.config.config_hash,
             "reviewed_at": info.reviewed_at,
             "findings": items[:MAX_STATE_FINDINGS],
-            "summary_comment_id": snap.prior.summary_comment_id if snap.prior else None,
-            "refused_resolves": list(snap.prior.refused_resolves) if snap.prior else [],
+            "summary_comment_id": prior.summary_comment_id if prior else None,
+            "refused_resolves": list(prior.refused_resolves) if prior else [],
+            "blockers": list(assessment.blockers)[:20],
+            "not_opened": [p[:500] for p in not_opened][:100],
         }
     )
+
+
+def _command_notes(snap: PrSnapshot) -> list[str]:
+    """Why `/msreview dismiss` commands did nothing (unauthorised, unknown id, fixed)."""
+    recorded = {p.id: p for p in snap.prior.findings} if snap.prior else {}
+    notes = list(snap.ignored_commands)
+    for c in snap.dismiss_commands:
+        p = recorded.get(c.id)
+        if p is None:
+            notes.append(
+                f"dismiss command for {c.id} by {c.by}: this pull request has no such finding"
+            )
+        elif p.state == "fixed":
+            notes.append(f"dismiss command for {c.id} by {c.by}: the finding is already fixed")
+    return notes[:20]
+
+
+def readiness(
+    findings: Sequence[FinalFinding], complete: bool, blocking_severity: Severity
+) -> tuple[bool, int]:
+    """(ready to merge, open findings at or above ``blocking_severity``)."""
+    blocking = sum(
+        1
+        for f in findings
+        if counts_as_finding(f) and severity_at_least(f.severity, blocking_severity)
+    )
+    return complete and blocking == 0, blocking
 
 
 def _sources(
@@ -279,6 +399,7 @@ def finalize(
         renamed_from=anchors.renamed_from,
         bot_login=snap.bot_login,
         existing_paths={f.path for f in snap.files if f.status != "removed"},
+        commands=snap.dismiss_commands,
     )
     built = build_findings(
         sources,
@@ -313,6 +434,18 @@ def finalize(
         rate_limit_wait_seconds=info.rate_limit_wait_seconds,
     )
     verdict, reasons = assessment.verdict, assessment.reasons
+    ready, blocking = readiness(built.findings, assessment.complete, cfg.blocking_severity)
+    state = _state(
+        snap,
+        info,
+        assessment,
+        built.findings,
+        priors,
+        head,
+        built.repeats,
+        prep.scope,
+        coverage.not_opened,
+    )
     usage = collect_usage(all_explores, all_drafts, verify)
     cost = sum(u.cost_usd for u in usage.values())
     verify_counts: dict[str, int] = {}
@@ -353,6 +486,11 @@ def finalize(
         details=details if cfg.show_usage else None,
         over_cap=built.over_cap,
         author_may_dismiss=cfg.author_may_dismiss,
+        ready=ready,
+        blocking=blocking,
+        blocking_severity=cfg.blocking_severity,
+        closed=[f for f in state.findings if f.state in ("fixed", "dismissed")],
+        command_notes=_command_notes(snap),
     )
     return FinalReview(
         verdict=verdict,
@@ -361,9 +499,11 @@ def finalize(
         priors=priors[:60],
         summary_md=render.summary(view),
         report_md=render.report(view, head),
-        state=_state(snap, info, assessment, built.findings, priors, head),
+        state=state,
         usage=usage,
         cost_usd=cost,
         coverage=coverage.as_dict(),
         refuted=refuted[:60],
+        ready=ready,
+        blocking=blocking,
     )

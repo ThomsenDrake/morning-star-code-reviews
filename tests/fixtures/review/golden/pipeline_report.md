@@ -1,13 +1,16 @@
 ### Morning Star Code Review report
 **Verdict: 5 open findings (4 critical, 1 medium)** · 2 possible issues (not confirmed) · `aaaaaaa` · full review
+**Not ready to merge:** 5 open findings at medium severity or above.
 
-| Severity | Finding | Location | Status |
-|---|---|---|---|
-| Critical | Page slice off by one | [`ledger/service.py:14`](https://github.com/octo/ledger/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ledger/service.py#L14) | new |
-| Critical | Ownership check is inverted | [`ledger/service.py:18`](https://github.com/octo/ledger/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ledger/service.py#L18) | new |
-| Critical | prorate arguments are swapped | [`ledger/service.py:27`](https://github.com/octo/ledger/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ledger/service.py#L27) | new |
-| Critical | SQL built by string concatenation | [`ledger/service.py:23`](https://github.com/octo/ledger/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ledger/service.py#L23) | [still open](https://github.com/octo/ledger/pull/7#discussion_r103) |
-| Medium | Total ignores refunds | [`ledger/service.py:30`](https://github.com/octo/ledger/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ledger/service.py#L30) | [still open (resolved without a fix by drive-by)](https://github.com/octo/ledger/pull/7#discussion_r105) |
+#### Open findings
+
+| ID | Severity | Finding | Location | Status |
+|---|---|---|---|---|
+| `f96addfc28589` | Critical | Page slice off by one | [`ledger/service.py:14`](https://github.com/octo/ledger/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ledger/service.py#L14) | new |
+| `f93ebfca948b4` | Critical | Ownership check is inverted | [`ledger/service.py:18`](https://github.com/octo/ledger/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ledger/service.py#L18) | new |
+| `f09980c2acb07` | Critical | prorate arguments are swapped | [`ledger/service.py:27`](https://github.com/octo/ledger/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ledger/service.py#L27) | new |
+| `fec35660df683` | Critical | SQL built by string concatenation | [`ledger/service.py:23`](https://github.com/octo/ledger/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ledger/service.py#L23) | [still open](https://github.com/octo/ledger/pull/7#discussion_r103) |
+| `f83da676389d7` | Medium | Total ignores refunds | [`ledger/service.py:30`](https://github.com/octo/ledger/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ledger/service.py#L30) | [still open (resolved without a fix by drive-by)](https://github.com/octo/ledger/pull/7#discussion_r105) |
 
 #### Possible issues (not confirmed)
 
@@ -18,13 +21,17 @@ The verifier could neither confirm nor rule these out. Check them yourself.
 | Medium | prorate has no guard for zero total days | `ledger/money.py` | 1 explorer |
 | Low | Description is hard-coded | [`ledger/service.py:33`](https://github.com/octo/ledger/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/ledger/service.py#L33) | 1 explorer |
 
-#### Resolved since the last review
+<details><summary>Fixed and dismissed findings (1)</summary>
 
-- Old null check (`ledger/service.py`): code changed
+| ID | Severity | Finding | Location | Outcome |
+|---|---|---|---|---|
+| `f0000000000aa` | High | Old null check | `ledger/service.py:20` | fixed in `aaaaaaa` |
+
+</details>
 
 #### Findings in detail
 
-##### 1. Critical · correctness: Page slice off by one
+##### 1. `f96addfc28589` · Critical · correctness: Page slice off by one
 
 `ledger/service.py:14` · on a changed line · reported by zai-glm-5-3, mistral-large-4, deepseek-v4-1-flash-1017 · confirmed by the verifier
 
@@ -48,7 +55,7 @@ Code at head:
 16
 ```
 
-##### 2. Critical · security: Ownership check is inverted
+##### 2. `f93ebfca948b4` · Critical · security: Ownership check is inverted
 
 `ledger/service.py:18` · on a changed line · reported by zai-glm-5-3 · confirmed by the verifier
 
@@ -72,7 +79,7 @@ Code at head:
 20          return False
 ```
 
-##### 3. Critical · correctness: prorate arguments are swapped
+##### 3. `f09980c2acb07` · Critical · correctness: prorate arguments are swapped
 
 `ledger/service.py:27` · on a changed line · reported by mistral-large-4 · confirmed by the verifier
 
@@ -90,7 +97,7 @@ Code at head:
 29      def total(self, entries):
 ```
 
-##### 4. Critical · security: SQL built by string concatenation (unconfirmed)
+##### 4. `fec35660df683` · Critical · security: SQL built by string concatenation (unconfirmed)
 
 `ledger/service.py:23` · on a changed line · reported by zai-glm-5-3 · carried from the previous review · not confirmed by the verifier
 
@@ -108,7 +115,7 @@ Code at head:
 25
 ```
 
-##### 5. Medium · Total ignores refunds
+##### 5. `f83da676389d7` · Medium · Total ignores refunds
 
 `ledger/service.py:30` · on a changed line · carried from the previous review
 
@@ -122,7 +129,7 @@ Code at head:
 32      def describe(self):
 ```
 
-##### 6. Medium · reliability: prorate has no guard for zero total days (unconfirmed)
+##### 6. `fdb0811f5dc4f` · Medium · reliability: prorate has no guard for zero total days (unconfirmed)
 
 `ledger/money.py` · outside this PR's changed files · reported by deepseek-v4-1-flash-1017 · not confirmed by the verifier
 
@@ -130,7 +137,7 @@ Division by zero when total is 0.
 
 **Suggested fix:** Drop the + 1.
 
-##### 7. Low · other: Description is hard-coded (unconfirmed)
+##### 7. `f61b2f47261f0` · Low · other: Description is hard-coded (unconfirmed)
 
 `ledger/service.py:33` · in a changed file, not on a changed line · reported by mistral-large-4 · not confirmed by the verifier
 

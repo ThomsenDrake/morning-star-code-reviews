@@ -227,6 +227,7 @@ def _ci_results(
         values = {
             "status": outcome.status,
             "verdict": outcome.verdict or "",
+            "ready": "" if outcome.ready is None else str(outcome.ready).lower(),
             "findings": str(open_findings(outcome)),
             "execution-id": outcome.execution_id,
             "report-path": str(report_path) if report_path else "",

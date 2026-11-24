@@ -280,8 +280,11 @@ def _gaps(
 ) -> tuple[list[str], list[str]]:
     """(blockers, notes), each in plain language."""
     if scope == "carry_over":
-        # No model ran: completeness is inherited from the review being carried over.
+        # No model ran: completeness is inherited from the review being carried over,
+        # with its own reasons when its state recorded them (0.3.0 and later).
         if prior_state is None or not prior_state.complete or prior_state.verdict == "incomplete":
+            if prior_state is not None and prior_state.blockers:
+                return list(prior_state.blockers), []
             return ["the previous review was incomplete and no reviewable file changed since"], []
         return [], []
     if (

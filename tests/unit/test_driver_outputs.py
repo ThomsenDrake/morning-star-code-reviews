@@ -316,13 +316,15 @@ def test_emit_published_writes_the_ci_results(
     stop = outputs.StopCommands(stream=io.StringIO())
     stop.start()
     env = {"GITHUB_OUTPUT": str(gh_out), "GITHUB_STEP_SUMMARY": str(summary)}
-    path = outputs.emit_published(outcome(), tmp_path / "report", env, run_dir=run_dir, stop=stop)
+    posted = outcome().model_copy(update={"ready": False})
+    path = outputs.emit_published(posted, tmp_path / "report", env, run_dir=run_dir, stop=stop)
     assert path == tmp_path / "report" / "report.md" and path.read_text() == "posted report\n"
     assert json.loads((tmp_path / "report" / "run.json").read_text())["status"] == "posted"
     lines = dict(line.split("=", 1) for line in gh_out.read_text().splitlines())
     assert lines == {
         "status": "posted",
         "verdict": "findings",
+        "ready": "false",
         "findings": "0",
         "execution-id": "msreview-ci-x-pr7-latest-0a0b0c0d",
         "report-path": str(path),

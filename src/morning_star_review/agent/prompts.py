@@ -122,13 +122,20 @@ review, and you should focus on them (read older code only as context). The
 current code and write one PRIOR line for it (fixed, still_open or unsure). Do not
 report a listed prior finding again as a new FINDING."""
 
+_DISMISSED = """\
+If a <dismissed_findings> block is present, the maintainers have looked at those
+findings and decided that they are not problems. Do not report any of them again: not
+in other words, not at another line and not with another severity. Write no PRIOR line
+for them."""
+
 
 def explorer_instructions(variant: Literal["full", "incremental"], max_tool_calls: int) -> str:
     """System prompt of the explorer."""
+    priors = _PRIORS_INCREMENTAL if variant == "incremental" else _PRIORS_FULL
     return _EXPLORER.format(
         tools=_TOOLS,
         untrusted=_UNTRUSTED,
-        priors=_PRIORS_INCREMENTAL if variant == "incremental" else _PRIORS_FULL,
+        priors=f"{priors}\n\n{_DISMISSED}",
         max_tool_calls=max_tool_calls,
         grammar=GRAMMAR_HELP.rstrip(),
     )

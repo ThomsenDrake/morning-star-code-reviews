@@ -1,6 +1,7 @@
 <!-- morning-star-review:summary v1 -->
 ### Morning Star Code Review
 **Verdict: clean** · No confirmed findings · 1 possible issue (not confirmed) · `aaaaaaa` · full review
+**Ready to merge:** no open findings at medium severity or above.
 
 #### Possible issues (not confirmed)
 
@@ -29,4 +30,4 @@ Verifier: 0 confirmed, 1 not confirmed, 0 refuted and dropped
 
 </details>
 
-<sub>Automated review; findings can be wrong. Resolve a thread to dismiss a finding (the PR author or anyone with write access).</sub>
+<sub>Automated review; findings can be wrong. Open findings lists everything still outstanding on this pull request. To dismiss a finding, resolve its thread or comment `/msreview dismiss <id> <reason>` (anyone with write access).</sub>

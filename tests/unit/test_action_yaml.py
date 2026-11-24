@@ -57,7 +57,9 @@ def test_action_inputs_and_defaults() -> None:
     assert inputs["labels"]["default"] == "true"
     assert inputs["suggestions"]["default"] == "true"
     assert inputs["preset"]["default"] == ""  # repository file, else the built-in default
-    assert set(doc["outputs"]) == {"status", "verdict", "findings", "execution-id", "report-path"}
+    assert set(doc["outputs"]) == {
+        "status", "verdict", "ready", "findings", "execution-id", "report-path",
+    }  # fmt: skip
     for name, output in doc["outputs"].items():
         # The publish step's value when it ran, else the review step's (deferred publish).
         assert output["value"] == (
@@ -94,6 +96,21 @@ def test_action_env_matches_the_ci_contract() -> None:
     head = review["env"]["MSREVIEW_HEAD_SHA"]
     assert "inputs.pr-url == github.event.pull_request.html_url" in head
     assert head.rstrip("} ").endswith("|| ''")
+    # A `/msreview` comment: the PR commented on, and a refresh (no model runs).
+    publish = by_id("publish")
+    for step in (review, publish):
+        url = " ".join(step["env"]["MSREVIEW_PR_URL"].split())
+        assert url == (
+            "${{ inputs.pr-url || github.event.pull_request.html_url || "
+            "github.event.issue.pull_request.html_url }}"
+        )
+    assert review["env"]["MSREVIEW_REFRESH"] == "${{ github.event_name == 'issue_comment' }}"
+    assert cli._ci_settings({**PR, "MSREVIEW_REFRESH": "true"})["refresh"] is True
+    assert cli._ci_settings({**PR, "MSREVIEW_REFRESH": "false"})["refresh"] is False
+    assert cli._ci_settings(PR)["refresh"] is False
+
+
+PR = {"MSREVIEW_PR_URL": "https://github.com/o/r/pull/1"}
 
 
 def step_ids() -> list[str]:
@@ -224,7 +241,8 @@ def test_docs_name_the_current_release() -> None:
 def test_example_workflow_skips_forks() -> None:
     doc = load(EXAMPLE)
     assert doc["on"] == {
-        "pull_request": {"types": ["opened", "synchronize", "reopened", "ready_for_review"]}
+        "pull_request": {"types": ["opened", "synchronize", "reopened", "ready_for_review"]},
+        "issue_comment": {"types": ["created", "edited"]},
     }
     job = doc["jobs"]["review"]
     assert "head.repo.full_name == github.repository" in job["if"]
@@ -233,6 +251,29 @@ def test_example_workflow_skips_forks() -> None:
     assert 'deadline-minutes: "90"' in EXAMPLE.read_text()
     assert doc["permissions"] == {"contents": "read", "pull-requests": "read"}
     assert "morning-star-code-review-forks.yml" in EXAMPLE.read_text()
+
+
+def test_example_workflow_runs_dismiss_commands() -> None:
+    doc = load(EXAMPLE)
+    job = doc["jobs"]["review"]
+    condition = " ".join(job["if"].split())
+    # Only comments on pull requests that hold a dismiss command, by people who may
+    # have write access (msreview checks the permission itself).
+    assert "github.event_name == 'issue_comment' && github.event.issue.pull_request" in condition
+    assert "contains(github.event.comment.body, '/msreview dismiss')" in condition
+    # Bots never: our own summary mentions the command, and every edit of it is a comment.
+    assert "github.event.comment.user.type != 'Bot'" in condition
+    assert 'fromJSON(\'["OWNER", "MEMBER", "COLLABORATOR"]\')' in condition
+    assert "github.event.comment.author_association" in condition
+    # Per job, so the runs other comments start (and skip) never join the group; a push
+    # cancels the review in progress, a command waits for it.
+    assert "concurrency" not in doc
+    group = " ".join(job["concurrency"]["group"].split())
+    assert group == (
+        "${{ github.workflow }}-${{ github.event.pull_request.number || "
+        "github.event.issue.number }}"
+    )
+    assert job["concurrency"]["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
 
 
 def test_fork_workflow_follows_addendum_g() -> None:
@@ -278,7 +319,7 @@ def test_fork_workflow_follows_addendum_g() -> None:
     # are keyed by the workflow's name, and the two workflows have different names.
     example = load(EXAMPLE)
     assert "github.workflow" in review["concurrency"]["group"]
-    assert "github.workflow" in example["concurrency"]["group"]
+    assert "github.workflow" in example["jobs"]["review"]["concurrency"]["group"]
     assert doc["name"] != example["name"]
 
 

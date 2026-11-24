@@ -24,6 +24,7 @@ from morning_star_review.core.contract import (
     Verdict,
 )
 from morning_star_review.core.runctx import RunContext
+from morning_star_review.review.final import readiness
 
 PR_URL = "https://github.com/octo-org/widgets/pull/7"
 EXEC_ID = "msreview-cli-octo-org-widgets-pr7-aaaaaaa-0123abcd"
@@ -129,6 +130,8 @@ def make_final(
         state = make_state(
             [prior_finding(f.id, path=f.path, line=f.line, state=f.state) for f in findings]
         )
+    # As finalize decides it: an incomplete verdict means an incomplete review.
+    ready, blocking = readiness(findings, state.complete and verdict != "incomplete", "medium")
     return FinalReview(
         verdict=verdict,
         verdict_reasons=[],
@@ -140,6 +143,8 @@ def make_final(
         usage={},
         cost_usd=0.5,
         coverage={"reviewable": 2, "covered": 2, "excluded": 1},
+        ready=ready,
+        blocking=blocking,
     )
 
 

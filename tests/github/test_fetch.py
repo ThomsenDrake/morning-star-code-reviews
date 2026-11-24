@@ -229,3 +229,41 @@ async def test_refused_permission_lookup_fails_closed(fake: FakeGitHub, tmp_path
     assert snap.prior is not None
     found = snap.prior.findings[0]
     assert found.thread_resolved and not found.resolver_can_dismiss
+
+
+async def test_refresh_needs_a_review_of_the_head(fake: FakeGitHub, tmp_path: Path) -> None:
+    # No review yet, or a review of an older head: nothing to re-apply commands to.
+    assert (await snapshot(fake, tmp_path, refresh=True)).skip == "not_reviewed"
+    older = make_state(head_sha="e" * 40)
+    fake.add_issue_comment(f"{st.SUMMARY_MARKER}\n{st.encode_state(older)}")
+    assert (await snapshot(fake, tmp_path, refresh=True)).skip == "not_reviewed"
+    # The head was reviewed (completely, same configuration): a refresh still runs.
+    fake.issue_comments.clear()
+    fake.add_issue_comment(f"{st.SUMMARY_MARKER}\n{st.encode_state(make_state())}")
+    assert (await snapshot(fake, tmp_path)).skip == "already_reviewed"
+    assert (await snapshot(fake, tmp_path, refresh=True)).skip is None
+    fake.pr.update({"state": "closed"})
+    assert (await snapshot(fake, tmp_path, refresh=True)).skip == "closed"
+
+
+async def test_dismiss_commands_are_read_with_the_prior_state(
+    fake: FakeGitHub, tmp_path: Path
+) -> None:
+    a, b = "f00000000000a", "f00000000000b"
+    state = make_state([prior_finding(a), prior_finding(b, state="summary_only")])
+    fake.add_issue_comment(f"{st.SUMMARY_MARKER}\n{st.encode_state(state)}")
+    fake.collaborators.update({"maintainer": "maintain", "reader": "read"})
+    fake.add_issue_comment(f"/msreview dismiss {b} accepted for now", login="maintainer")
+    fake.add_issue_comment(f"/msreview dismiss {a}", login="reader")
+    snap = await snapshot(fake, tmp_path, refresh=True)
+    assert [(c.id, c.by, c.reason) for c in snap.dismiss_commands] == [
+        (b, "maintainer", "accepted for now")
+    ]
+    assert snap.ignored_commands == [
+        "a dismiss command by reader was ignored: only people with write access can dismiss "
+        "findings"
+    ]
+    # Without a review there is nothing to dismiss: commands are not even read.
+    fake.issue_comments = [c for c in fake.issue_comments if c["user"]["login"] != BOT]
+    snap = await snapshot(fake, tmp_path)
+    assert snap.dismiss_commands == [] and snap.ignored_commands == []

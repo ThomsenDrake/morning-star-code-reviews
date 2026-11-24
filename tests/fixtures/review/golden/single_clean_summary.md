@@ -1,6 +1,7 @@
 <!-- morning-star-review:summary v1 -->
 ### Morning Star Code Review
 **Verdict: clean** · `aaaaaaa` · full review
+**Ready to merge:** no open findings at medium severity or above.
 
 #### Coverage
 
@@ -18,4 +19,4 @@ Estimated cost: $0.05 (list prices)
 
 </details>
 
-<sub>Automated review; findings can be wrong. Resolve a thread to dismiss a finding (the PR author or anyone with write access).</sub>
+<sub>Automated review; findings can be wrong. Open findings lists everything still outstanding on this pull request. To dismiss a finding, resolve its thread or comment `/msreview dismiss <id> <reason>` (anyone with write access).</sub>

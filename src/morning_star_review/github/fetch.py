@@ -40,6 +40,7 @@ from morning_star_review.core.jsonio import read_verified, write_json_atomic
 from morning_star_review.core.naming import parse_pr_url
 from morning_star_review.core.runctx import RunContext
 from morning_star_review.github import graphql
+from morning_star_review.github.commands import Commands, collect_commands
 from morning_star_review.github.http import GitHubGraphQLError, GitHubHttp
 from morning_star_review.github.permissions import PermissionCache, can_dismiss
 from morning_star_review.github.publish import report_reason
@@ -162,7 +163,9 @@ def decide_skip(
 ) -> SkipReason | None:
     """DESIGN 9.4 order: superseded, closed, draft, already reviewed.
 
-    ``req.force`` bypasses all but ``superseded``.
+    ``req.force`` bypasses all but ``superseded``. A refresh (``req.refresh``) only
+    re-applies commands to the review of the current head, so it needs one: without
+    it the refresh is skipped as ``not_reviewed`` (no model ever runs in a refresh).
     """
     if req.expected_head_sha and req.expected_head_sha != head_sha:
         return "superseded"
@@ -170,6 +173,8 @@ def decide_skip(
         return None
     if state == "closed" or merged:
         return "closed"
+    if req.refresh:
+        return None if prior is not None and prior.head_sha == head_sha else "not_reviewed"
     if draft and not cfg.review_drafts:
         return "draft"
     if (
@@ -190,6 +195,15 @@ async def _prior_state(
     if not bot_login:
         return None, None, []
     comments = await gh.paginate(f"{_repo_path(owner, repo)}/issues/{number}/comments")
+    return _prior_from_comments(comments, bot_login)
+
+
+def _prior_from_comments(
+    comments: list[Any], bot_login: str | None
+) -> tuple[PriorState | None, int | None, list[str]]:
+    """``_prior_state`` from the PR's issue comments, already read."""
+    if not bot_login:
+        return None, None, []
     summary = find_summary_comment(comments, bot_login)
     if summary is None:
         return None, None, []
@@ -216,6 +230,7 @@ async def _live_priors(
     bot_login: str,
     pr_author: str,
     cfg: ResolvedConfig,
+    perms: PermissionCache | None = None,
 ) -> PriorState:
     """``prior`` with live thread data (resolution, resolver rights) from GraphQL."""
     threads = await graphql.list_review_threads(gh, snap_owner, snap_repo, number)
@@ -224,7 +239,7 @@ async def _live_priors(
         if t.started_by(bot_login):
             for fid in finding_ids_in(t.first_body):
                 by_id.setdefault(fid, t)
-    perms = PermissionCache(gh, snap_owner, snap_repo)
+    perms = perms or PermissionCache(gh, snap_owner, snap_repo)
     findings: list[PriorFinding] = []
     for f in prior.findings:
         thread = by_id.get(f.id)
@@ -324,16 +339,30 @@ async def build_snapshot(
         raise MsreviewBadRequest(str(exc)) from None
     warnings = [*warnings, *resolve_warnings]
 
-    prior, _summary_id, prior_warnings = await _prior_state(gh, owner, repo, number, ctx.bot_login)
+    comments: list[Any] = []
+    if ctx.bot_login:
+        comments = await gh.paginate(f"{base}/issues/{number}/comments")
+    prior, _summary_id, prior_warnings = _prior_from_comments(comments, ctx.bot_login)
     warnings.extend(prior_warnings)
+    perms = PermissionCache(gh, owner, repo)
     if prior is not None and ctx.bot_login and gh.has_token:
         try:
             prior = await _live_priors(
-                gh, owner, repo, number, prior, ctx.bot_login, pr_author, cfg
+                gh, owner, repo, number, prior, ctx.bot_login, pr_author, cfg, perms
             )
         except GitHubGraphQLError as exc:
             log.warning("review threads unavailable: %s", exc)
             warnings.append("review threads could not be read; earlier findings kept as recorded")
+    commands = Commands()
+    if prior is not None and gh.has_token:
+        # Commands only act on the findings of an earlier review.
+        commands = await collect_commands(
+            comments,
+            bot_login=ctx.bot_login,
+            pr_author=pr_author,
+            author_may_dismiss=cfg.author_may_dismiss,
+            permission=perms.get,
+        )
 
     compare_from_prior: CompareStatus | None = None
     merges = False
@@ -382,4 +411,6 @@ async def build_snapshot(
         config_warnings=[w[:500] for w in warnings][:20],
         skip=skip,
         run_dir=str(run_dir),
+        dismiss_commands=commands.dismissals,
+        ignored_commands=[n[:500] for n in commands.ignored][:20],
     )

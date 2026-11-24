@@ -141,8 +141,9 @@ commit** through the Contents API, and resolves the effective configuration from
 preset, the file, the run overrides and the operator caps (see
 [configuration.md](configuration.md)). It also reads the prior review state. The prior state is a compressed
 JSON marker in the bot's own summary comment, trusted only when your App's bot wrote
-it. It also reads review threads (who resolved what) and the permission of each person
-who resolved a thread. It then decides whether to **skip**, in this order:
+it. It also reads review threads (who resolved what), the `/msreview dismiss` commands
+in the PR's comments, and the permission of each person who resolved a thread or wrote
+a command. It then decides whether to **skip**, in this order:
 
 1. the head moved past `expected-head-sha` (superseded);
 2. the PR is closed;
@@ -150,7 +151,10 @@ who resolved a thread. It then decides whether to **skip**, in this order:
 4. this head was already reviewed **completely** with the same configuration hash and
    the same major version.
 
-`--force` bypasses the last three.
+`--force` bypasses the last three. A **refresh** (the run that a `/msreview dismiss`
+comment starts) needs a review of the current head instead: without one it is
+skipped as `not_reviewed`; with one, `prepare` carries that review over (scope
+`carry_over`), so no model runs and only the commands change the result.
 
 ### `prepare`
 
@@ -286,15 +290,22 @@ review time, the duration and whether the run had reached its wind-down.
    "(unconfirmed)" tag when at least two explorers reported them at high or critical
    severity. `refuted` ones are dropped and kept in `findings.json`.
 4. **Prior findings.** Code decides each prior finding, not the models:
-   - If the flagged code changed (or the file was deleted), the finding is resolved.
+   - If a `/msreview dismiss` command names it, the finding is dismissed.
+   - If the flagged code changed (or the file was deleted), the finding is fixed, also
+     when someone resolved its thread.
    - If a person with write access resolved the thread (and, when
      `author_may_dismiss: false`, that person is not the PR author), the finding is
-     dismissed, and a new finding on the same code is not posted again.
+     dismissed.
    - If anyone else resolved the thread, the finding is kept open as "resolved without a
      fix".
    - Otherwise the finding stays open and is carried over.
 
-   The explorers' opinions about prior findings are advisory only.
+   A new finding on the code of a dismissed one (the same id) is not posted again. A
+   new finding that repeats a dismissed one in other words (the same file, and the same
+   quoted code or a title that shares most of its words, within 40 lines) is recorded
+   as dismissed, as a repeat of the first. The explorers are shown the dismissed
+   findings and told not to report them again. The explorers' opinions about prior
+   findings are advisory only.
 5. **Suggestions.** A suggestion block is kept only if all of these hold, otherwise it
    is dropped and the finding stays:
    - the anchor is exact;
@@ -318,6 +329,10 @@ review time, the duration and whether the run had reached its wind-down.
      `uncertain` and that is listed only in the summary) does not count here.
    - Otherwise `incomplete` if the review was not complete.
    - Otherwise `clean`.
+
+   **Ready to merge** when the review is complete and no open finding is at or above
+   `review.blocking_severity` (default `medium`). This decides the label, not the
+   verdict.
 
    "Complete" requires all of these: the primary explorer finished within its budget;
    the other explorers finished, or their notes parsed in full; every draft parsed
@@ -350,13 +365,20 @@ If posting is possible, it writes to GitHub in an order that makes retries safe:
    GitHub refuses this unless the token has Contents: write. msreview requests Contents:
    read on purpose, so it then **hides its own comment as resolved** instead. It
    records the thread, so later runs do not reply again or retry.
-5. Create or update the **summary comment** last. It carries the state marker
-   (findings, comment ids, thread ids, verdict, configuration hash, head). The state
-   therefore records only what was really posted. A retry after a crash finds every
+   A finding dismissed by a command while its thread is still open gets the reply
+   "Dismissed by `<login>`: `<reason>`." and is closed the same way.
+5. Create or update the **summary comment** last. It lists every open finding (with
+   its id, and a collapsed block of explanations) and the record of fixed and
+   dismissed findings. It carries the state marker (the open findings with their
+   explanations, the fixed and dismissed ones, comment ids, thread ids, verdict,
+   configuration hash, head, and why the review was incomplete, if it was). The state therefore records only what was really posted.
+   When the marker would pass 20 KB, explanations are shortened first, then the oldest
+   fixed findings are dropped, then dismissed ones. A retry after a crash finds every
    earlier write through its marker.
-6. Set the verdict label (`msreview: clean`, `findings` or `incomplete`), create it if
-   it is missing, and remove the other two. This step is best effort: a failure becomes
-   a note, never a failed run.
+6. Set the status label (`msreview: ready to merge`, `findings` or `incomplete`),
+   create it if it is missing, and remove the others (and the `msreview: clean` label
+   of older versions). This step is best effort: a failure becomes a note, never a
+   failed run.
 
 **Report mode.** When posting is not possible (no App credentials, App not installed,
 missing permission, `post: never`), `publish` writes nothing to GitHub. It returns the
@@ -406,7 +428,7 @@ src/morning_star_review/
   core/                  contracts, config, models and presets, notes grammar, sanitiser,
                          seals, guards, redaction, child-process helpers, run clock
   diff/                  patch parsing, rendering, pre-pass, anchors, scope, related definitions
-  github/                HTTP client, App auth and mint child, fetch, publish, labels, state marker
+  github/                HTTP client, App auth and mint child, fetch, commands, publish, labels, state marker
   review/                anchoring, merge, reconcile, verdict, suggestions, rendering, finalize
 ```
 

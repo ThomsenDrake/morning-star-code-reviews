@@ -275,3 +275,10 @@ def test_http_app_api_asks_as_the_app_and_revokes_its_token() -> None:
     with pytest.raises(EnableUsageError, match="do not belong to the same App"):
         refused.app()
     refused.close()
+
+
+def test_has_command_trigger() -> None:
+    text = tpl.render("v1.2.3")
+    assert tpl.has_command_trigger(text)
+    assert not tpl.has_command_trigger(text.replace("  issue_comment:", "  # issue_comment:"))
+    assert not tpl.has_command_trigger("on:\n  pull_request:\n# issue_comment: later\n")

@@ -34,6 +34,7 @@ __all__ = [
     "defang",
     "missing_diff_text",
     "neutralize",
+    "prompt_dismissed",
     "prompt_priors",
     "render_file",
     "render_prompt",
@@ -152,6 +153,11 @@ def prompt_priors(priors: Sequence[PriorFinding]) -> list[PriorFinding]:
     return [p for p in priors if p.state in ("open", "summary_only")][:PRIOR_MAX]
 
 
+def prompt_dismissed(priors: Sequence[PriorFinding]) -> list[PriorFinding]:
+    """Dismissed findings shown to the explorer, so it does not report them again."""
+    return [p for p in priors if p.state == "dismissed"][:PRIOR_MAX]
+
+
 def _pr_block(snap: PrSnapshot, boundary: str) -> str:
     body = snap.body_excerpt.strip() or "(no description)"
     text = (
@@ -237,17 +243,29 @@ def _scope_block(snap: PrSnapshot, plan: PromptPlan, scope: ScopeDecision) -> st
     return "\n".join(lines)
 
 
-def _prior_block(priors: Sequence[PriorFinding]) -> str:
-    shown = prompt_priors(priors)
-    if not shown:
-        return ""
+def _prior_rows(shown: Sequence[PriorFinding]) -> list[str]:
     # Titles and evidence came from model output over author text: defang them.
-    rows = [
+    return [
         f"{defang(p.id)} | {defang(p.path)}:{p.line if p.line is not None else '-'} | "
         f"{p.severity} | {defang(_one_line(p.title))} | evidence: {defang(_one_line(p.evidence))}"
         for p in shown
     ]
-    return "<prior_findings>\n" + "\n".join(rows) + "\n</prior_findings>"
+
+
+def _prior_block(priors: Sequence[PriorFinding]) -> str:
+    shown = prompt_priors(priors)
+    if not shown:
+        return ""
+    return "<prior_findings>\n" + "\n".join(_prior_rows(shown)) + "\n</prior_findings>"
+
+
+def _dismissed_block(priors: Sequence[PriorFinding]) -> str:
+    """Findings the maintainers dismissed. Their reasons are PR text and stay out."""
+    shown = prompt_dismissed(priors)
+    if not shown:
+        return ""
+    rows = "\n".join(_prior_rows(shown))
+    return f"<dismissed_findings>\n{rows}\n</dismissed_findings>"
 
 
 def render_prompt(
@@ -263,8 +281,9 @@ def render_prompt(
 ) -> str:
     """The explorer's user message (DESIGN 6.5, ADDENDUM H).
 
-    Order: PR block, repository guidance, review scope, prior findings, the inlined
-    diff, the related-definitions block (when enabled and non-empty), the budget line.
+    Order: PR block, repository guidance, review scope, prior findings, dismissed
+    findings, the inlined diff, the related-definitions block (when enabled and
+    non-empty), the budget line.
     """
     # Imported here: related.py imports this module for untrusted_block.
     from morning_star_review.diff.related import render_block
@@ -278,6 +297,7 @@ def render_prompt(
         _guidance(cfg),
         _scope_block(snap, plan, scope),
         _prior_block(priors),
+        _dismissed_block(priors),
         untrusted_block(boundary, "diff", diff_text),
         render_block(related or [], boundary) if cfg.related_definitions else "",
         f"Budget: about {budgets.max_tool_calls} tool calls.",

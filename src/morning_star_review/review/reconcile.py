@@ -10,17 +10,24 @@ DESIGN 8.2 and 8.3, plus ADDENDUM D (publishing policy for verified candidates):
 - ``refuted`` candidates are dropped and kept only for the report JSON.
 
 Prior findings are reconciled deterministically: a model's claim that something was
-fixed is advisory, and only a change to the flagged code resolves a thread.
+fixed is advisory, and only a change to the flagged code resolves a thread. A finding
+is dismissed by a ``/msreview dismiss`` command, or by resolving its thread without
+changing the flagged code (someone who may dismiss findings). A new finding that
+repeats a dismissed one (the same id, or the same file and evidence, or a similar
+title close by) is dropped and recorded as dismissed too. Findings that are already
+open are never matched that way: their author saw both and dismissed only one.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Iterable, Sequence
+import re
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from morning_star_review.core.contract import (
     SEVERITY_ORDER,
     AnchorMap,
+    DismissCommand,
     DraftFinding,
     DroppedCandidate,
     FinalFinding,
@@ -53,6 +60,7 @@ __all__ = [
     "inline_allowed_by_verification",
     "reconcile_priors",
     "refound_priors",
+    "repeat_of",
     "sources_from_draft",
     "truncate",
 ]
@@ -92,6 +100,8 @@ class Built:
     over_cap: int = 0
     dropped_dismissed: int = 0  # new findings matching a dismissed prior
     reported_ids: frozenset[str] = frozenset()  # ids reported in this review (not dismissed)
+    # New findings dropped as repeats of a dismissed prior (other id), with that prior.
+    repeats: list[tuple[FinalFinding, PriorFinding]] = field(default_factory=list)
 
 
 def sources_from_draft(draft: ReviewDraft | None, model: str | None = None) -> list[Source]:
@@ -259,12 +269,14 @@ def carried_finding(prior: PriorFinding) -> FinalFinding:
         id=prior.id,
         path=prior.path,
         line=prior.line,
+        start_line=prior.start_line,
         anchor="inline" if has_thread else "file",
         severity=prior.severity,
-        category="other",
+        category=prior.category or "other",
         title=prior.title,
         evidence=prior.evidence,
-        explanation="",
+        explanation=prior.explanation,
+        fix=prior.fix,
         state="open" if has_thread else "summary_only",
         carried=True,
         thread_id=prior.thread_id,
@@ -303,6 +315,62 @@ def _assign_states(findings: list[FinalFinding], cfg: ResolvedConfig) -> list[Fi
     return out
 
 
+_WORD = re.compile(r"[a-z0-9_]+")
+_STOPWORD_TEXT = (
+    "the and for with that this from when are not can its into than then has have "
+    "but was were will would should could does did may might any all also only each "
+    "per via one two there their which while where after before"
+)
+_STOPWORDS = frozenset(_STOPWORD_TEXT.split())
+_REPEAT_MIN_SHARED = 4  # title words a repeat shares with the dismissed finding
+_REPEAT_MIN_OVERLAP = 0.6  # of the shorter title's words
+_REPEAT_MAX_LINES = 40  # lines between the two findings
+
+
+def _title_words(title: str) -> set[str]:
+    """Content words of a title: lower case, no stop words, plural ``s`` removed."""
+    words: set[str] = set()
+    for w in _WORD.findall(title.lower()):
+        if len(w) < 3 or w in _STOPWORDS:
+            continue
+        if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+            w = w[:-1]
+        words.add(w)
+    return words
+
+
+def _near(a: int | None, b: int | None) -> bool:
+    return a is None or b is None or abs(a - b) <= _REPEAT_MAX_LINES
+
+
+def repeat_of(
+    f: FinalFinding | PriorFinding,
+    dismissed: Sequence[PriorFinding],
+    renamed_from: Mapping[str, str],
+) -> PriorFinding | None:
+    """The dismissed finding that ``f`` repeats in other words, if any.
+
+    A repeat is in the same file and flags the same code (evidence), or has a title
+    that shares most of its words with the dismissed one, within a few lines of it.
+    """
+    words = _title_words(f.title)
+    for p in dismissed:
+        if p.id == f.id or renamed_from.get(p.path, p.path) != f.path:
+            continue
+        if norm(p.evidence) and norm(p.evidence) == norm(f.evidence):
+            return p
+        other = _title_words(p.title)
+        shared = len(words & other)
+        smaller = max(min(len(words), len(other)), 1)
+        if (
+            shared >= _REPEAT_MIN_SHARED
+            and shared / smaller >= _REPEAT_MIN_OVERLAP
+            and _near(p.line, f.line)
+        ):
+            return p
+    return None
+
+
 def build_findings(
     sources: Sequence[Source],
     *,
@@ -315,19 +383,26 @@ def build_findings(
 ) -> Built:
     """Anchor, id, de-duplicate, match against priors, sort, cap and assign states.
 
-    New findings matching a dismissed prior are dropped; those matching an open prior
+    New findings matching a dismissed prior are dropped (``repeat_of`` also catches a
+    dismissed finding reported again in other words); those matching an open prior
     with a thread are ``carried`` (never posted again). Open priors that nobody
     reported again are carried as well, so their threads stay listed.
     """
     findings = _dedupe(_to_final(s, anchors, head_text, pr_paths, cfg.suggestions) for s in sources)
     action = {p.id: p.action for p in priors}
     recorded = {p.id: p for p in prior_state.findings} if prior_state else {}
+    gone = [recorded[p.id] for p in priors if p.action == "dismissed" and p.id in recorded]
     kept: list[FinalFinding] = []
+    repeats: list[tuple[FinalFinding, PriorFinding]] = []
     dismissed = 0
     for f in findings:
         prior = recorded.get(f.id)
         if prior is not None and action.get(f.id) == "dismissed":
             dismissed += 1
+            continue
+        same = repeat_of(f, gone, anchors.renamed_from) if prior is None else None
+        if same is not None:
+            repeats.append((f, same))
             continue
         if (
             prior is not None
@@ -355,6 +430,7 @@ def build_findings(
         over_cap=len(kept) - len(capped),
         dropped_dismissed=dismissed,
         reported_ids=seen,
+        repeats=repeats,
     )
 
 
@@ -418,28 +494,42 @@ def _reconcile_one(
     renamed_from: dict[str, str],
     bot_login: str | None,
     existing_paths: Collection[str],
+    command: DismissCommand | None = None,
 ) -> ResolvedPrior | None:
+    """What happens to one prior finding.
+
+    A dismiss command wins over everything else. Otherwise a change to the flagged
+    code means fixed, also when someone resolved the thread (a fix is not a
+    dismissal); resolving the thread of unchanged code dismisses it.
+    """
     if p.state == "fixed":
         return None  # resolved by an earlier review
     if p.state == "dismissed":
         return _prior(p, "dismissed", "dismissed earlier")
+    if command is not None:
+        return _prior(p, "dismissed", f"dismissed by {command.by}")
     human = p.thread_resolved and p.resolved_by is not None and p.resolved_by != bot_login
-    if human and p.resolver_can_dismiss:
-        return _prior(p, "dismissed", f"dismissed by {p.resolved_by}")
+    by_human = f"dismissed by {p.resolved_by}"
     path = renamed_from.get(p.path, p.path)
     lines = head_text(path)
     if lines is None:
         if path in existing_paths:
+            if human and p.resolver_can_dismiss:
+                return _prior(p, "dismissed", by_human)
             # The file is still there but cannot be read (binary, too large): the
             # flagged code may be unchanged, so the thread must not be resolved.
             return _prior(p, "keep_open", "the file could not be read at head")
         return _prior(p, "file_deleted", "the file was deleted")
     if not _evidence_present(p.evidence, [ln.rstrip("\r\n") for ln in lines]):
-        if said == "still_open":
-            return _prior(
-                p, "keep_open", "the flagged code changed, but the model reports it is still open"
-            )
-        return _prior(p, "resolve", "the flagged code changed")
+        if said != "still_open":
+            return _prior(p, "resolve", "the flagged code changed")
+        if human and p.resolver_can_dismiss:
+            return _prior(p, "dismissed", by_human)
+        return _prior(
+            p, "keep_open", "the flagged code changed, but the model reports it is still open"
+        )
+    if human and p.resolver_can_dismiss:
+        return _prior(p, "dismissed", by_human)
     if human:
         # Resolved by someone who may not dismiss findings, and the code is unchanged.
         return _prior(p, "keep_open", f"{RESOLVED_WITHOUT_FIX} {p.resolved_by}")
@@ -457,13 +547,15 @@ def reconcile_priors(
     renamed_from: dict[str, str] | None = None,
     bot_login: str | None = None,
     existing_paths: Collection[str] = (),
+    commands: Sequence[DismissCommand] = (),
 ) -> list[ResolvedPrior]:
     """Decide what happens to each finding of the previous review (DESIGN 8.3).
 
     ``resolver_can_dismiss`` already folds in ``cfg.author_may_dismiss`` (``fetch_pr``
-    computes it), so ``cfg`` is accepted for the contract but not needed here.
-    ``existing_paths`` are files known to exist at head (PR files not removed): when
-    ``head_text`` returns ``None`` for one of them, the file is unreadable, not deleted.
+    computes it), so ``cfg`` is accepted for the contract but not needed here; so
+    are the authorised ``/msreview dismiss`` ``commands``. ``existing_paths`` are files
+    known to exist at head (PR files not removed): when ``head_text`` returns ``None``
+    for one of them, the file is unreadable, not deleted.
     """
     del cfg
     if prior is None:
@@ -471,9 +563,12 @@ def reconcile_priors(
     said = {s.id: s.status for s in drafts_status}
     renames = renamed_from or {}
     existing = frozenset(existing_paths)
+    by_id = {c.id: c for c in commands}
     out: list[ResolvedPrior] = []
     for p in prior.findings:
-        r = _reconcile_one(p, said.get(p.id), head_text, renames, bot_login, existing)
+        r = _reconcile_one(
+            p, said.get(p.id), head_text, renames, bot_login, existing, by_id.get(p.id)
+        )
         if r is not None:
             out.append(r)
     return out

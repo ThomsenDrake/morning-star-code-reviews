@@ -8,7 +8,7 @@ Each page has size + 1 items, and consecutive pages overlap by one item.
         end = start + size
 ```
 
-<sub>Morning Star Code Review · zai-glm-5-3, mistral-large-4, deepseek-v4-1-flash-1017 · `aaaaaaa` · confirmed by the verifier</sub>
+<sub>Morning Star Code Review · zai-glm-5-3, mistral-large-4, deepseek-v4-1-flash-1017 · `aaaaaaa` · confirmed by the verifier · id `f96addfc28589`</sub>
 <!-- morning-star-review:finding f96addfc28589 -->
 
 ---
@@ -23,7 +23,7 @@ Anyone except the owner may edit the entry; the owner may not.
         if user.id == entry.owner_id:
 ```
 
-<sub>Morning Star Code Review · zai-glm-5-3 · `aaaaaaa` · confirmed by the verifier</sub>
+<sub>Morning Star Code Review · zai-glm-5-3 · `aaaaaaa` · confirmed by the verifier · id `f93ebfca948b4`</sub>
 <!-- morning-star-review:finding f93ebfca948b4 -->
 
 ---
@@ -34,5 +34,5 @@ Anyone except the owner may edit the entry; the owner may not.
 
 **Suggested fix:** Call `prorate(amount, days, total_days)`.
 
-<sub>Morning Star Code Review · mistral-large-4 · `aaaaaaa` · confirmed by the verifier</sub>
+<sub>Morning Star Code Review · mistral-large-4 · `aaaaaaa` · confirmed by the verifier · id `f09980c2acb07`</sub>
 <!-- morning-star-review:finding f09980c2acb07 -->

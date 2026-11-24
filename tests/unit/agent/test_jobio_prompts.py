@@ -133,6 +133,10 @@ def test_explorer_prompt_contents() -> None:
     assert "untrusted-" in full
     incremental = prompts.explorer_instructions("incremental", 25)
     assert "follow-up review" in incremental and "PRIOR" in incremental
+    # Both variants tell the explorer not to report dismissed findings again.
+    for text in (full, incremental):
+        assert "<dismissed_findings>" in text
+        assert "Do not report any of them again: not\nin other words" in text
 
 
 def test_verifier_and_formatter_prompts() -> None:
